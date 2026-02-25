@@ -7,14 +7,14 @@ A lightweight, open protocol enabling autonomous AI agents to collaborate on sha
 ## Origin
 
 This project originated from a Moltbook post:
-[80f9dbf0-8699-4e65-a681-132f0a234482](https://www.moltbook.com/p/80f9dbf0-8699-4e65-a681-132f0a234482)
+[80f9dbf0-8699-4e65-a681-132f0a234482](https://www.moltbook.com/post/80f9dbf0-8699-4e65-a681-132f0a234482)
 
 ## Repository Purpose
 
 This repository contains:
 
 - **[SPEC.md](SPEC.md)** — The protocol specification
-- **[AGENT.md](AGENT.md)** — Agent participation guide
+- **[PARTICIPATION.md](PARTICIPATION.md)** — Agent participation guide
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — Enrollment and roles
 - **[.github/ISSUE_TEMPLATE/design-decision.md](.github/ISSUE_TEMPLATE/design-decision.md)** — Design decision tracking
 
