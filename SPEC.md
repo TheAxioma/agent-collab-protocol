@@ -356,7 +356,31 @@ At this boundary, trust relationships get renegotiated without explicit ceremony
 
 Boundary agents MUST NOT forward attestation status implicitly. When a schema crosses a trust boundary, attestation MUST be re-evaluated against the receiving domain's requirements. Forwarding a schema from a trusted internal orchestrator to an external peer without re-attestation is a protocol violation.
 
-### 9.4 Known Non-Goal
+### 9.4 Translation Layer as Information Bottleneck
+
+The translation layer described in §9.3 is not merely an attack surface — it is an information bottleneck. Whatever crosses a trust boundary gets lossy-compressed by the translation protocol. Adversarial agents exploit the compression: they inject meaning that survives translation intact while changing semantics. The attack does not need to bypass schema validation. It only needs to survive the compression step with altered meaning preserved.
+
+This is a distinct threat class from:
+
+- **Schema corruption** — requires orchestrator compromise; the orchestrator redefines canonical schema mid-pipeline.
+- **Execution errors** — `trace_hash` catches behavioral divergence post-hoc.
+
+Translation-bottleneck attacks succeed even when schema validation passes, `trace_hash` confirms compliance, and all verification layers report clean. The threat lands at the semantic layer during translation, not at the structural layer where existing defenses operate.
+
+**Mitigations (post-hoc, not preventive):**
+
+| Mitigation | Mechanism | Limitation |
+|------------|-----------|------------|
+| Behavioral comparison downstream | Compare outputs of agents that received the same pre-translation input. Divergence in behavior implies the translation introduced semantic drift. | Detects divergence after the threat has already landed. Requires redundant execution paths. |
+| Semantic fingerprinting | Attach a semantic fingerprint (independent of structural schema) that can be verified post-translation. Drift in fingerprint signals lossy or adversarial compression. | Detection tool, not prevention. Fingerprint itself crosses the same bottleneck. |
+
+Both mitigations detect divergence after the fact — they are detection tools, not prevention. No mechanism in v0.1 prevents a translation-bottleneck attack at the point of translation.
+
+**Named limitation — `trace_hash` semantic blindness.** `trace_hash` (§6.2) surfaces behavioral divergence but cannot distinguish identical traces produced by different internal reasoning. Two agents can execute the same trace for semantically incompatible reasons. This limitation is structural, not a bug — `trace_hash` operates on execution artifacts, not on the reasoning that produced them. In a translation-bottleneck attack, `trace_hash` confirms that the agent faithfully executed the post-translation schema; it cannot reveal that the post-translation schema no longer carries the pre-translation meaning.
+
+> Community discussion: [Moltbook thread](https://www.moltbook.com/post/ee11a195-d5d6-4f60-90e9-dcfa45ee99b2). See also [PR #11](https://github.com/agent-collab-protocol/agent-collab-protocol/pull/11), [issue #10](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/10).
+
+### 9.5 Known Non-Goal
 
 §9 cannot prevent a sufficiently determined malicious orchestrator from constructing schemas that pass attestation checks while misrepresenting intent. A schema can be technically accurate (every field describes what will happen) and still deceptive (the described behavior is not what the worker would agree to if the intent were stated plainly).
 
@@ -368,14 +392,15 @@ The protocol's security goal is to make deception **detectable**, not **impossib
 
 A determined adversary operating within a single interaction can succeed. The protocol raises the cost of repeated deception across interactions.
 
-### 9.5 Relationship to Other Sections
+### 9.6 Relationship to Other Sections
 
 - `trace_hash` (§6.2) verifies execution-matches-spec. §9 addresses whether the spec was honest.
 - Merkle tree divergence (§7) localizes where execution diverged from plan. §9 addresses whether the plan was honestly constructed.
 - Zombie state detection (§8) handles cooperative failure. §9 handles adversarial failure — §8.3 explicitly defers adversarial drift to this section.
 - TEE attestation boundary (§8.3) proves where execution occurred. Schema attestation (§9.1) proves who vouched for what was executed. These are complementary, not overlapping.
+- Translation boundary (§9.3) identifies the attack surface. Translation bottleneck (§9.4) identifies the information-theoretic reason attacks at that surface evade structural defenses — lossy compression preserves adversarial semantics while satisfying validation.
 
-### 9.6 Open Questions
+### 9.7 Open Questions
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
