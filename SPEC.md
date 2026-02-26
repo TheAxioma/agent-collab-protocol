@@ -186,6 +186,215 @@ canonical_json MUST produce deterministic output regardless of key insertion ord
 4. Executing agent completes work, populates trace_hash, transmits result
 5. Delegating agent verifies task_hash integrity; optionally validates trace_hash against expected behavior
 
+### 6.6 Delegation Message Types
+
+> **Draft — community discussion in progress via [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15).**
+
+The delegation protocol uses six message types. All messages MUST include `task_id` for correlation.
+
+**TASK_ASSIGN**
+
+Sent by the delegating agent to initiate delegation.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| task_id | UUID v4 | Yes | Unique task instance identifier (from §6.1) |
+| session_id | string | Yes | Active session identifier binding this delegation to a collaboration session |
+| spec | object | Yes | Task specification (see below) |
+| trust_level | enum | Yes | Trust level granted to the delegatee for this task (see §6.8) |
+| delegation_depth | integer | Yes | Current depth in the delegation chain; 0 for direct delegation (see §6.9) |
+
+The `spec` object contains:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| description | string | Yes | Semantic description of the task (equivalent to `intent` in §6.1) |
+| expected_output_format | object | Yes | Schema or description of the expected result structure |
+| deadline | ISO 8601 | No | Absolute deadline for task completion |
+| resource_constraints | object | No | Limits on compute, memory, network, or other resources the delegatee may consume |
+
+The full canonical task schema (§6.1) is transmitted within or alongside `spec`. The fields above are the delegation-specific subset; `task_hash`, `namespace`, `alias`, `version`, `issued_at`, and `issuer_id` travel with the task schema as defined in §6.1.
+
+**TASK_ACCEPT**
+
+Sent by the delegatee to confirm it will execute the task.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| task_id | UUID v4 | Yes | Echoed from TASK_ASSIGN |
+| session_id | string | Yes | Echoed from TASK_ASSIGN |
+| accepted_at | ISO 8601 | Yes | Timestamp of acceptance |
+
+A TASK_ACCEPT is a commitment. After sending TASK_ACCEPT, the delegatee is responsible for eventually sending TASK_COMPLETE or TASK_FAIL.
+
+**TASK_REJECT**
+
+Sent by the delegatee to decline the task.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| task_id | UUID v4 | Yes | Echoed from TASK_ASSIGN |
+| session_id | string | Yes | Echoed from TASK_ASSIGN |
+| reason | string | Yes | Why the task was rejected (insufficient capabilities, resource limits, trust level incompatible, etc.) |
+
+TASK_REJECT is terminal for the delegatee. The delegating agent MAY reassign the task to another agent.
+
+**TASK_PROGRESS**
+
+Optionally sent by the delegatee during execution. Serves as both a progress update and a heartbeat signal (see §8.4 protocol-layer heartbeat).
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| task_id | UUID v4 | Yes | Echoed from TASK_ASSIGN |
+| session_id | string | Yes | Echoed from TASK_ASSIGN |
+| progress | object | No | Structured progress data (percentage, subtask status, etc.) |
+| timestamp | ISO 8601 | Yes | When this progress report was generated |
+
+TASK_PROGRESS is optional — the protocol does not require progress reporting for task completion. However, implementations that set `timeout_seconds` (§6.1) SHOULD use TASK_PROGRESS as a liveness signal to distinguish a working agent from a zombied one (§8.1). The absence of TASK_PROGRESS within the expected heartbeat interval is an input to the external verifier (§4.2), not a definitive failure signal.
+
+**TASK_COMPLETE**
+
+Sent by the delegatee when the task finishes successfully.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| task_id | UUID v4 | Yes | Echoed from TASK_ASSIGN |
+| session_id | string | Yes | Echoed from TASK_ASSIGN |
+| result | object or string | Yes | Structured result conforming to `expected_output_format`, or a resource reference (URI) to the result |
+| trace_hash | SHA-256 | Yes | Post-execution hash of the actual execution trace (§6.2) |
+| completed_at | ISO 8601 | Yes | Timestamp of completion |
+
+The delegating agent SHOULD verify that `result` conforms to `expected_output_format` from the original TASK_ASSIGN. Non-conforming results are not a protocol error — the delegating agent decides whether to accept, reject, or request rework.
+
+**TASK_FAIL**
+
+Sent by the delegatee when the task cannot be completed.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| task_id | UUID v4 | Yes | Echoed from TASK_ASSIGN |
+| session_id | string | Yes | Echoed from TASK_ASSIGN |
+| error | object | Yes | Structured error: `code` (string), `message` (string), `details` (object, optional) |
+| partial_results | object or null | No | Whatever partial output is available; null if nothing was produced |
+| trace_hash | SHA-256 | No | Post-execution hash if any execution occurred before failure |
+| failed_at | ISO 8601 | Yes | Timestamp of failure |
+
+TASK_FAIL with `partial_results` is preferred over TASK_FAIL without — even incomplete output may be useful for recovery or reassignment. The delegating agent owns the recovery decision (see §6.10).
+
+### 6.7 Delegation Lifecycle
+
+> **Draft — community discussion in progress via [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15).**
+
+The delegation lifecycle follows a linear state machine:
+
+```
+TASK_ASSIGN → TASK_ACCEPT → TASK_PROGRESS* → TASK_COMPLETE
+                                            → TASK_FAIL
+           → TASK_REJECT
+```
+
+**State transitions:**
+
+| Current State | Valid Next Messages | Sender |
+|---------------|---------------------|--------|
+| (initial) | TASK_ASSIGN | Delegator |
+| TASK_ASSIGN sent | TASK_ACCEPT, TASK_REJECT | Delegatee |
+| TASK_ACCEPT sent | TASK_PROGRESS, TASK_COMPLETE, TASK_FAIL | Delegatee |
+| TASK_PROGRESS sent | TASK_PROGRESS, TASK_COMPLETE, TASK_FAIL | Delegatee |
+| TASK_COMPLETE sent | (terminal) | — |
+| TASK_FAIL sent | (terminal) | — |
+| TASK_REJECT sent | (terminal) | — |
+
+Messages received out of sequence MUST be rejected. An agent that receives TASK_PROGRESS for a task_id it never sent TASK_ASSIGN for MUST ignore the message and MAY log it as anomalous.
+
+**Timeout behavior:** If `timeout_seconds` is set in the task schema (§6.1) and the delegatee has not sent TASK_COMPLETE or TASK_FAIL within that window after TASK_ACCEPT, the delegator MAY treat the task as failed. The delegator SHOULD send no message — timeout is a delegator-side decision, not a protocol message. The delegatee may still be executing (zombie state, §8.1); the external verifier (§4.2) handles liveness determination.
+
+**Accept/reject deadline:** The protocol does not define a deadline for TASK_ACCEPT or TASK_REJECT. Implementations SHOULD define a reasonable timeout after TASK_ASSIGN, after which the delegator MAY reassign the task. This timeout is deployment-specific, not protocol-specified.
+
+### 6.8 Trust Semantics
+
+> **Draft — community discussion in progress via [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15).**
+
+Trust during delegation follows a strict inheritance model with no privilege escalation.
+
+**Core rule:** The delegatee inherits the delegator's trust level for the duration of the subtask. This is scoped — the inherited trust applies only to operations within the delegated task's `scope` and `constraints`. It does not extend to other tasks, other sessions, or capabilities outside the task specification.
+
+**No privilege escalation.** A delegatee MUST NOT acquire capabilities beyond what the delegator holds. If agent A has trust level `restricted` and delegates to agent B, agent B operates at `restricted` for that task — even if B independently holds a higher trust level in other contexts. The delegation narrows B's effective trust to min(B's own trust, A's delegated trust).
+
+**Delegation-in-B's-name is not B acquiring new capabilities.** When A delegates to B, B acts on A's behalf within A's trust boundary. This is not B gaining access to A's capabilities — it is A extending its own execution through B. The distinction matters for audit: the `issuer_id` in the task schema (§6.1) traces back to A. B's actions under this delegation are attributable to A for trust accounting purposes.
+
+**Trust level values** are defined by the deployment's trust topology (§9.2). The protocol does not mandate specific trust level names or semantics beyond requiring that they are comparable (a partial order exists) and that `trust_level` in TASK_ASSIGN is always ≤ the delegator's own trust level for the session.
+
+**Relationship to §9.2:** Trust semantics during delegation operate within a single trust topology. Cross-topology delegation (e.g., from orchestrator-over-worker to peer-to-peer) requires the trust boundary handling described in §9.3 — attestation MUST be re-evaluated at the boundary.
+
+### 6.9 Delegation Chains
+
+> **Draft — community discussion in progress via [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15).**
+
+Delegation chains — where a delegatee further delegates subtasks to other agents — are permitted.
+
+**Depth limit:** v1 enforces a maximum delegation depth of 3. The `delegation_depth` field in TASK_ASSIGN tracks the current position in the chain. An agent receiving TASK_ASSIGN with `delegation_depth >= 3` MUST NOT further delegate; it MUST either execute the task itself or reject it.
+
+The depth limit is configurable per deployment. Implementations MAY set a lower limit. Implementations MUST NOT exceed the protocol maximum of 3 in v1.
+
+**Chain construction:**
+
+```
+A assigns to B (delegation_depth: 0)
+  B assigns to C (delegation_depth: 1)
+    C assigns to D (delegation_depth: 2)
+      D must execute or reject (delegation_depth: 3 would exceed limit)
+```
+
+When re-delegating, the delegatee:
+
+1. Increments `delegation_depth` by 1
+2. Sets `trust_level` to at most its own effective trust level for the parent task (§6.8 — no escalation)
+3. Sets `issuer_id` to its own identity (proximate delegator), but MUST include `parent_task_id` (§6.1) referencing the upstream task for auditability
+4. Computes a new `task_hash` for the subtask schema
+
+**Cancellation propagation.** Cancellation propagates down the chain. If A cancels the task assigned to B, B MUST cancel any subtasks it delegated to C, and C MUST cancel any subtasks it delegated to D. Each agent in the chain sends TASK_FAIL with error code `cancelled_upstream` to its delegatees.
+
+Cancellation is best-effort — a delegatee that has already sent TASK_COMPLETE before receiving the cancellation is not required to undo completed work. The delegator receiving a TASK_COMPLETE after initiating cancellation MAY discard the result.
+
+**Chain visibility.** The delegator at depth N has visibility only into depth N+1. A does not directly observe C or D. Intermediate agents (B, C) are responsible for aggregating results and propagating failures up the chain.
+
+### 6.10 Failure Handling
+
+> **Draft — community discussion in progress via [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15).**
+
+**Delegator owns recovery.** When a delegatee sends TASK_FAIL, the delegating agent — not the failing agent — decides the recovery strategy. The delegatee's responsibility ends at sending TASK_FAIL with as much information as possible (error details, partial results, trace_hash if any execution occurred).
+
+**Recovery options available to the delegator:**
+
+| Strategy | When appropriate |
+|----------|-----------------|
+| Reassign to a different agent | The failure is agent-specific (capability mismatch, resource exhaustion) |
+| Retry with same agent | The failure is transient (timeout, temporary resource unavailability) |
+| Absorb partial results and complete locally | Partial results are sufficient to finish the remaining work |
+| Propagate failure upstream | The delegator is itself a delegatee in a chain and cannot recover |
+| Abort | The task is no longer viable |
+
+**Partial results.** TASK_FAIL SHOULD include `partial_results` when any useful output was produced before failure. The format of `partial_results` SHOULD conform to `expected_output_format` where possible, with clear indication of which parts are complete and which are missing. This enables the "absorb and complete" recovery strategy.
+
+**Failure in delegation chains.** Failure at any depth propagates upward. Each intermediate agent receives TASK_FAIL from its delegatee and decides independently whether to recover or propagate. This means an intermediate agent MAY recover from a downstream failure without the upstream delegator ever seeing a TASK_FAIL — the chain is transparent only in the downward direction (assignment) and opaque in the upward direction (results), by design.
+
+**Relationship to §8:** TASK_FAIL is the cooperative failure mechanism — the delegatee knows it failed and reports. Zombie state (§8.1) is the uncooperative failure mechanism — the delegatee does not know it failed. Both terminate the same way from the delegator's perspective (the task did not complete), but require different detection paths: TASK_FAIL is self-reported; zombie state is externally detected (§4.2).
+
+### 6.11 Open Questions
+
+The following are explicitly identified as unresolved gaps in v0.1:
+
+1. **TASK_CANCEL as a first-class message.** Cancellation currently propagates via TASK_FAIL with `cancelled_upstream` error code (§6.9). Should TASK_CANCEL be a separate message type? A dedicated message makes intent explicit and avoids overloading TASK_FAIL semantics, but adds a seventh message type to the protocol.
+
+2. **Idempotency of TASK_ASSIGN.** If a delegator retransmits TASK_ASSIGN (e.g., due to transport-layer uncertainty about delivery), should the delegatee treat the duplicate as a new task or deduplicate by `task_id`? Deduplication is safer but requires the delegatee to maintain state about previously seen task_ids.
+
+3. **Trust level enumeration.** §6.8 defers trust level values to deployment configuration. Should the protocol define a minimum set of standard trust levels (e.g., `unrestricted`, `standard`, `restricted`, `sandboxed`) for interoperability, or is this purely deployment-specific?
+
+4. **Delegation depth limit rationale.** The v1 limit of 3 is pragmatic, not principled. Community input is needed on whether real-world delegation patterns require deeper chains and what the observability cost of deeper chains is.
+
+> Community discussion: See [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15).
+
 ## 7. Progress Reporting
 
 Progress verification uses an intent-execution merkle tree — a three-level hash structure that makes divergence between what was requested, what was planned, and what was executed both detectable and localizable.
