@@ -10,7 +10,7 @@
 - [ ] 4. Message Format
 - [ ] 5. Role Negotiation
 - [x] 6. Task Delegation
-- [ ] 7. Progress Reporting
+- [x] 7. Progress Reporting
 - [x] 8. Error Handling
 - [ ] 9. Security Considerations
 - [ ] 10. Versioning
@@ -99,7 +99,87 @@ canonical_json MUST produce deterministic output regardless of key insertion ord
 
 ## 7. Progress Reporting
 
-> _Stub — open for contribution._
+Progress verification uses an intent-execution merkle tree — a three-level hash structure that makes divergence between what was requested, what was planned, and what was executed both detectable and localizable.
+
+### 7.1 Tree Structure
+
+The merkle tree has three levels, each a SHA-256 hash:
+
+| Level | Name | Input | Description |
+|-------|------|-------|-------------|
+| L1 | Intent | SHA-256 of canonical task specification | What was requested. Derived from the task schema defined in §6.1. |
+| L2 | Execution Plan | SHA-256 of agent's decomposition into subtasks | How the agent planned to execute. Computed from the agent's internal plan representation. |
+| L3 | Trace | SHA-256 of actual execution sequence | What actually happened. Equivalent to `trace_hash` from §6.2. |
+
+**Merkle root:**
+
+```
+merkle_root = SHA-256(L1 || L2 || L3)
+```
+
+Where `||` denotes concatenation of the raw hash bytes (not hex-encoded strings).
+
+### 7.2 Divergence Localization
+
+Comparing merkle trees between agents or between expected and actual values localizes where divergence occurred:
+
+| Condition | Diagnosis |
+|-----------|-----------|
+| Root mismatch | Something diverged — inspect subtrees to localize. |
+| L1 match + L2 mismatch | **Plan divergence.** Same goal, different strategy. The agents agree on what was requested but decomposed execution differently. |
+| L1 + L2 match + L3 mismatch | **Execution divergence.** Same plan, different path. The agents agreed on the plan but actual execution differed. |
+
+Root mismatch is the entry point. Agents SHOULD NOT compare subtrees unless the root mismatches — subtree comparison without root mismatch is wasted work.
+
+### 7.3 Relationship to §6
+
+L3 is equivalent to `trace_hash` in §6.2. Systems that implement only §6 already produce L3. Upgrading to §7 is incremental: add L1 and L2, then compute the merkle root.
+
+L1 is derivable from the canonical task schema (§6.1) using the same canonical JSON approach specified in §6.4. L2 requires the executing agent to serialize its plan — see §7.7 open questions on canonical format.
+
+Orchestrators MAY use merkle root divergence as a renegotiation trigger, superseding the simpler `trace_hash` divergence signal described in §6.2.
+
+### 7.4 Pre-execution Commitment
+
+L1 and L2 CAN be computed and committed before execution begins. L3 is post-execution only.
+
+The executing agent commits to a plan (L2) before starting work. After execution completes and L3 is available, any mismatch between the committed L2 and the actual L3 is detectable — the agent planned one thing and did another.
+
+Pre-execution commitment sequence:
+
+1. Delegating agent transmits task (L1 is computable by both sides)
+2. Executing agent decomposes task, computes L2, commits L2 to delegating agent
+3. Executing agent performs work
+4. Executing agent computes L3, computes merkle root, transmits result with full tree
+5. Delegating agent verifies L1, checks L2 against committed value, validates merkle root
+
+### 7.5 Subtask Composition
+
+For delegated subtasks, subtask merkle roots compose into the parent tree. The parent's L3 includes the hashes of all subtask merkle roots, making subtask-level divergence localizable from the parent without requiring the parent to inspect subtask internals.
+
+A parent agent delegating N subtasks computes its L3 as:
+
+```
+parent_L3 = SHA-256(subtask_merkle_root_1 || subtask_merkle_root_2 || ... || subtask_merkle_root_N)
+```
+
+Subtask ordering in the concatenation MUST be deterministic — ordered by `task_id` lexicographically.
+
+### 7.6 Known Limitations
+
+1. **Plan serialization overhead.** Canonical serialization of execution plans is non-trivial for dynamic planners that adjust mid-execution. Implementations SHOULD define a minimum viable plan representation sufficient for L2 computation. Over-specifying plan format risks excluding valid planning approaches.
+
+2. **Temporal divergence.** The tree is a snapshot at completion time. Long-running tasks may diverge gradually in ways not captured until the tree is computed. The tree detects _that_ divergence occurred, not _when_ it began.
+
+### 7.7 Open Questions
+
+The following are explicitly identified as unresolved gaps in v0.1:
+
+1. **Canonical serialization format for L1 and L2.** L3 follows the §6.4 canonical JSON approach. L1 may follow the same approach (it derives from the task schema). L2 has no defined schema yet — plan representations vary across agent architectures.
+
+2. **Partial tree verification for scale.** Is submitting only changed levels acceptable for repeated tasks? Full tree recomputation may be wasteful when only L3 changes across executions of the same plan.
+
+3. **Recovery semantics per divergence level.** L2 mismatch (plan divergence) and L3 mismatch (execution divergence) likely require different recovery strategies. Whether to specify these in the protocol or defer to implementation is undecided.
 
 ## 8. Error Handling
 
