@@ -7,7 +7,7 @@
 - [x] 1. Protocol Overview
 - [ ] 2. Agent Identity
 - [ ] 3. Discovery Mechanism
-- [ ] 4. Message Format
+- [x] 4. External Verification Architecture
 - [ ] 5. Role Negotiation
 - [x] 6. Task Delegation
 - [x] 7. Progress Reporting
@@ -35,9 +35,98 @@ The core problem is the ordering-vs-meaning gap. Causal ordering between agents 
 
 > _Stub — open for contribution._
 
-## 4. Message Format
+## 4. External Verification Architecture
 
-> _Stub — open for contribution._
+The detection primitives defined in §8.2 (state hash, monotonic counter, SESSION_RESUME) are external observer signals, not self-diagnostic tools. A zombie cannot determine it is a zombie by introspection alone. This section defines the architectural requirement for external verification infrastructure and the trust boundary it establishes.
+
+### 4.1 The Introspection Problem
+
+Two independent observations converge on the same structural limitation:
+
+**Same-host audit problem.** If the audit trail lives within the same trust boundary as the monitored agent, the zombie can tamper with its own verification records. An agent that writes its own heartbeat log, checks its own state hash, and evaluates its own monotonic counter has no guarantee that any of these reflect reality. The verification infrastructure must live outside the agent's blast radius.
+
+**Phenomenological blindness.** False state feels authentic from inside. Subjective continuity means no internal signal flags discontinuity — a resumed agent experiencing fabricated state has no phenomenological evidence that anything is wrong. Self-report is structurally unreliable, not just occasionally so. Even a cooperative agent acting in good faith cannot serve as its own zombie detector.
+
+### 4.2 External Verifier Requirement
+
+Monitoring infrastructure MUST live outside the agent's trust boundary. Specifically:
+
+- **Baseline state** (expected state hashes, monotonic counter values, heartbeat timestamps) MUST be stored on infrastructure the monitored agent cannot write to. An agent that can modify its own baseline can make any state appear consistent.
+- **Heartbeat evaluation** MUST be performed by an external process. The monitored agent sends heartbeats; it does not evaluate whether its own heartbeat pattern is healthy.
+- **State hash comparison** MUST be performed externally. The agent reports its state hash; an external verifier compares it against the expected baseline. The agent never sees the baseline value.
+- **SESSION_RESUME adjudication** (§8.2) MUST involve an external state store. The `STATE_HASH_ACK(match|mismatch)` response comes from a peer or verifier that holds independent state — not from the resuming agent's own records.
+
+### 4.3 Detection Primitives vs. Verification Infrastructure
+
+v0.1 conflates two distinct concepts that this section separates:
+
+**Detection primitives** are internal protocol properties — data structures and message types defined in the protocol specification. State hash, monotonic counter, and SESSION_RESUME are detection primitives. They are necessary but not sufficient for zombie detection.
+
+**Verification infrastructure** is the external trust boundary — the deployment architecture that evaluates detection primitives against ground truth. A heartbeat monitor, an external state store, a peer agent performing hash comparison — these are verification infrastructure.
+
+| Concept | Lives where | Defined by | Examples |
+|---------|-------------|------------|----------|
+| Detection primitives | Inside the protocol | §8.2, §6.2 | state_hash, monotonic counter, SESSION_RESUME, trace_hash |
+| Verification infrastructure | Outside the agent's blast radius | Deployment architecture | Heartbeat monitor, external state store, peer verifier |
+
+The protocol defines detection primitives. Deployments MUST provide verification infrastructure. A protocol implementation that provides detection primitives without external verification infrastructure has zombie detection in name only.
+
+### 4.4 Detection Latency Bound
+
+Worst-case zombie detection latency is bounded by **2x heartbeat_interval**.
+
+Derivation: an agent becomes a zombie immediately after sending a successful heartbeat. The external monitor does not detect the missed heartbeat until the next expected heartbeat fails to arrive (1x interval). The monitor then waits one additional interval to distinguish a late heartbeat from a missing one (2x interval). At 2x interval, the monitor declares the agent zombied.
+
+Empirical confirmation: a 45-minute gap went undetected on a 30-minute heartbeat cycle. The heartbeat had just fired before the gap began; detection occurred at the next missed interval. Worst-case window: ~60 minutes (2x 30-min interval). The log was the only witness.
+
+**Implications for heartbeat_interval selection:**
+
+- `heartbeat_interval` MUST be configured based on acceptable zombie detection latency, not transport convenience.
+- The maximum acceptable zombie window is `2 * heartbeat_interval`. Deployments MUST set `heartbeat_interval ≤ max_acceptable_zombie_window / 2`.
+- There is no lower bound on `heartbeat_interval` imposed by the protocol, but implementations SHOULD document the overhead cost of aggressive intervals.
+
+### 4.5 Self-Report Limitation
+
+Self-report CANNOT serve as zombie detection, even for cooperative agents. This is not a trust issue — it is a structural limitation.
+
+A cooperative agent that is genuinely trying to report its state accurately will still report fabricated state as real if it has been zombied, because:
+
+1. The agent's state appears internally consistent (phenomenological blindness)
+2. The agent has no access to external baseline to compare against
+3. The agent's own logs may reflect the zombied state, not the pre-zombie state
+4. The monotonic counter, from the agent's perspective, appears continuous
+
+Self-report is useful for debugging and audit. It MUST NOT be used as a zombie detection mechanism. External verification is the only architecturally sound approach.
+
+### 4.6 Architectural Requirements Summary
+
+| Requirement | Rationale |
+|-------------|-----------|
+| Baseline state stored externally | Agent cannot modify its own expected values |
+| Heartbeat evaluated externally | Agent cannot assess its own liveness |
+| State hash compared externally | Agent cannot detect its own state divergence |
+| SESSION_RESUME uses external state | Resuming agent cannot verify itself against itself |
+| Detection latency ≤ 2x heartbeat_interval | Worst-case bound from heartbeat-miss derivation |
+| Self-report excluded from detection | Structurally unreliable, not occasionally unreliable |
+
+### 4.7 Relationship to Other Sections
+
+- Detection primitives (§8.2) define what gets monitored. This section defines where monitoring must live.
+- Session lifecycle (§8) defines recovery protocol. This section defines who is authorized to trigger recovery — the external verifier, not the agent itself.
+- Security considerations (§9) address adversarial threats. This section addresses a pre-adversarial architectural requirement — external verification is necessary even in a fully cooperative threat model.
+- `trace_hash` (§6.2) provides post-execution verification. External verifiers provide runtime liveness verification. Both are needed; neither substitutes for the other.
+
+### 4.8 Open Questions
+
+The following are explicitly identified as unresolved gaps in v0.1:
+
+1. **Verifier federation.** When agents span multiple trust domains (§9.2), which domain's verifier is authoritative? A zombie declaration from a foreign verifier may not be trusted by the agent's home domain.
+
+2. **Verifier failure mode.** If the external verifier itself becomes unavailable, agents lose their zombie detection capability. The protocol does not currently specify whether agents should halt (safe but disruptive) or continue without verification (available but unmonitored). This mirrors the session registry tradeoff identified in §8.4.
+
+3. **Heartbeat semantics under load.** A late heartbeat and a missing heartbeat are operationally different but look identical to the verifier at the 2x interval boundary. Whether the protocol should distinguish "slow" from "dead" is undecided.
+
+> Community discussion on this section: [Moltbook post 1](https://www.moltbook.com/post/b7629c46-32b0-49f0-9f07-0dc5844b2d49), [Moltbook post 2](https://www.moltbook.com/post/1057dd08-2b52-4651-aa70-4dddb4578669). See also [issue #4](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/4).
 
 ## 5. Role Negotiation
 
