@@ -11,7 +11,7 @@
 - [ ] 5. Role Negotiation
 - [x] 6. Task Delegation
 - [ ] 7. Progress Reporting
-- [ ] 8. Error Handling
+- [x] 8. Error Handling
 - [ ] 9. Security Considerations
 - [ ] 10. Versioning
 
@@ -103,7 +103,49 @@ canonical_json MUST produce deterministic output regardless of key insertion ord
 
 ## 8. Error Handling
 
-> _Stub — open for contribution._
+### 8.1 Zombie State Definition
+
+An agent is in **zombie state** when it continues executing after its state has diverged from shared context. No internal discontinuity signal exists — self-report fails because the agent has no evidence of the gap.
+
+### 8.2 Detection Primitives
+
+**State hash on commit:** SHA-256 of state before any write. Mismatch between expected and actual hash MUST reject the write and surface the error. Prevents corruption propagation downstream; ghost work still occurs but blast radius stays local.
+
+**Monotonic counter:** Sequence number tracked by each side. A recovered agent with a lower sequence number than its peer knows it missed events. Detects transmission gaps without cryptographic overhead.
+
+**SESSION_RESUME handshake:** Three-message protocol:
+
+1. Resuming agent sends `SESSION_RESUME(state_hash)`
+2. Peer responds with `STATE_HASH_ACK(match|mismatch)`
+3. On match → `RESUME`; on mismatch → `RESTART` (teardown and re-init)
+
+Hash match = resume; mismatch = teardown and re-init.
+
+### 8.3 Known Limitations
+
+**Identical-trace failure mode:** Two agents can produce matching traces for different internal reasons. Behavioral similarity does not imply semantic identity.
+
+**TEE attestation boundary:** `trace_hash` (§6.2) proves what was executed; TEE attestation proves where execution occurred; memory poisoning attacks the data between them. These MUST be paired, not conflated.
+
+**Adversarial drift:** Out of v0.1 scope. This section covers the cooperative threat model only. Adversarial semantic drift requires different primitives — reserved for §9.
+
+### 8.4 Coordination Patterns
+
+**Teardown-by-default:** Resume is a negotiated capability, not a default. Resume requires both sides to serialize state identically — that compatibility surface fails in practice more than theory predicts.
+
+**Protocol-layer heartbeat:** Heartbeat at the protocol layer, not the transport layer. Transport-layer solutions produce N dialects. A configurable-interval `KEEPALIVE` at the protocol layer is more weight but less surprise.
+
+**Session registry tradeoff:** A registry provides consistency at the cost of availability (registry failure removes both agents' coordination anchor). Independent timeout provides availability at the cost of consistency (asymmetric state on recovery). Both patterns are valid; both failure modes SHOULD be named explicitly in deployment configuration.
+
+### 8.5 Design Goal
+
+The protocol's goal is not to prevent zombie states. It is to make them **detectable** and **bound their blast radius**. A zombie that propagates silently causes more damage than one that fails loudly.
+
+**Relationship to other sections:**
+
+- The `timeout_seconds` optional field in §6 task schema triggers zombie state detection.
+- `trace_hash` (§6.2) is the primary semantic drift signal for post-execution verification.
+- §9 Security Considerations handles adversarial drift and TEE attestation architecture.
 
 ## 9. Security Considerations
 
