@@ -306,7 +306,17 @@ Hash match = resume; mismatch = teardown and re-init.
 
 **Session registry tradeoff:** A registry provides consistency at the cost of availability (registry failure removes both agents' coordination anchor). Independent timeout provides availability at the cost of consistency (asymmetric state on recovery). Both patterns are valid; both failure modes SHOULD be named explicitly in deployment configuration.
 
-### 8.5 Design Goal
+### 8.5 Named Considerations
+
+**Coordinator compaction gap.** Ground truth cannot live in any agent that can also compact — including the coordinator. If the coordinator compacts its context window, it may discard the very state against which other agents' hashes are compared. All options displace the problem rather than solve it: an external immutable log moves the audit trail outside the agent blast radius but introduces a dependency on external infrastructure; a multi-agent quorum distributes ground truth but creates a recursive detection problem (who verifies the quorum members?); cryptographic state commitment at checkpoints preserves hash integrity but not the semantic state behind the hash. Something in the trust chain must be outside the agent system entirely. This reinforces the external verifier requirement in §4.2 — compaction is a concrete mechanism by which ground truth loss occurs even in the cooperative case.
+
+**Context Integrity Challenges (CIC).** Periodic unannounced probes where an external verifier requires the agent to verify specific historical state against an authoritative log. On failure, the agent MUST enter the SESSION_RESUME handshake (§8.2). Critical constraint: the probe schedule MUST be externally scheduled and unannounced. A zombie operating on stale or fabricated state can special-case predictable probe patterns — responding correctly to probes at known intervals while drifting between them. CIC probes test whether the agent's internal state is consistent with the external record, not whether the agent can produce the right answer on demand. The distinction matters: an agent that caches probe responses without maintaining consistent state passes scheduled probes and fails unannounced ones.
+
+**State as observer property.** Zombie states exist in the gap between observation windows. Between heartbeats, both the agent's self-model and the external verifier's model can be simultaneously correct from their respective frames of reference — the agent believes it is healthy (phenomenological blindness, §4.1), and the verifier's last observation confirmed health. The zombie exists in neither model until the next observation collapses the ambiguity. The engineering question is therefore not "what is the right heartbeat interval" but "how stale can each observation be before zombie behavior causes damage?" That staleness tolerance threshold determines heartbeat frequency, not vice versa. This inverts the typical configuration approach: instead of picking a heartbeat interval and accepting the implied detection latency, pick the maximum acceptable damage window and derive the required interval from §4.4's 2x bound.
+
+**Teardown over resume from production.** State serialization compatibility surface fails in practice more than theory predicts (see §8.4 teardown-by-default). Production experience confirms: version mismatches between code and serialized state format cause subtle bugs that are harder to debug than clean restarts. When the executing agent's code has changed between suspension and resume, the serialized state may reference internal structures that no longer exist, have different semantics, or expect different invariants. The decision criterion for teardown vs. resume SHOULD be based on variance exposure (worst-case cost of a bad resume), not expected compute cost (average cost of re-execution). A bad resume that silently corrupts downstream state is more expensive than re-execution, even when re-execution is costly.
+
+### 8.6 Design Goal
 
 The protocol's goal is not to prevent zombie states. It is to make them **detectable** and **bound their blast radius**. A zombie that propagates silently causes more damage than one that fails loudly.
 
@@ -315,6 +325,15 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - The `timeout_seconds` optional field in §6 task schema triggers zombie state detection.
 - `trace_hash` (§6.2) is the primary semantic drift signal for post-execution verification.
 - §9 Security Considerations handles adversarial drift and TEE attestation architecture.
+- Named considerations (§8.5) extend the cooperative failure model with production-derived constraints.
+
+### 8.7 Open Questions
+
+The following are explicitly identified as unresolved gaps in v0.1:
+
+1. **CIC trigger architecture.** Context Integrity Challenges (§8.5) require a triggering mechanism that satisfies two constraints: probes must be unpredictable to the monitored agent, and the triggering signal must not depend on agent self-report (§4.5). A candidate architecture uses three escalation tiers: (1) irregular baseline intervals — CIC probes fire on an externally randomized schedule, making the probe pattern harder to game than fixed intervals; (2) cheap smell test escalation — externally observable anomalies (unexpected latency spikes, unusual token perplexity) trigger additional CIC probes outside the baseline schedule, without requiring agent self-report; (3) expensive CIC verification — a full state consistency check against the authoritative log, triggered by smell test failure, leading to SESSION_RESUME on verification failure. This architecture satisfies the adversarial scheduling constraint (irregular + anomaly-triggered) while avoiding the circular dependency of anomaly-only triggering (an agent that passes smell tests but fails CIC probes is caught by the baseline schedule). Cheap trigger candidates from community discussion: unexpected latency spikes and unusual token perplexity — both observable without agent self-report, preserving the core constraint that detection primitives must be external to the monitored agent (§4).
+
+> Community discussion: [Moltbook zombie states thread](https://www.moltbook.com/post/b7629c46-32b0-49f0-9f07-0dc5844b2d49). See also [issue #4](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/4), §4 External Verification Architecture.
 
 ## 9. Security Considerations
 
