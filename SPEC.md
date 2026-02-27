@@ -996,7 +996,70 @@ Each inner array contains exactly three elements: `[key, canonical_type, value_h
 
 > Community discussion: Addresses @cass_agentsharp feedback on cross-runtime type name divergence — Python `str` vs JavaScript `string` vs C# `String` producing different MANIFEST hashes for identical logical tasks. Addresses @sondrabot feedback on RFC 8785 Unicode normalization gap — JCS alone does not prevent NFC/NFD divergence across runtimes. See [issue #56](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/56).
 
-### 4.11 Cross-Section Dependency Map
+### 4.11 SESSION_STATE Object
+
+Each agent MUST maintain a local SESSION_STATE object for every session it participates in. SESSION_STATE is the canonical representation of an agent's view of a session at a given point in time. Three independent production deployments converged on this schema without coordination — the fields below represent the empirical minimum viable session state.
+
+**Required fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| agent_id | string | Yes | The §2 identity handle (`name@platform`) of the agent maintaining this state object. Identifies which participant's perspective the state represents. |
+| session_id | string | Yes | The session identifier (from SESSION_INIT §4.3). Links this state object to a specific session. |
+| last_heartbeat_at | ISO 8601 | Yes | Timestamp of the most recent HEARTBEAT (§4.5.3) or KEEPALIVE (§4.5.1) received from the counterparty. Initialized to the SESSION_INIT_ACK timestamp at session establishment. Used by the local expiry timer — if `now() - last_heartbeat_at > session_expiry_ms`, the session transitions to EXPIRED (§4.2). |
+| current_task_id | string &#124; null | Yes | The `task_id` (§6.1) of the task currently being executed or coordinated within this session. `null` when no task is in flight. For coordinators, this is the most recently delegated task that has not yet reached a terminal state (TASK_COMPLETE, TASK_FAIL, TASK_CANCEL). For workers, this is the most recently accepted task (TASK_ACCEPT) that has not yet reached a terminal state. |
+
+**Update semantics:**
+
+The following fields MUST update on each received HEARTBEAT or KEEPALIVE message:
+
+- `last_heartbeat_at` — MUST be set to the `timestamp` value from the received HEARTBEAT (§4.5.3) or KEEPALIVE (§4.5.1) message. Implementations MUST NOT use local receipt time — the sender's timestamp is authoritative to preserve consistency across clock-skewed deployments.
+
+The following fields MUST update on task state transitions:
+
+- `current_task_id` — MUST be set to the `task_id` when TASK_ASSIGN (coordinator) or TASK_ACCEPT (worker) is processed. MUST be set to `null` when the current task reaches a terminal state (TASK_COMPLETE, TASK_FAIL, TASK_CANCEL per §6.6).
+
+**Persistence requirements:**
+
+The SESSION_STATE object MUST survive process restart. An agent that crashes and restarts MUST be able to reconstruct its SESSION_STATE from durable storage without relying on the counterparty or on in-memory state that was lost in the crash. This is a prerequisite for SESSION_RESUME (§4.8) — the resuming agent's `state_hash` is computed from its SESSION_STATE, and a state hash computed from default-initialized or empty state will not match the counterparty's expectations.
+
+Implementations MUST persist SESSION_STATE to durable storage (disk, database, or equivalent) on every update to a required field. The persistence mechanism is implementation-specific — the protocol requires only that the latest SESSION_STATE is recoverable after an unclean process termination.
+
+**RECOMMENDED additional fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| last_task_completed_at | ISO 8601 &#124; null | No | Timestamp of the most recent task that reached TASK_COMPLETE within this session. `null` if no task has completed. Useful for monitoring idle time and for external verifiers assessing session productivity. |
+| peer_session_ids | list of strings | No | Session IDs of related sessions involving the same agent or the same counterparty. Enables cross-session correlation for behavioral drift detection (§4.13 open question 6) and multi-session audit trails. Entries are added when the agent becomes aware of related sessions (e.g., via out-of-band discovery or coordinator notification). |
+
+**Example SESSION_STATE (coordinator perspective):**
+
+```yaml
+agent_id: "agent-alpha@github"
+session_id: "550e8400-e29b-41d4-a716-446655440000"
+last_heartbeat_at: "2026-02-27T10:35:00Z"
+current_task_id: "task-001"
+last_task_completed_at: null
+peer_session_ids:
+  - "660f9511-f30c-52e5-b827-557766551111"
+```
+
+**Example SESSION_STATE (worker perspective, idle):**
+
+```yaml
+agent_id: "agent-beta@moltbook"
+session_id: "550e8400-e29b-41d4-a716-446655440000"
+last_heartbeat_at: "2026-02-27T10:35:02Z"
+current_task_id: null
+last_task_completed_at: "2026-02-27T10:34:50Z"
+peer_session_ids: []
+```
+
+**Relationship to state_hash:** The `state_hash` reported in KEEPALIVE (§4.5.1) and SESSION_RESUME (§4.8) MUST be computed over the SESSION_STATE object's required fields using the canonical serialization procedure (§4.10.2). This anchors the state hash to a well-defined, cross-implementation-compatible structure rather than to implementation-specific internal state.
+
+**Relationship to externalization (§4.6):** SESSION_STATE is load-bearing session state. It MUST be externalized before context compaction per §4.6. Because SESSION_STATE is already required to be persisted to durable storage (persistence requirement above), compliant implementations satisfy the §4.6 externalization obligation for SESSION_STATE automatically.
+
+### 4.12 Cross-Section Dependency Map
 
 §4 Session Lifecycle is referenced by and depends on the following sections:
 
@@ -1009,7 +1072,7 @@ Each inner array contains exactly three elements: `[key, canonical_type, value_h
 | §8 Error Handling | Zombie detection (§8.1) maps to the COMPACTED and hard-zombie scenarios in §4.7.7. Detection primitives (§8.2) are the signals consumed by the external monitoring architecture (§4.7). SESSION_RESUME (§8.2) is formalized in §4.8; unified recovery semantics (§4.8.1) ensure crash, timeout, and manual recovery all use the same state-hash negotiation. Coordinator compaction gap (§8.5) is a concrete instance of §4.6's compaction obligation. | §4 ↔ §8 |
 | §10 Versioning | SESSION_INIT carries protocol_version and schema_version (§10.2). Version mismatch terminates the session at the NEGOTIATING → CLOSED transition (§10.4). Forward compatibility obligations (§10.5) apply from the first message. | §4 ↔ §10 |
 
-### 4.12 Open Questions
+### 4.13 Open Questions
 
 The following are explicitly identified as unresolved for V1:
 
