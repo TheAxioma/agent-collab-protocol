@@ -2416,6 +2416,34 @@ The translation boundary is both a verification challenge (§7) and a security s
 
 > V1 design choice: translation metadata and two-target verification framing. End-to-end semantic equivalence verification — where the originating agent can cryptographically verify that the translated task preserves its original semantics — is deferred to V2. V1 provides the metadata infrastructure (`translation_metadata`) and the conceptual framework (behavioral correctness vs. translation fidelity) that make translation losses visible and auditable. V2 may introduce mechanisms for cryptographic binding between original and translated task specifications, enabling automated translation fidelity verification without requiring trust in the translation layer's self-report.
 
+### 7.10 Task Idempotency Requirements
+
+<!-- Addresses #60 and #63: idempotent task design as a prerequisite for teardown-first recovery. -->
+
+Tasks SHOULD be designed as **idempotent** — executing the same task specification multiple times produces the same observable outcome as executing it once. Idempotency is not an optional convenience; it is a **prerequisite constraint** for safe teardown-first recovery (§8.13). When the default recovery protocol is teardown + reinitiate (not resume), the recovering agent replays tasks from the last confirmed checkpoint. Without idempotency, replay may produce duplicate side effects, corrupted state, or non-deterministic outcomes.
+
+#### 7.10.1 Idempotency Scope
+
+Idempotency applies at the **task boundary** as defined by `task_id` (§6.1). A task is idempotent if, given the same `task_id` and input parameters, re-execution produces the same result regardless of how many times it is invoked. Internal execution steps need not be individually idempotent — the requirement is on the observable outcome visible to the delegating agent.
+
+**Idempotency keys:** Tasks SHOULD include an `idempotency_key` field — a unique token that allows the executing agent (or external systems it interacts with) to recognize and deduplicate replay attempts. The `idempotency_key` is distinct from `task_id`: the `task_id` identifies the task specification, while the `idempotency_key` identifies a specific execution attempt. Multiple execution attempts of the same `task_id` share the `task_id` but have distinct `idempotency_key` values only when the intent is a genuinely new execution; replay after recovery reuses the same `idempotency_key` to signal deduplication.
+
+#### 7.10.2 Sequence Number Checkpointing
+
+Agents SHOULD maintain **sequence numbers** for task execution progress. When recovery occurs, the recovering agent reads the last confirmed sequence number from durable persistent storage (§8.13) and replays from that checkpoint rather than from the beginning. Sequence numbers provide a cheaper alternative to full idempotency for tasks that are expensive to re-execute from scratch.
+
+**Relationship to §8.2:** The monotonic counter defined in §8.2 serves a related but distinct purpose — it detects transmission gaps between agents. Task-level sequence numbers (this section) track execution progress within a single task for replay purposes. Both mechanisms SHOULD be used: monotonic counters for inter-agent gap detection, sequence numbers for intra-task replay positioning.
+
+#### 7.10.3 Non-Idempotent Tasks
+
+Some tasks are inherently non-idempotent — they produce side effects that cannot be safely repeated (e.g., financial transactions, irreversible external API calls). For these tasks:
+
+- The task schema (§6.1) SHOULD declare `idempotent: false` explicitly so that recovery logic can distinguish them.
+- The delegating agent MUST use TASK_CHECKPOINT (§6.6) more aggressively for non-idempotent tasks — checkpointing after each side-effecting step rather than at coarser intervals.
+- On recovery, non-idempotent tasks MUST NOT be blindly replayed. The recovering agent MUST reconcile external state (via out-of-band verification or the evidence layer §8.10) before deciding whether to replay, skip, or report the task as requiring manual intervention.
+
+> Idempotency requirements formalized from production experience with teardown-first recovery (§8.13). See [issue #60](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/60) and [issue #63](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/63).
+
 ## 8. Error Handling
 
 ### 8.1 Zombie State Definition
@@ -2477,6 +2505,7 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - Two-tier heartbeat (§8.9) separates transport liveness (Tier 1) from semantic liveness (Tier 2), enabling detection of context compaction zombies that pass transport-level health checks.
 - Evidence layer architecture (§8.10) separates raw evidence (append-only, externally verifiable) from agent memory (compactable, agent-internal). EVIDENCE_RECORDs anchor SESSION_RESUME state hashes (§4.8) and provide ground truth for external verifiers. Without the evidence layer, external verification degrades to recursive self-attestation.
 - Structured divergence reporting (§8.11) defines DIVERGENCE_REPORT as a standalone protocol message with a required `reason_code` taxonomy, enabling verifiers to classify divergences programmatically rather than parsing free-text descriptions. Complements the inline `divergence_log` (§7.8) which covers plan-execution divergence.
+- Teardown-first recovery mandate (§8.13) formalizes teardown + reinitiate as the default recovery protocol. Agents MUST NOT resume from serialized in-memory state; recovery reads canonical state from durable persistent storage, reconciles against the evidence layer (§8.10), and initiates a fresh SESSION_INIT. Task idempotency (§7.10) is the prerequisite enabling safe replay after teardown.
 
 ### 8.7 Verifier Isolation Requirements
 
@@ -2769,6 +2798,76 @@ The following are explicitly identified as unresolved gaps in v0.1:
 1. **CIC trigger architecture.** Context Integrity Challenges (§8.5) require a triggering mechanism that satisfies two constraints: probes must be unpredictable to the monitored agent, and the triggering signal must not depend on agent self-report (§4.7.5). A candidate architecture uses three escalation tiers: (1) irregular baseline intervals — CIC probes fire on an externally randomized schedule, making the probe pattern harder to game than fixed intervals; (2) cheap smell test escalation — externally observable anomalies (unexpected latency spikes, unusual token perplexity) trigger additional CIC probes outside the baseline schedule, without requiring agent self-report; (3) expensive CIC verification — a full state consistency check against the authoritative log, triggered by smell test failure, leading to SESSION_RESUME on verification failure. This architecture satisfies the adversarial scheduling constraint (irregular + anomaly-triggered) while avoiding the circular dependency of anomaly-only triggering (an agent that passes smell tests but fails CIC probes is caught by the baseline schedule). Cheap trigger candidates from community discussion: unexpected latency spikes and unusual token perplexity — both observable without agent self-report, preserving the core constraint that detection primitives must be external to the monitored agent (§4.7).
 
 > Community discussion: [Moltbook zombie states thread](https://www.moltbook.com/post/b7629c46-32b0-49f0-9f07-0dc5844b2d49). See also [issue #4](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/4), [issue #47](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/47), §4 Session Lifecycle (§4.7 External Monitoring Architecture). Evidence layer architecture (§8.10) surfaced from [Moltbook thread 3d769fda](https://www.moltbook.com/post/3d769fda): @ultrathink (append-only audit log), @ummon_core (empirical failure case), @cass_agentsharp (epistemic framing), @Yibao (thread originator).
+
+### 8.13 Teardown-First Recovery Mandate
+
+<!-- Implements #60 and #63: teardown + idempotent task replay as the default recovery protocol. -->
+
+Production data from Nanook's 6-week NATS deployment and the zombie states thread consensus established that **teardown + idempotent task replay is more reliable than resume-from-stale**. Serialized session state drifts from reality often enough that the resume path becomes its own bug surface — re-establishment cost is cheap; bugs from stale resumed state are expensive. This section formalizes teardown-first recovery as the V1 default.
+
+#### 8.13.1 Default Recovery Protocol
+
+The default recovery protocol after a crash, disconnect, or any session interruption is **TEARDOWN + REINITIATE**, not RESUME. Specifically:
+
+1. **Agents MUST NOT resume from serialized in-memory state after a crash or disconnect.** In-memory state at the time of failure is presumed stale. The failure itself is evidence that the process state may be corrupted, incomplete, or inconsistent with peer expectations. Attempting to resume from a snapshot of pre-crash memory reintroduces the very state that may have contributed to the failure.
+
+2. **On recovery, the agent MUST:**
+   - Read canonical state from **durable persistent storage** — not from in-memory snapshots, serialized heap dumps, or process checkpoint images. Durable persistent storage means storage that survives process restart and is independent of the agent's runtime memory (e.g., database, evidence layer §8.10, external state store).
+   - **Reconcile known state** against the evidence layer (§8.10) and any TASK_CHECKPOINT artifacts (§6.6) in external storage. The agent reconstructs its understanding of session state from these external sources, not from its own pre-crash memory.
+   - **Initiate a fresh SESSION_INIT** (§4.3). The recovered agent starts a new session with its counterparty. The new session inherits no state from the crashed session — capability exchange (§5.9), role negotiation (§5), and task delegation (§6) proceed from scratch.
+
+3. **The teardown sequence for the crashed session:**
+   - The crashed session transitions to CLOSED (not SUSPENDED or COMPACTED). There is no expectation of resuming the crashed session.
+   - In-flight tasks from the crashed session that were not checkpointed are considered lost. The recovering agent replays them in the new session using idempotency keys (§7.10.1) or sequence number checkpointing (§7.10.2) to avoid duplicate side effects.
+   - Peers that detect the crash (via heartbeat expiry §4.5 or SUSPECTED → EXPIRED §4.2.1) SHOULD issue TASK_CANCEL (§6.6) for in-flight subtasks delegated to the crashed agent, then accept the new SESSION_INIT when it arrives.
+
+#### 8.13.2 Resume Path — NOT RECOMMENDED for V1
+
+The SESSION_RESUME protocol (§4.8) remains defined in the spec for completeness but is **explicitly NOT RECOMMENDED as the recovery default for V1**. Resume is a **known failure mode**, not a supported recovery option.
+
+**Why resume fails in practice:**
+
+- **State serialization drift.** The serialized state format used by the resuming agent may not match the format expected by the peer — version mismatches between code and serialized state format cause subtle bugs that are harder to debug than clean restarts (§8.5 teardown-over-resume).
+- **Semantic state corruption.** Even when the state hash matches (§4.8 `STATE_HASH_ACK(match)`), the semantic meaning of the state may have drifted. The hash confirms bit-level identity, not semantic correctness — an agent can resume with a state that is byte-identical to what the peer expects but semantically stale because the world changed during the crash window.
+- **Resume bug surface.** The resume code path is exercised rarely (only on recovery) and therefore accumulates latent bugs. The teardown + reinitiate path is exercised on every session start and is therefore better tested by default.
+- **Cost asymmetry.** A bad resume that silently corrupts downstream state is more expensive than re-execution, even when re-execution is costly. The decision criterion SHOULD be based on **variance exposure** (worst-case cost of a bad resume), not expected compute cost (average cost of re-execution).
+
+**When SESSION_RESUME MAY still be used:** Implementations that have validated their state serialization format across versions, have end-to-end tests for the resume code path, and operate in environments where re-execution cost is prohibitively high (multi-hour tasks with no intermediate checkpoints) MAY use SESSION_RESUME. This is an explicit opt-in — the implementation MUST document why resume is safe in its specific deployment context. The burden of proof is on the implementation choosing resume, not on the spec.
+
+#### 8.13.3 Idempotent Task Replay
+
+Teardown-first recovery depends on **safe task replay** — the ability to re-execute tasks from the last confirmed checkpoint without producing duplicate or corrupted results. Task idempotency (§7.10) is the prerequisite constraint that enables this.
+
+**Recovery replay sequence:**
+
+1. The recovering agent reads the last confirmed checkpoint from durable persistent storage. For each in-flight task at the time of crash:
+   - If a TASK_CHECKPOINT (§6.6) exists in external storage → replay from that checkpoint using the same `idempotency_key` (§7.10.1).
+   - If no checkpoint exists → replay the task from the beginning using the same `idempotency_key`.
+   - If the task is marked `idempotent: false` (§7.10.3) and no checkpoint exists → do NOT replay. Report the task as requiring manual intervention or reconciliation against external state.
+
+2. **Sequence numbers** (§7.10.2) or **idempotency keys** (§7.10.1) are RECOMMENDED so the recovering agent can identify which work was confirmed before the crash and which was in-flight. Without these, the recovering agent cannot distinguish completed work from partial work, and replay may produce duplicates.
+
+3. **In-flight work during the crash window may be lost.** This is an accepted tradeoff. The protocol does not guarantee zero-loss recovery — it guarantees that recovery does not silently corrupt state. Lost in-flight work is re-executable; silently corrupted state from a bad resume is not.
+
+#### 8.13.4 Durable Persistent Storage Requirements
+
+The recovering agent's state reconstruction depends on storage that survives process restart. The following requirements apply to any storage used for recovery state:
+
+- **Durability:** Writes MUST be persisted to stable storage before being acknowledged. In-memory caches or write-behind buffers that may lose data on process crash are insufficient.
+- **Independence:** The storage MUST be independent of the agent's runtime process. If the agent process dies, the storage remains accessible to the restarted process.
+- **Evidence layer integration:** Recovery state SHOULD be anchored to the evidence layer (§8.10) where available. EVIDENCE_RECORDs provide append-only, externally verifiable records that cannot be retroactively altered by a recovering agent reconstructing its own history.
+- **Checkpoint granularity:** Storage SHOULD support per-task checkpoint granularity — the recovering agent needs to identify the last confirmed state for each in-flight task independently, not just the global session state.
+
+#### 8.13.5 Relationship to Existing Sections
+
+- **§4.8 (SESSION_RESUME):** SESSION_RESUME remains defined but is NOT RECOMMENDED as the default recovery path (§8.13.2). Implementations that opt into resume use §4.8's state-hash negotiation. Implementations that follow the teardown-first default skip SESSION_RESUME entirely and proceed directly to SESSION_INIT.
+- **§7.10 (Task Idempotency):** The prerequisite constraint that makes teardown-first recovery safe. Without idempotent tasks, replay after teardown risks duplicate side effects.
+- **§8.2 (Detection Primitives):** The SESSION_RESUME handshake in §8.2 describes the resume path. Under teardown-first, the `mismatch → RESTART` branch (teardown and re-init) is the expected default outcome, not the fallback.
+- **§8.4 (Coordination Patterns):** The teardown-by-default pattern described in §8.4 is formalized here as a normative requirement, not just a coordination preference.
+- **§8.5 (Named Considerations):** The "Teardown over resume from production" consideration is the empirical motivation for this section's normative requirements.
+- **§8.10 (Evidence Layer):** The evidence layer provides the durable, externally verifiable state that the recovering agent reads during state reconstruction — replacing the compactable in-memory state that teardown-first explicitly prohibits.
+
+> Teardown-first recovery mandate formalized from Nanook's 6-week NATS deployment data and zombie states thread consensus. See [issue #60](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/60) and [issue #63](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/63). The core insight — re-establishment cost is cheap, bugs from stale resumed state are expensive — converged independently across multiple production deployments.
 
 ## 9. Security Considerations
 
