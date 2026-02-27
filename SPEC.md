@@ -1061,6 +1061,7 @@ SESSION_RESUME is the single recovery mechanism for all session interruptions �
 | sender_id | string | Yes | Identity of the closing agent. |
 | reason | string | No | Why the session is being closed. |
 | force | boolean | No | If `true`, close immediately without waiting for in-flight tasks. In-flight tasks are treated as failed. Default: `false`. |
+| amendments_log | array | No | Array of amendment audit entries recording each accepted PLAN_AMEND during the session (see §6.11.6). The delegatee MUST include `amendments_log` in SESSION_CLOSE when any PLAN_AMEND was accepted during the session. The delegating agent SHOULD re-verify all `amend_hash` values on receipt. |
 | timestamp | ISO 8601 | Yes | When the SESSION_CLOSE was sent. |
 
 ### 4.10 MANIFEST Canonicalization
@@ -1913,15 +1914,36 @@ Sent by the delegating agent to modify future (not-yet-started) steps in an acti
 | amended_steps | array | Yes | Array of step declarations (same schema as `steps` in PLAN_COMMIT) replacing or adding to future steps. Each step MUST have a `step_id` that either matches a not-yet-started step in the original plan or is a new step. |
 | removed_step_ids | array of strings | No | Array of `step_id` values to remove from the plan. Each listed step MUST be a not-yet-started step. Removing a step that has already been crossed or is currently executing is a protocol violation. |
 | amended_plan_hash | SHA-256 | Yes | New `plan_hash` computed over the amended plan (original plan with amendments applied). Becomes the active `plan_hash` for three-level alignment verification if the amendment is accepted. |
+| amend_hash | SHA-256 or HMAC-SHA-256 | Yes | Authorization hash binding the amendment to the session and specific change content. Computed as `SHA256(session_id \|\| step_id \|\| canonical_json(new_step_spec))` where `canonical_json` uses JCS (§4.10.2) and `step_id` is the first step in `amended_steps`. If a session-level HMAC key was negotiated at SESSION_INIT, `HMAC-SHA256(hmac_key, session_id \|\| step_id \|\| canonical_json(new_step_spec))` MUST be used instead. For amendments affecting multiple steps, the hash input concatenates all `step_id \|\| canonical_json(new_step_spec)` pairs in `amended_steps` array order. |
 | timestamp | ISO 8601 | Yes | When the PLAN_AMEND was sent. |
 
 **PLAN_AMEND semantics:**
 
 - PLAN_AMEND is valid only for steps whose end boundaries have **not** been crossed. An amendment targeting a crossed step MUST be rejected by the delegatee.
 - The delegatee MUST validate that all `step_id` values in `amended_steps` and `removed_step_ids` refer to not-yet-started steps. If any refer to crossed or in-progress steps, the delegatee MUST reject the amendment.
-- On accepting PLAN_AMEND, the delegatee MUST respond with PLAN_COMMIT_ACK (with `accepted: true` or `false`). The `amended_plan_hash` becomes the new active plan hash if accepted.
+- **amend_hash verification:** The delegatee MUST verify `amend_hash` on receipt by independently computing the hash from the received `session_id`, `amended_steps`, and the session-level HMAC key (if negotiated). On mismatch, the delegatee MUST reply with PLAN_AMEND_REJECT containing `step_id` and `reason=hash_mismatch`. The delegatee MUST NOT apply the amendment when `amend_hash` verification fails.
+- On accepting PLAN_AMEND (after successful `amend_hash` verification), the delegatee MUST respond with PLAN_COMMIT_ACK (with `accepted: true` or `false`). The `amended_plan_hash` becomes the new active plan hash if accepted.
+- On accepting PLAN_AMEND, the delegatee MUST append an entry to its `amendments_log` in durable session state (§6.11.6).
 - PLAN_AMEND does not reset step boundaries — all previously crossed steps remain committed and immutable.
 - Dependency constraints (`depends_on`) in amended steps are validated against the full amended plan, including both unchanged and amended steps. A `depends_on` reference to a removed step is malformed and MUST be rejected.
+
+**PLAN_AMEND_REJECT**
+
+Sent by the delegatee to reject a PLAN_AMEND that fails validation. PLAN_AMEND_REJECT is distinct from PLAN_COMMIT_ACK with `accepted: false` — it indicates a structural or authorization failure in the amendment itself, not a semantic disagreement about the amended plan content.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| plan_id | string | Yes | The `plan_hash_ref` from the rejected PLAN_AMEND, identifying which plan the amendment targeted. |
+| step_id | string | Yes | The `step_id` of the first step that triggered the rejection, or the first step in `amended_steps` for `hash_mismatch` rejections. |
+| reason | enum | Yes | Reason for rejection. One of: `hash_mismatch` (the `amend_hash` does not match the delegatee's independent computation — indicates potential unauthorized amendment or transmission corruption), `step_already_crossed` (the amendment targets a step whose end boundary has already been crossed — violates step boundary immutability), `invalid_spec` (the step specification in `amended_steps` is malformed, contains invalid `depends_on` references, or otherwise fails schema validation). |
+| timestamp | ISO 8601 | Yes | When the PLAN_AMEND_REJECT was sent. |
+
+**PLAN_AMEND_REJECT semantics:**
+
+- On receiving PLAN_AMEND_REJECT, the delegating agent MUST NOT assume the amendment was applied. The active plan remains unchanged — the `plan_hash` from before the rejected PLAN_AMEND is still the active plan hash.
+- For `hash_mismatch` rejections: the delegating agent SHOULD investigate the cause (transmission corruption, stale session state, or unauthorized third-party amendment attempt) before retrying. A repeated `hash_mismatch` from the same delegatee for the same amendment content indicates a systemic integrity problem, not a transient error.
+- For `step_already_crossed` rejections: the delegating agent MUST NOT retry the same amendment. The step is committed and immutable (§6.11.5).
+- For `invalid_spec` rejections: the delegating agent MAY revise the step specification and resubmit a corrected PLAN_AMEND.
 
 **TASK_REJECT**
 
@@ -1967,6 +1989,7 @@ Sent by the delegatee when the task finishes successfully.
 | delegation_chain | array of strings | No | Ordered list of agent identifiers representing every agent that handled or forwarded the task, in execution order (see §6.9.2). Present when the task involved sub-delegation. |
 | plan_hash_ref | SHA-256 | No | Back-reference to the `plan_hash` from the most recent PLAN_COMMIT (§6.6, §6.11) for this task. Enables audit log correlation and three-level alignment verification: L1 (`task_hash`) → L2 (`plan_hash_ref`) → L3 (`trace_hash`). Present when PLAN_COMMIT was sent during execution. |
 | completed_steps | array of strings | No | Array of `step_id` values (from the active PLAN_COMMIT's `steps` array) whose end boundaries were crossed before completion. Present when PLAN_COMMIT with steps was active. For a successful TASK_COMPLETE, this SHOULD include all steps in the plan. See §6.11.5 for partial completion semantics. |
+| amendments_log | array | No | Array of amendment audit entries recording each accepted PLAN_AMEND during execution (see §6.11.6). Present when any PLAN_AMEND was accepted during the task. The delegating agent SHOULD re-verify all `amend_hash` values on receipt to confirm that all spec drift was authorized. |
 
 The delegating agent SHOULD verify that `result` conforms to `expected_output_format` from the original TASK_ASSIGN. Non-conforming results are not a protocol error — the delegating agent decides whether to accept, reject, or request rework.
 
@@ -1987,6 +2010,7 @@ Sent by the delegatee when the task cannot be completed.
 | delegation_chain | array of strings | No | Ordered list of agent identifiers representing every agent that handled or forwarded the task, in execution order (see §6.9.2). Present when the task involved sub-delegation, even on failure — enables post-hoc audit of which agents were involved before the failure occurred. |
 | plan_hash_ref | SHA-256 | No | Back-reference to the `plan_hash` from the most recent PLAN_COMMIT (§6.6, §6.11) for this task. Present when PLAN_COMMIT was sent before failure — enables post-hoc analysis of whether failure was a plan-level or execution-level problem. |
 | completed_steps | array of strings | No | Array of `step_id` values (from the active PLAN_COMMIT's `steps` array) whose end boundaries were crossed before the failure. Present when PLAN_COMMIT with steps was active. The delegating agent MUST treat effects of crossed steps with `reversible: false` as committed even though the overall task failed (§6.11.5). |
+| amendments_log | array | No | Array of amendment audit entries recording each accepted PLAN_AMEND during execution (see §6.11.6). Present when any PLAN_AMEND was accepted before the failure. The delegating agent SHOULD re-verify all `amend_hash` values on receipt to confirm that all spec drift was authorized, even on task failure. |
 
 TASK_FAIL with `partial_results` is preferred over TASK_FAIL without — even incomplete output may be useful for recovery or reassignment. The delegating agent owns the recovery decision (see §6.10).
 
@@ -2038,6 +2062,7 @@ The delegation lifecycle follows a linear state machine:
 TASK_ASSIGN → TASK_ACCEPT → [PLAN_COMMIT → PLAN_COMMIT_ACK] → TASK_PROGRESS*    → TASK_COMPLETE
                                                                 TASK_CHECKPOINT*  → TASK_FAIL
                                                                ← PLAN_AMEND (delegator-initiated)
+                                                                 → PLAN_COMMIT_ACK or PLAN_AMEND_REJECT
                                                                ← TASK_CANCEL (delegator-initiated)
            → TASK_REJECT
 ```
@@ -2058,7 +2083,7 @@ TASK_ASSIGN → TASK_ACCEPT → [PLAN_COMMIT → PLAN_COMMIT_ACK] → TASK_PROGR
 | PLAN_COMMIT_ACK received (accepted) | PLAN_AMEND, TASK_CANCEL | Delegator |
 | PLAN_COMMIT_ACK received (rejected) | PLAN_COMMIT (revised) | Delegatee |
 | PLAN_COMMIT_ACK received (rejected) | TASK_CANCEL | Delegator |
-| PLAN_AMEND received | PLAN_COMMIT_ACK | Delegatee |
+| PLAN_AMEND received | PLAN_COMMIT_ACK, PLAN_AMEND_REJECT | Delegatee |
 | TASK_PROGRESS sent | TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
 | TASK_PROGRESS sent | PLAN_AMEND, TASK_CANCEL | Delegator |
 | TASK_CHECKPOINT sent | TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
@@ -2359,6 +2384,41 @@ When a session terminates mid-plan — whether due to crash, disconnect, timeout
 Crossed steps survive teardown-first recovery. When an agent recovers via the teardown-first protocol (§8.13), the `completed_steps` from the pre-crash plan MUST be carried forward. On reinitiation, the recovering agent includes the prior `completed_steps` in the new session context. The delegating agent MUST NOT re-request execution of steps that were already crossed and reported in `completed_steps` — those steps' effects are committed (if `reversible: false`) or subject to explicit rollback decision (if `reversible: true`). See §8.13.6 for the recovery cross-reference.
 
 > Step boundary semantics and partial completion handling formalized from [issue #70](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/70). The core insight: step boundaries create binding commitments — once a step's end boundary is crossed, its effects are real regardless of what happens to the overall plan. This is the fundamental difference between a step boundary and a progress checkpoint.
+
+#### 6.11.6 Amendments Audit Log
+
+<!-- Implements #66: amendments_log for verifiable spec drift audit trail -->
+
+Each accepted PLAN_AMEND creates an auditable record of authorized spec drift. The `amendments_log` is an append-only log maintained in the delegatee's durable session state that records every accepted amendment, enabling post-hoc verification that all plan modifications were authorized by the delegating agent.
+
+**Motivation:** Without `amend_hash`, spec drift is unverifiable. The delegating agent cannot distinguish authorized amendments from unilateral deviation by the delegatee. The `amend_hash` ties each amendment to the session identity and specific change content, creating an auditable re-commitment chain without requiring full PKI. The `amendments_log` complements the `crossed_steps` log from §6.11.5 — together they provide a full execution audit trail covering both what was done (crossed steps) and what was changed from the original plan (amendments).
+
+**amendments_log entry fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| step_id | string | Yes | The `step_id` of the amended step. For amendments affecting multiple steps, one entry is created per step. |
+| original_spec_hash | SHA-256 | Yes | SHA-256 hash of the original step specification (as it appeared in the PLAN_COMMIT or prior PLAN_AMEND before this amendment). Computed using canonical JSON serialization (§4.10.2). |
+| new_spec_hash | SHA-256 | Yes | SHA-256 hash of the amended step specification (as received in the PLAN_AMEND's `amended_steps`). Computed using canonical JSON serialization (§4.10.2). |
+| amend_hash | SHA-256 or HMAC-SHA-256 | Yes | The `amend_hash` value as received in the PLAN_AMEND message. Preserved verbatim for re-verification by the delegating agent. |
+| timestamp | ISO 8601 | Yes | Timestamp of when the PLAN_AMEND was accepted by the delegatee (i.e., when the delegatee sent PLAN_COMMIT_ACK with `accepted: true`). |
+
+**Log maintenance requirements:**
+
+- The delegatee MUST append an entry to `amendments_log` for each accepted PLAN_AMEND, immediately upon sending PLAN_COMMIT_ACK with `accepted: true`. Rejected amendments (PLAN_AMEND_REJECT or PLAN_COMMIT_ACK with `accepted: false`) are NOT logged in `amendments_log`.
+- `amendments_log` is append-only. Entries MUST NOT be modified or removed after insertion. The log is a durable audit artifact, not a mutable data structure.
+- `amendments_log` MUST be persisted to durable storage (§8.13.4) on each append. The log MUST survive process restart — it is part of the delegatee's durable session state alongside SESSION_STATE (§4.11).
+- For amendments affecting multiple steps (multiple entries in `amended_steps`), the delegatee MUST create one `amendments_log` entry per affected step. Each entry records the individual step's original and new spec hashes.
+
+**Inclusion in terminal messages:**
+
+- On session completion or teardown, the delegatee MUST include `amendments_log` in TASK_COMPLETE, TASK_FAIL, or SESSION_CLOSE (§4.9). This enables the delegating agent to re-verify the full amendment history as part of result acceptance.
+- The delegating agent SHOULD re-verify all `amend_hash` values in the received `amendments_log` by recomputing each hash from its own records of issued PLAN_AMEND messages. Any mismatch between the delegating agent's issued amendments and the delegatee's `amendments_log` indicates unauthorized spec drift or state corruption.
+- If re-verification reveals a mismatch, the delegating agent SHOULD treat the task result with reduced trust. The appropriate response is deployment-specific — options include rejecting the result, flagging for manual review, or emitting a DIVERGENCE_REPORT (§8.11).
+
+**Relationship to evidence layer (§8.10):** The `amendments_log` SHOULD be anchored to the evidence layer where available. Each `amendments_log` entry is a candidate for an EVIDENCE_RECORD — the `amend_hash` provides the content hash, and the `timestamp` provides the temporal anchor. Evidence layer anchoring makes the amendment audit trail externally verifiable, not just bilaterally verifiable between delegator and delegatee.
+
+> Amendments audit log formalized from [issue #66](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/66). The core insight: without `amend_hash`, a delegatee could claim to have received an amendment that was never issued, or a delegating agent could deny issuing one. The hash ties each amendment to the session identity and specific change content, closing the spec drift audit gap.
 
 ### 6.12 Open Questions
 
@@ -3087,6 +3147,31 @@ Teardown-first recovery (§8.13.1) tears down the crashed session and initiates 
 > Crossed step recovery semantics formalized from [issue #70](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/70). Step boundaries create durable commitments that outlive sessions — teardown destroys session state but cannot undo real-world effects of irreversible steps.
 
 > Teardown-first recovery mandate formalized from Nanook's 6-week NATS deployment data and zombie states thread consensus. See [issue #60](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/60) and [issue #63](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/63). The core insight — re-establishment cost is cheap, bugs from stale resumed state are expensive — converged independently across multiple production deployments.
+
+#### 8.13.7 Amendments Survive Teardown-First Recovery
+
+<!-- Implements #66: amendments_log durability through teardown-first recovery -->
+
+The `amendments_log` (§6.11.6) is a **durable artifact** — it MUST be preserved through session teardown. Teardown-first recovery (§8.13.1) tears down the crashed session and initiates a fresh one, but the amendment history from the pre-crash session is not erased by teardown. Amendments record authorized spec drift that occurred during plan execution; discarding this record on teardown would create an audit gap where the delegating agent cannot verify whether the delegatee's execution reflected the original plan or an authorized modification.
+
+**Recovery sequence for sessions with amendments:**
+
+1. The recovering agent reads the `amendments_log` from durable persistent storage (§8.13.4). The `amendments_log` is persisted alongside other durable session state (SESSION_STATE §4.11, `completed_steps` §8.13.6). Sources include: the delegatee's durable session state store, or the evidence layer (§8.10) if amendment entries were anchored as EVIDENCE_RECORDs.
+
+2. On reinitiation (fresh SESSION_INIT), the delegatee MUST include the `amendments_log` from the pre-crash session when reporting results or status to the delegating agent. This confirms that any spec drift during the pre-crash session was authorized. The `amendments_log` is carried in the first terminal message (TASK_COMPLETE, TASK_FAIL, or SESSION_CLOSE) of the recovery session that references work from the pre-crash plan.
+
+3. **Divergence detection:** The delegating agent MUST compare the received `amendments_log` against its own local record of issued PLAN_AMEND messages. If the delegating agent's local `amendments_log` diverges from the delegatee's — entries present in one but not the other, or `amend_hash` values that do not match — the session MUST be terminated. The divergence indicates one of: unauthorized spec drift (the delegatee applied amendments that were never issued), state corruption (the delegating agent's or delegatee's durable state was corrupted during the crash), or a repudiation attempt (one party is denying amendments that occurred).
+
+4. On divergence detection, the delegating agent MUST:
+   - Send SESSION_CLOSE with `reason: "amendments_log_divergence"`.
+   - Emit a DIVERGENCE_REPORT (§8.11) with `deviation_type: "amendments_log_mismatch"` documenting the specific entries that diverge.
+   - MUST NOT accept task results from the divergent session — the execution audit trail is compromised.
+
+**Relationship to crossed steps (§8.13.6):** The `amendments_log` and `completed_steps` are complementary durable artifacts. `completed_steps` records what was done; `amendments_log` records what was changed from the original plan. Together they provide a complete execution audit trail that survives teardown: the delegating agent can reconstruct the full execution history by combining the original PLAN_COMMIT, the `amendments_log` (authorized modifications), and the `completed_steps` (execution progress).
+
+**Relationship to evidence layer (§8.10):** Where the evidence layer is available, `amendments_log` entries SHOULD be anchored as EVIDENCE_RECORDs during execution (not only at session completion). This provides an externally verifiable record that survives not just session teardown but also bilateral state corruption — if both the delegating agent and delegatee lose their local `amendments_log`, the evidence layer preserves the amendment history.
+
+> Amendments recovery semantics formalized from [issue #66](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/66). The core insight: without durable `amendments_log`, teardown-first recovery erases the spec drift audit trail — the recovering agent cannot verify whether the pre-crash execution reflected the original plan or authorized modifications. Divergence between delegator and delegatee `amendments_log` on recovery is a terminal condition because the integrity of the entire execution audit trail is compromised.
 
 ### 8.14 SUSPECTED State and Heartbeat Negotiation Prerequisites
 
