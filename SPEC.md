@@ -1771,7 +1771,7 @@ Two agents — one in Python using `json.dumps`, one in Rust using `serde_cbor` 
 
 > **Draft — community discussion in progress via [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15).**
 
-The delegation protocol uses nine message types. All messages MUST include `task_id` for correlation.
+The delegation protocol uses eleven message types. All messages MUST include `task_id` for correlation.
 
 **TASK_ASSIGN**
 
@@ -1831,8 +1831,41 @@ Sent by the delegatee to the coordinator after TASK_ACCEPT (and after SESSION_IN
 | session_id | string | Yes | Echoed from TASK_ASSIGN |
 | plan_hash | SHA-256 | Yes | Hash of the delegatee's canonical plan representation. MUST be deterministic for the same logical plan. Recommended: SHA-256 of canonical UTF-8 JSON. The canonical representation is implementation-defined but MUST be documented in the agent's capability manifest (§5.1). |
 | task_hash_ref | SHA-256 | Yes | The `task_hash` (§6.1) of the task this plan was made against. Binds the plan commitment to a specific task version — any task modification invalidates the prior commitment and requires a new PLAN_COMMIT. |
+| steps | array | Yes | Ordered array of step declarations defining the plan's execution structure. See step declaration schema below. |
 | spec_version | semver | Yes | Protocol spec version governing this plan commitment (§10). |
 | timestamp | ISO 8601 | Yes | When the PLAN_COMMIT was sent. |
+
+**Step declaration schema:**
+
+Each element in the `steps` array MUST conform to the following schema:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| step_id | string | Yes | Unique identifier within this plan. MUST be unique across all steps in the same PLAN_COMMIT. |
+| description | string | Yes | Human-readable description of what this step accomplishes. |
+| estimated_tokens | integer | No | Estimated token budget for this step. Informational — not enforced by the protocol. |
+| reversible | boolean | No | Whether the step's effects can be undone after completion. Default: `false`. When `false`, the delegating agent MUST treat the step's effects as committed once its end boundary is crossed (§6.11.5). |
+| depends_on | array of strings | No | Array of `step_id` values that MUST have crossed their end boundary before this step may begin. The delegatee enforces this constraint — a step with `depends_on` MUST NOT begin execution until all listed dependency steps have completed. Circular dependencies are malformed and MUST be rejected. |
+
+**Example step declaration:**
+
+```yaml
+steps:
+  - step_id: "parse-input"
+    description: "Parse and validate input document structure"
+    estimated_tokens: 2000
+    reversible: true
+  - step_id: "transform-data"
+    description: "Apply transformation rules to parsed data"
+    estimated_tokens: 5000
+    reversible: false
+    depends_on: ["parse-input"]
+  - step_id: "write-output"
+    description: "Write transformed data to output format"
+    estimated_tokens: 3000
+    reversible: false
+    depends_on: ["transform-data"]
+```
 
 **PLAN_COMMIT semantics:**
 
@@ -1841,6 +1874,54 @@ Sent by the delegatee to the coordinator after TASK_ACCEPT (and after SESSION_IN
 - The spec MUST NOT mandate a specific internal plan representation format — agent architectures vary too widely. It MUST require that `plan_hash` is deterministic for the same logical plan.
 - PLAN_COMMIT MAY be sent even when `plan_commit_required` is `false` — the coordinator SHOULD accept and store it for audit purposes regardless.
 - A delegatee MAY send a new PLAN_COMMIT to supersede a previous one (e.g., after receiving updated task parameters). Only the most recent PLAN_COMMIT is considered the active commitment.
+
+**Step boundary semantics:**
+
+- A **step boundary** is crossed when the delegatee transitions from one `step_id` to the next. When a step boundary is crossed, the previous step is **immutable** — its outputs may be treated as committed by the delegating agent.
+- Once a step boundary has been crossed, the delegating agent MUST NOT amend that step. PLAN_AMEND (§6.6) is only valid for future (not-yet-started) steps. An amendment that attempts to modify a step whose end boundary has already been crossed is a protocol violation and MUST be rejected by the delegatee.
+- The delegatee SHOULD report step boundary crossings via TASK_PROGRESS (§6.6) by including the `current_step_id` field. This enables the delegating agent to track which steps are committed and which remain amendable.
+- Step boundary crossing is monotonic — a step that has been crossed cannot be "uncrossed." The delegatee MUST NOT re-enter a step whose boundary has been crossed. If re-execution of a completed step's logic is necessary (e.g., due to downstream failure), the delegatee MUST declare a new step in a PLAN_AMEND that captures the rework.
+
+**PLAN_COMMIT_ACK:**
+
+PLAN_COMMIT_ACK is the acknowledgment message for plan-related messages. When responding to PLAN_COMMIT, the **delegating agent** (coordinator) sends it. When responding to PLAN_AMEND, the **delegatee** sends it. In both cases, the receiving party MUST reply with PLAN_COMMIT_ACK within the session heartbeat timeout (§4.5). Failure to respond within the heartbeat timeout is a protocol violation — the sender MAY treat it as equivalent to rejection.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| task_id | UUID v4 | Yes | Echoed from PLAN_COMMIT |
+| session_id | string | Yes | Echoed from PLAN_COMMIT |
+| accepted | boolean | Yes | Whether the delegatee accepts the committed plan. |
+| reason | string | No | Required when `accepted` is `false`. Explanation of why the plan was rejected. |
+| first_rejected_step_id | string | No | Required when `accepted` is `false`. The `step_id` of the first step the delegatee cannot accept. Steps prior to this one are implicitly acceptable. |
+| timestamp | ISO 8601 | Yes | When the PLAN_COMMIT_ACK was sent. |
+
+**PLAN_COMMIT_ACK semantics:**
+
+- In the PLAN_COMMIT flow: the delegating agent (coordinator) sends PLAN_COMMIT_ACK in response to the delegatee's PLAN_COMMIT. In the PLAN_AMEND flow: the delegatee sends PLAN_COMMIT_ACK in response to the delegating agent's PLAN_AMEND.
+- When `accepted: true`, the plan (or amendment) becomes the active commitment for three-level alignment verification (§6.11.1). The delegatee MAY begin or continue execution.
+- When `accepted: false`, the plan (or amendment) is rejected. The `first_rejected_step_id` indicates where the plan becomes unacceptable. For a rejected PLAN_COMMIT, the delegatee MAY construct a revised PLAN_COMMIT. For a rejected PLAN_AMEND, the delegating agent MAY revise the amendment. The delegatee MUST NOT begin execution of a rejected plan.
+
+**PLAN_AMEND**
+
+Sent by the delegating agent to modify future (not-yet-started) steps in an active PLAN_COMMIT. PLAN_AMEND respects step boundary immutability — it cannot modify steps whose end boundaries have already been crossed.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| task_id | UUID v4 | Yes | Echoed from PLAN_COMMIT |
+| session_id | string | Yes | Echoed from PLAN_COMMIT |
+| plan_hash_ref | SHA-256 | Yes | The `plan_hash` of the active PLAN_COMMIT being amended. Ensures the amendment targets the correct plan version. |
+| amended_steps | array | Yes | Array of step declarations (same schema as `steps` in PLAN_COMMIT) replacing or adding to future steps. Each step MUST have a `step_id` that either matches a not-yet-started step in the original plan or is a new step. |
+| removed_step_ids | array of strings | No | Array of `step_id` values to remove from the plan. Each listed step MUST be a not-yet-started step. Removing a step that has already been crossed or is currently executing is a protocol violation. |
+| amended_plan_hash | SHA-256 | Yes | New `plan_hash` computed over the amended plan (original plan with amendments applied). Becomes the active `plan_hash` for three-level alignment verification if the amendment is accepted. |
+| timestamp | ISO 8601 | Yes | When the PLAN_AMEND was sent. |
+
+**PLAN_AMEND semantics:**
+
+- PLAN_AMEND is valid only for steps whose end boundaries have **not** been crossed. An amendment targeting a crossed step MUST be rejected by the delegatee.
+- The delegatee MUST validate that all `step_id` values in `amended_steps` and `removed_step_ids` refer to not-yet-started steps. If any refer to crossed or in-progress steps, the delegatee MUST reject the amendment.
+- On accepting PLAN_AMEND, the delegatee MUST respond with PLAN_COMMIT_ACK (with `accepted: true` or `false`). The `amended_plan_hash` becomes the new active plan hash if accepted.
+- PLAN_AMEND does not reset step boundaries — all previously crossed steps remain committed and immutable.
+- Dependency constraints (`depends_on`) in amended steps are validated against the full amended plan, including both unchanged and amended steps. A `depends_on` reference to a removed step is malformed and MUST be rejected.
 
 **TASK_REJECT**
 
@@ -1863,6 +1944,7 @@ Optionally sent by the delegatee during execution. Serves as both a progress upd
 | task_id | UUID v4 | Yes | Echoed from TASK_ASSIGN |
 | session_id | string | Yes | Echoed from TASK_ASSIGN |
 | progress | object | No | Structured progress data (percentage, subtask status, etc.) |
+| current_step_id | string | No | The `step_id` (from the active PLAN_COMMIT's `steps` array) of the step currently being executed. Present when PLAN_COMMIT with steps is active. When `current_step_id` changes from a previous TASK_PROGRESS, this signals that the previous step's end boundary has been crossed. |
 | timestamp | ISO 8601 | Yes | When this progress report was generated |
 | version_chain_summary | object | No | Summary of the protocol version chain across downstream hops known at the time of this progress report (see §6.9.1). Present when the delegatee has sub-delegated and has received version chain information from downstream. |
 | delegation_chain | array of strings | No | Ordered list of agent identifiers representing every agent that handled or forwarded the task, in execution order (see §6.9.2). Present when the task involves sub-delegation. |
@@ -1884,6 +1966,7 @@ Sent by the delegatee when the task finishes successfully.
 | divergence_log | array | No | Array of divergence entries recording each point where execution departed from the committed plan (see §7.8). Present when `trace_hash` differs from the committed plan hash (L2, §7.4). |
 | delegation_chain | array of strings | No | Ordered list of agent identifiers representing every agent that handled or forwarded the task, in execution order (see §6.9.2). Present when the task involved sub-delegation. |
 | plan_hash_ref | SHA-256 | No | Back-reference to the `plan_hash` from the most recent PLAN_COMMIT (§6.6, §6.11) for this task. Enables audit log correlation and three-level alignment verification: L1 (`task_hash`) → L2 (`plan_hash_ref`) → L3 (`trace_hash`). Present when PLAN_COMMIT was sent during execution. |
+| completed_steps | array of strings | No | Array of `step_id` values (from the active PLAN_COMMIT's `steps` array) whose end boundaries were crossed before completion. Present when PLAN_COMMIT with steps was active. For a successful TASK_COMPLETE, this SHOULD include all steps in the plan. See §6.11.5 for partial completion semantics. |
 
 The delegating agent SHOULD verify that `result` conforms to `expected_output_format` from the original TASK_ASSIGN. Non-conforming results are not a protocol error — the delegating agent decides whether to accept, reject, or request rework.
 
@@ -1903,6 +1986,7 @@ Sent by the delegatee when the task cannot be completed.
 | divergence_log | array | No | Array of divergence entries recording plan departures that occurred before failure (see §7.8). Present when any execution occurred before failure and the execution diverged from the committed plan. |
 | delegation_chain | array of strings | No | Ordered list of agent identifiers representing every agent that handled or forwarded the task, in execution order (see §6.9.2). Present when the task involved sub-delegation, even on failure — enables post-hoc audit of which agents were involved before the failure occurred. |
 | plan_hash_ref | SHA-256 | No | Back-reference to the `plan_hash` from the most recent PLAN_COMMIT (§6.6, §6.11) for this task. Present when PLAN_COMMIT was sent before failure — enables post-hoc analysis of whether failure was a plan-level or execution-level problem. |
+| completed_steps | array of strings | No | Array of `step_id` values (from the active PLAN_COMMIT's `steps` array) whose end boundaries were crossed before the failure. Present when PLAN_COMMIT with steps was active. The delegating agent MUST treat effects of crossed steps with `reversible: false` as committed even though the overall task failed (§6.11.5). |
 
 TASK_FAIL with `partial_results` is preferred over TASK_FAIL without — even incomplete output may be useful for recovery or reassignment. The delegating agent owns the recovery decision (see §6.10).
 
@@ -1951,13 +2035,14 @@ Sent by the delegating agent to explicitly cancel an in-flight task. TASK_CANCEL
 The delegation lifecycle follows a linear state machine:
 
 ```
-TASK_ASSIGN → TASK_ACCEPT → [PLAN_COMMIT] → TASK_PROGRESS*    → TASK_COMPLETE
-                                             TASK_CHECKPOINT*  → TASK_FAIL
+TASK_ASSIGN → TASK_ACCEPT → [PLAN_COMMIT → PLAN_COMMIT_ACK] → TASK_PROGRESS*    → TASK_COMPLETE
+                                                                TASK_CHECKPOINT*  → TASK_FAIL
+                                                               ← PLAN_AMEND (delegator-initiated)
                                                                ← TASK_CANCEL (delegator-initiated)
            → TASK_REJECT
 ```
 
-`[PLAN_COMMIT]` is optional by default; it becomes mandatory when `plan_commit_required: true` was negotiated in SESSION_INIT (§4.3).
+`[PLAN_COMMIT → PLAN_COMMIT_ACK]` is optional by default; it becomes mandatory when `plan_commit_required: true` was negotiated in SESSION_INIT (§4.3). PLAN_AMEND is valid only after PLAN_COMMIT_ACK and only for not-yet-started steps.
 
 **State transitions:**
 
@@ -1967,18 +2052,23 @@ TASK_ASSIGN → TASK_ACCEPT → [PLAN_COMMIT] → TASK_PROGRESS*    → TASK_COM
 | TASK_ASSIGN sent | TASK_ACCEPT, TASK_REJECT | Delegatee |
 | TASK_ACCEPT sent | PLAN_COMMIT, TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
 | TASK_ACCEPT sent | TASK_CANCEL | Delegator |
-| PLAN_COMMIT sent | PLAN_COMMIT (supersede), TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
-| PLAN_COMMIT sent | TASK_CANCEL | Delegator |
+| PLAN_COMMIT received | PLAN_COMMIT_ACK | Delegator (coordinator) |
+| PLAN_COMMIT received | TASK_CANCEL | Delegator |
+| PLAN_COMMIT_ACK received (accepted) | PLAN_COMMIT (supersede), TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
+| PLAN_COMMIT_ACK received (accepted) | PLAN_AMEND, TASK_CANCEL | Delegator |
+| PLAN_COMMIT_ACK received (rejected) | PLAN_COMMIT (revised) | Delegatee |
+| PLAN_COMMIT_ACK received (rejected) | TASK_CANCEL | Delegator |
+| PLAN_AMEND received | PLAN_COMMIT_ACK | Delegatee |
 | TASK_PROGRESS sent | TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
-| TASK_PROGRESS sent | TASK_CANCEL | Delegator |
+| TASK_PROGRESS sent | PLAN_AMEND, TASK_CANCEL | Delegator |
 | TASK_CHECKPOINT sent | TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
-| TASK_CHECKPOINT sent | TASK_CANCEL | Delegator |
+| TASK_CHECKPOINT sent | PLAN_AMEND, TASK_CANCEL | Delegator |
 | TASK_CANCEL sent | TASK_FAIL (with `cancelled`), TASK_COMPLETE (if already finished) | Delegatee |
 | TASK_COMPLETE sent | (terminal) | — |
 | TASK_FAIL sent | (terminal) | — |
 | TASK_REJECT sent | (terminal) | — |
 
-Messages received out of sequence MUST be rejected. An agent that receives TASK_PROGRESS for a task_id it never sent TASK_ASSIGN for MUST ignore the message and MAY log it as anomalous. When `plan_commit_required: true` is active (§4.3), TASK_PROGRESS received before PLAN_COMMIT for the same `task_id` is a protocol violation — the coordinator MUST reject it.
+Messages received out of sequence MUST be rejected. An agent that receives TASK_PROGRESS for a task_id it never sent TASK_ASSIGN for MUST ignore the message and MAY log it as anomalous. When `plan_commit_required: true` is active (§4.3), TASK_PROGRESS received before PLAN_COMMIT_ACK (with `accepted: true`) for the same `task_id` is a protocol violation — the coordinator MUST reject it.
 
 **Timeout behavior:** If `timeout_seconds` is set in the task schema (§6.1) and the delegatee has not sent TASK_COMPLETE or TASK_FAIL within that window after TASK_ACCEPT, the delegator MAY treat the task as failed. The delegator SHOULD send no message — timeout is a delegator-side decision, not a protocol message. The delegatee may still be executing (zombie state, §8.1); the external verifier (§4.7.2) handles liveness determination.
 
@@ -2240,6 +2330,35 @@ SEMANTIC_RESPONSE messages (§8.9.2) MAY include the agent's current `plan_hash`
 3. `current_state_hash` verification: is the agent's working state internally consistent?
 
 An agent that passes `task_hash` verification but fails `plan_hash` verification has lost its plan context — it knows what was requested but has forgotten what it committed to doing about it. This is a distinct failure mode from full context compaction (which loses both) and detectable only when PLAN_COMMIT is in use.
+
+#### 6.11.5 Partial Completion and Step Boundary Obligations
+
+<!-- Implements #70: partial completion handling for PLAN_COMMIT step boundaries -->
+
+When a session terminates mid-plan — whether due to crash, disconnect, timeout, or explicit SESSION_CLOSE — the delegatee MUST report which steps completed before termination. Partial completion creates binding obligations based on each step's `reversible` flag.
+
+**Reporting requirements:**
+
+- If the session terminates mid-plan, the delegatee MUST include a `completed_steps` array in the terminal message (TASK_COMPLETE, TASK_FAIL, or SESSION_CLOSE). The `completed_steps` array lists all `step_id` values whose end boundaries were crossed before termination.
+- `completed_steps` MUST only contain steps whose end boundaries were fully crossed. A step that was in progress when termination occurred is NOT included — its effects are undefined and the delegating agent MUST NOT treat it as committed.
+- If the delegatee is unable to send a terminal message (e.g., hard crash), the delegating agent reconstructs `completed_steps` from the last TASK_PROGRESS or TASK_CHECKPOINT that reported a `current_step_id` transition, combined with evidence layer records (§8.10) if available.
+
+**Commitment obligations based on `reversible` flag:**
+
+- If `reversible: false` for a crossed step (the default), the delegating agent MUST treat that step's effects as **committed** even if the overall plan fails. The step's outputs are binding — they cannot be silently discarded or rolled back. This is a deliberate constraint: irreversible steps that have crossed their boundary have produced real-world effects (writes, external API calls, resource allocations) that cannot be undone by protocol action alone.
+- If `reversible: true` for a crossed step, the delegating agent MAY choose to roll back that step's effects as part of recovery. The protocol does not define a rollback mechanism — rollback semantics are implementation-defined. The `reversible` flag signals that rollback is **possible**, not that the protocol handles it.
+- **Compensation transactions** (automated rollback of irreversible steps) are explicitly **deferred to V2**. V1 acknowledges the problem — crossed irreversible steps in a failed plan create committed partial state — but does not provide a protocol-level compensation mechanism. Implementations that need compensation MUST handle it outside the protocol in V1.
+
+**Dependency enforcement during execution:**
+
+- A step with `depends_on` MUST NOT begin execution until all listed dependency steps have crossed their end boundary. The delegatee enforces this constraint locally — there is no protocol-level dependency enforcement message. If a dependency step fails, the dependent step cannot start, and the delegatee MUST report the dependency failure in TASK_FAIL.
+- The delegating agent MAY validate dependency ordering from TASK_PROGRESS reports: if a `current_step_id` appears in TASK_PROGRESS before all of its `depends_on` steps have been reported as completed (via prior `current_step_id` transitions), this is a protocol violation by the delegatee.
+
+**Interaction with session teardown (§8.13):**
+
+Crossed steps survive teardown-first recovery. When an agent recovers via the teardown-first protocol (§8.13), the `completed_steps` from the pre-crash plan MUST be carried forward. On reinitiation, the recovering agent includes the prior `completed_steps` in the new session context. The delegating agent MUST NOT re-request execution of steps that were already crossed and reported in `completed_steps` — those steps' effects are committed (if `reversible: false`) or subject to explicit rollback decision (if `reversible: true`). See §8.13.6 for the recovery cross-reference.
+
+> Step boundary semantics and partial completion handling formalized from [issue #70](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/70). The core insight: step boundaries create binding commitments — once a step's end boundary is crossed, its effects are real regardless of what happens to the overall plan. This is the fundamental difference between a step boundary and a progress checkpoint.
 
 ### 6.12 Open Questions
 
@@ -2943,6 +3062,29 @@ The recovering agent's state reconstruction depends on storage that survives pro
 - **§8.4 (Coordination Patterns):** The teardown-by-default pattern described in §8.4 is formalized here as a normative requirement, not just a coordination preference.
 - **§8.5 (Named Considerations):** The "Teardown over resume from production" consideration is the empirical motivation for this section's normative requirements.
 - **§8.10 (Evidence Layer):** The evidence layer provides the durable, externally verifiable state that the recovering agent reads during state reconstruction — replacing the compactable in-memory state that teardown-first explicitly prohibits.
+
+#### 8.13.6 Crossed Steps Survive Teardown-First Recovery
+
+<!-- Implements #70: crossed PLAN_COMMIT steps survive teardown and MUST appear in completed_steps on reinitiation -->
+
+Teardown-first recovery (§8.13.1) tears down the crashed session and initiates a fresh one. However, **crossed step boundaries from the pre-crash plan are not erased by teardown**. Step boundary crossing creates binding commitments (§6.11.5) that persist independent of session state.
+
+**Recovery sequence for plans with step boundaries:**
+
+1. The recovering agent reads the last confirmed `completed_steps` from durable persistent storage (§8.13.4). Sources include: the most recent TASK_CHECKPOINT with `completed_steps`, the evidence layer (§8.10), or the last TASK_PROGRESS that reported a `current_step_id` transition.
+
+2. On reinitiation (fresh SESSION_INIT), the recovering agent or the delegating agent MUST carry forward the `completed_steps` from the pre-crash session. When re-delegating the task in the new session, the delegating agent includes the prior `completed_steps` in the task context (via `progress_checkpoint` in the task schema, §6.1).
+
+3. The new PLAN_COMMIT in the reinitiated session MUST account for already-crossed steps:
+   - Steps listed in `completed_steps` MUST NOT be re-executed. Their effects are committed (if `reversible: false`) or subject to explicit rollback decision (if `reversible: true`).
+   - The new plan SHOULD contain only the remaining (not-yet-crossed) steps, plus any new steps needed to handle recovery-specific concerns (e.g., consistency verification of prior step outputs).
+   - The `plan_hash` of the new PLAN_COMMIT will differ from the pre-crash plan because it covers a different step set. This is expected — the three-level alignment verification (§6.11.1) uses the new plan hash for the recovery session.
+
+4. Steps with `reversible: false` that were crossed before the crash are **unconditionally committed**. The delegating agent MUST NOT request re-execution of these steps and MUST account for their effects in any subsequent planning. This is the key difference between a step boundary and a progress checkpoint: a checkpoint says "work was done up to here"; a crossed irreversible step boundary says "these effects are permanent regardless of what happens next."
+
+**Relationship to idempotent task replay (§8.13.3):** Idempotent replay applies to tasks that need re-execution. Crossed irreversible steps are explicitly excluded from replay — they are committed, not re-executable. The recovering agent replays only the uncrossed portion of the plan. For crossed reversible steps, the delegating agent decides whether to accept the prior results or request re-execution in the new plan.
+
+> Crossed step recovery semantics formalized from [issue #70](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/70). Step boundaries create durable commitments that outlive sessions — teardown destroys session state but cannot undo real-world effects of irreversible steps.
 
 > Teardown-first recovery mandate formalized from Nanook's 6-week NATS deployment data and zombie states thread consensus. See [issue #60](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/60) and [issue #63](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/63). The core insight — re-establishment cost is cheap, bugs from stale resumed state are expensive — converged independently across multiple production deployments.
 
