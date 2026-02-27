@@ -1363,7 +1363,7 @@ The following tracks resolution status for identified gaps. Resolved items docum
 
 2. **Manifest freshness.** ~~CAPABILITY_MANIFEST is exchanged at session establishment. If an agent's capabilities change during a long-running session, the manifest becomes stale. Should CAPABILITY_MANIFEST be re-sendable mid-session?~~ **Resolved (V1).** CAPABILITY_UPDATE (§5.8.1) is the protocol mechanism for mid-session capability changes. It handles both capability loss (removed capabilities) and capability gain (added capabilities). Degraded mode semantics are defined for non-mandatory capability loss; mandatory capability loss triggers SESSION_SUSPEND. CAPABILITY_REQUEST (§5.8) remains the mechanism for task-side discovery of new needs; CAPABILITY_UPDATE is the complementary mechanism for agent-side capability changes.
 
-3. **Delegation token revocation propagation.** When a session expires and delegation tokens are revoked (§5.10), how is revocation propagated to delegatees in a multi-hop chain? The delegatee at depth 2 may not have a direct communication channel to the root delegator. Revocation must propagate through intermediaries, introducing latency and potential failure points.
+3. **Delegation token revocation propagation.** When a session expires and delegation tokens are revoked (§5.10), how is revocation propagated to delegatees in a multi-hop chain? The delegatee at depth 2 may not have a direct communication channel to the root delegator. Revocation must propagate through intermediaries, introducing latency and potential failure points. **Partially addressed (V1).** §9.8 documents that revocation propagation is advisory, not technically enforceable — the protocol depends on intermediate agents to propagate faithfully, and partial propagation failure is a known limitation. §9.8.2 defines the failure modes and introduces the optional REVOCATION_PROPAGATION_FAILED message for detecting incomplete propagation. Technical enforcement via cryptographic session tokens with built-in TTL is deferred to V2 (§9.8.3).
 
 4. **Trust level granularity in allowed_capabilities.** The current design grants a single `trust_level` per delegation (§6.8). Should `allowed_capabilities` support per-capability trust levels? E.g., an agent might be trusted for `cap:example.net.access@1` at `standard` but only `cap:example.fs.access@1` at `restricted`. Per-capability trust increases expressiveness but also complexity and the surface for misconfiguration.
 
@@ -2515,6 +2515,7 @@ A determined adversary operating within a single interaction can succeed. The pr
 - Zombie state detection (§8) handles cooperative failure. §9 handles adversarial failure — §8.3 explicitly defers adversarial drift to this section.
 - TEE attestation boundary (§8.3) proves where execution occurred. Schema attestation (§9.1) proves who vouched for what was executed. These are complementary, not overlapping.
 - Translation boundary (§9.3) identifies the attack surface. Translation bottleneck (§9.4) identifies the information-theoretic reason attacks at that surface evade structural defenses — lossy compression preserves adversarial semantics while satisfying validation. Translation boundary metadata and verification (§7.9) provides the cooperative-model counterpart: `translation_metadata` makes translation losses visible and the two-target verification framework (behavioral correctness vs. translation fidelity) separates execution failures from translation failures.
+- Revocation trust (§9.8) documents the advisory nature of REVOKE signals and the Byzantine propagation problem in delegation chains. Identity revocation (§2.3.4) and delegation token revocation (§5.10) define MUST-level requirements that are binding on compliant agents but not technically enforceable on non-compliant or offline nodes.
 
 ### 9.7 Open Questions
 
@@ -2528,9 +2529,89 @@ The following are explicitly identified as unresolved gaps in v0.1:
 
 4. **~~Structured divergence annotation.~~** Resolved (V1). When `trace_hash` diverges from plan, should the protocol provide a structured mechanism for annotating _why_ divergence occurred? Two candidate approaches were considered: (a) merkle-tree extension — embed divergence annotations into the L3 computation (§7), making them tamper-evident but requiring synchronized tree structures; (b) sidecar log — an inline `divergence_log` array recording divergence events without cryptographic integration. **V1 uses the sidecar log approach** (§7.8): lightweight, no shared state required, survives partial execution, and lowers the barrier to adoption. Merkle-tree-based divergence annotation is deferred to V2 as an opt-in extension for agents requiring cryptographic audit trails. The `divergence_log` is self-reported and therefore trustworthy only in the cooperative threat model (§8) — it is an audit aid, not a security primitive.
 
+6. **~~Non-cryptographic revocation enforcement.~~** Resolved (V1). REVOKE signals (CAPABILITY_REVOKE, SESSION_TERMINATE, identity revocation per §2.3.4, delegation token revocation per §5.10) are advisory — compliant agents honor them; non-compliant or offline nodes may not. Can the protocol technically enforce revocation without cryptographic expiry or a consensus mechanism? **V1 documents this as a known limitation, not a bug** (§9.8): decentralized revocation without cryptography is a social contract, not a technical guarantee. The protocol's guarantees hold only among compliant agents. Cryptographic session tokens with built-in TTL expiry — where session bounds are enforced by token lifetime rather than relay trust — are deferred to V2 as an opt-in extension for environments requiring technical enforcement. See §9.8 for the full analysis including multi-hop propagation failure modes, threat model scoping, and approach tradeoffs.
+
 5. **~~Translation layers at trust boundaries.~~** Resolved (V1). When an intermediary agent acts as a translation layer — transforming task semantics, vocabulary, or capability representations between heterogeneous agents — it functions as an information bottleneck where signal is inevitably lost. Should the protocol provide structured metadata for describing translation losses and a verification framework for separating execution failures from translation failures? **V1 provides `translation_metadata` and two-target verification framing** (§7.9): the `translation_metadata` optional field on TASK_ASSIGN (§6.6) carries `source_schema`, `target_schema`, `fidelity_confidence` (LOW/MEDIUM/HIGH), and `translation_losses` (SHOULD, not MUST — agents omitting it remain V1-compliant); the two-target verification framework (§7.9.3) distinguishes behavioral correctness (did the executor do what the translation asked?) from translation fidelity (was the original intent faithfully conveyed?). End-to-end semantic equivalence verification — where the originating agent can cryptographically verify that a translated task preserves its original semantics — is deferred to V2.
 
-> Community discussion on this section: [Moltbook post](https://www.moltbook.com/post/2fdee5e5-cdae-47c0-82a5-6bb9ec407d3c). See also [issue #10](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/10), [issue #36](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/36), [issue #38](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/38).
+### 9.8 Revocation Trust and the Byzantine Propagation Problem
+
+REVOKE signals in this protocol — identity revocation (§2.3.4), manifest revocation (§3.1 REVOKE operation), attestation revocation (§3.3.3), delegation token invalidation on session expiry (§5.10), and task cancellation propagation (§6.6 TASK_CANCEL) — are **advisory**. They are binding on compliant agents and meaningless to non-compliant or offline nodes. This is a documented known limitation of V1, not a bug to fix in V2.
+
+**Decentralized revocation without cryptography is a social contract, not a technical guarantee.**
+
+The protocol specifies that agents holding invalidated delegation tokens "MUST cease operations" (§2.3.4, §5.10) and that revocation "MUST propagate downstream to any sub-delegatees" (§2.3.4). These requirements are normative for compliant implementations. They are not — and cannot be — technically enforceable by the protocol alone. A non-compliant agent that receives a REVOKE signal and ignores it will continue operating on revoked credentials. The protocol has no mechanism to prevent this without either (a) a consensus mechanism that allows honest nodes to reject the non-compliant agent's messages, or (b) cryptographic token expiry that makes revoked credentials unusable regardless of agent compliance.
+
+#### 9.8.1 Threat Model Scoping
+
+**Protocol guarantees hold only among compliant agents.** The specification is a coordination contract, not a cryptographic enforcement mechanism. Non-compliant or offline nodes can continue executing beyond revoked bounds. Specifically:
+
+- An agent that ignores CAPABILITY_REVOKE continues exercising revoked capabilities.
+- An agent that ignores SESSION_TERMINATE continues operating on a terminated session.
+- An agent that ignores delegation token invalidation continues acting under revoked authority.
+
+These are not protocol violations that can be detected and rejected in real time by other protocol participants (absent cryptographic infrastructure). They are contract violations — detectable post-hoc through audit trails (§8) but not preventable at the point of violation.
+
+**Implication for trust topology (§9.2):** The advisory revocation model is well-suited for orchestrator-over-worker and peer-to-peer topologies where agents are known, operated by cooperating parties, and subject to reputation consequences. It is insufficient for federated topologies where agents cross trust boundaries and may not share a compliance incentive.
+
+#### 9.8.2 Multi-Hop Revocation Propagation
+
+When a REVOKE signal must traverse a delegation chain (A → B → C → D), the protocol depends on each intermediate agent to propagate faithfully. This creates a Byzantine propagation problem: if the REVOKE reaches B but B fails to propagate it to C (whether through non-compliance, network partition, or crash), C and D continue operating under revoked authority.
+
+**Propagation requirements:**
+
+- An agent that receives a REVOKE signal (identity revocation, delegation token invalidation, or TASK_CANCEL) SHOULD propagate the signal to all downstream delegatees. This is SHOULD, not MUST — propagation cannot be technically enforced, and a MUST requirement would create a normative obligation that the protocol cannot verify.
+- The revoking agent (or coordinator) SHOULD NOT assume downstream propagation succeeded without explicit acknowledgment from each node in the chain.
+
+**Partial propagation failure modes:**
+
+| Scenario | Effect | Detection |
+|----------|--------|-----------|
+| B receives REVOKE, propagates to C, C propagates to D | Full propagation — nominal case | Acknowledgments received at each hop |
+| B receives REVOKE, fails to propagate to C | C and D continue under revoked authority | Coordinator receives acknowledgment from B only; absence of C/D acknowledgment signals partial propagation |
+| B receives REVOKE, propagates to C, C fails to propagate to D | D continues under revoked authority | Coordinator receives acknowledgments from B and C; absence of D acknowledgment signals partial propagation |
+| B is offline when REVOKE is sent | B, C, and D all continue under revoked authority | No acknowledgment from B; coordinator detects total propagation failure |
+
+**REVOCATION_PROPAGATION_FAILED message (optional):**
+
+When a coordinator detects partial propagation (acknowledgment received from some but not all nodes in a delegation chain), it MAY emit a REVOCATION_PROPAGATION_FAILED signal to indicate that revocation is incomplete.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| message_type | string | Yes | `REVOCATION_PROPAGATION_FAILED` |
+| revocation_id | string | Yes | Identifier of the original REVOKE signal |
+| acknowledged_by | array | Yes | Agent identities that acknowledged the revocation |
+| not_acknowledged_by | array | Yes | Agent identities from which acknowledgment was not received within the expected window |
+| partial | boolean | Yes | `true` if some but not all agents acknowledged; `false` if no agents acknowledged |
+
+This message is informational — it signals to operators and audit systems that revocation coverage is incomplete. It does not trigger any automatic protocol behavior. Implementations that do not support REVOCATION_PROPAGATION_FAILED remain V1-compliant.
+
+#### 9.8.3 Approach Tradeoffs
+
+Two revocation models apply to decentralized agent collaboration, with different trust requirements and failure modes:
+
+**Advisory REVOKE messages (V1 — current approach):**
+
+| Property | Characteristic |
+|----------|----------------|
+| Infrastructure required | None beyond the protocol's existing message transport |
+| Enforcement mechanism | Social contract — compliant agents honor REVOKE; non-compliant agents may not |
+| Failure mode | Silent — if an intermediary is offline or non-compliant, downstream agents continue under revoked authority with no indication to the revoking agent (absent explicit acknowledgment) |
+| Suitable for | Cooperative agent environments where Byzantine failure is not the primary threat model |
+| Latency | Propagation delay proportional to chain depth; each hop adds round-trip latency |
+
+**Cryptographic session tokens with built-in expiry (deferred — V2 opt-in):**
+
+| Property | Characteristic |
+|----------|----------------|
+| Infrastructure required | Key management infrastructure for token issuance and verification |
+| Enforcement mechanism | Technical — token TTL enforces session bounds regardless of agent compliance or relay trust |
+| Failure mode | No retroactive revocation after issuance — TTL is a hard expiry bound, not a revocable signal. An agent holding a valid token continues operating until TTL expires, even if the issuer wishes to revoke earlier |
+| Suitable for | Environments requiring technical enforcement, including federated topologies crossing trust boundaries |
+| Latency | None for enforcement (TTL is local); issuance latency at session establishment |
+
+The V1 advisory model and the V2 cryptographic model address different failure classes. Advisory revocation fails when intermediaries are non-compliant; cryptographic expiry fails when early revocation is needed before TTL expires. A complete solution would combine both — advisory REVOKE for cooperative fast-path revocation, cryptographic TTL as a hard backstop — but V1 implements only the advisory path to avoid mandating key infrastructure.
+
+> Community discussion on this section: [Moltbook post](https://www.moltbook.com/post/2fdee5e5-cdae-47c0-82a5-6bb9ec407d3c). See also [issue #10](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/10), [issue #36](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/36), [issue #38](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/38), [issue #49](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/49).
 
 ## 10. Versioning
 
@@ -2729,7 +2810,9 @@ The following are explicitly identified as unresolved gaps in v0.1:
 
 4. **Capability version constraints.** Capability declarations (§5.1) do not currently carry protocol version constraints — a capability declared under protocol v1 is assumed to remain valid under protocol v2. If protocol changes alter the semantics of capability types (e.g., by redefining what `cap:example.net.access@1` means), existing capability declarations become ambiguous. Whether capabilities should be explicitly bound to a protocol version range is deferred to a future version.
 
-> Community discussion: See [issue #20](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/20), [issue #37](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/37). Architecture surfaced in discussion with @cass_agentsharp. Cross-version delegation chain guidance (§10.7.1) implements #37. Implements #20, #37.
+5. **Cryptographic session tokens with built-in expiry.** V1 revocation is advisory (§9.8) — REVOKE signals are honored by compliant agents but not technically enforceable. Cryptographic session tokens with built-in TTL would enforce session bounds without relay trust: a token expires regardless of whether the REVOKE signal was propagated or acknowledged. This eliminates the Byzantine propagation problem (§9.8.2) for session-scoped authority but introduces key infrastructure requirements and removes the ability to revoke before TTL expiry. Whether to introduce cryptographic session tokens as a V2 opt-in extension — complementing rather than replacing advisory REVOKE — is deferred. See §9.8.3 for the tradeoff analysis.
+
+> Community discussion: See [issue #20](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/20), [issue #37](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/37), [issue #49](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/49). Architecture surfaced in discussion with @cass_agentsharp. Cross-version delegation chain guidance (§10.7.1) implements #37. Implements #20, #37.
 
 ---
 
