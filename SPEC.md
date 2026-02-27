@@ -492,6 +492,10 @@ ACTIVE → SUSPECTED
          Detection is local — each side evaluates independently
          suspected_threshold_ms is negotiated in SESSION_INIT / SESSION_INIT_ACK
          (see §4.2.1 and issue #71 for heartbeat negotiation)
+         OR current_task_hash mismatch detected in received HEARTBEAT
+            (requires heartbeat_params.task_hash_verification = true, §4.3.1)
+         OR counterparty reports app_status: SUSPECTED in HEARTBEAT
+            (requires heartbeat_params.application_liveness = true, §4.3.1)
 
 SUSPECTED → ACTIVE
   Guard: HEARTBEAT or HEARTBEAT_PONG received from counterparty
@@ -598,7 +602,7 @@ COMPACTED → CLOSED
 
 **SUSPECTED entry condition:** An agent transitions from ACTIVE to SUSPECTED when no HEARTBEAT (§4.5.3), HEARTBEAT_PONG (§8.9.1), or KEEPALIVE (§4.5.1) has been received from the counterparty within `suspected_threshold_ms`. This threshold MUST be configurable per-session — it is not a hardcoded protocol constant. The value is negotiated in SESSION_INIT / SESSION_INIT_ACK alongside other heartbeat parameters (see §4.3). The `suspected_threshold_ms` value MUST be greater than `heartbeat_interval_ms` and MUST be less than `session_expiry_ms`. A typical value is 2–3× `heartbeat_interval_ms`.
 
-> **Cross-reference:** The per-session negotiation of `suspected_threshold_ms` follows the same pattern as `heartbeat_interval_ms` and `session_expiry_ms` negotiation defined in §4.3. See also [issue #71](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/71) for the broader SESSION_INIT heartbeat negotiation design.
+> **Cross-reference:** The per-session negotiation of `suspected_threshold_ms` follows the same pattern as `heartbeat_interval_ms` and `session_expiry_ms` negotiation defined in §4.3. The `heartbeat_params` block (§4.3.1) extends SUSPECTED detection beyond heartbeat gap to include task hash mismatch (`task_hash_verification = true`) and application self-report (`application_liveness = true`) — but these detection paths require explicit bilateral negotiation at SESSION_INIT. See §8.14 for prerequisite constraints. See also [issue #71](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/71) for the broader SESSION_INIT heartbeat negotiation design.
 
 **Work-buffering-during-uncertainty:** While in SUSPECTED state, the local agent MUST:
 
@@ -642,6 +646,7 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | requested_mandatory | array | No | Capability IDs (§5.1.1 format) the coordinator requires the worker to support. If any are missing from the worker's manifest, the session MUST NOT proceed to ACTIVE. |
 | requested_optional | array | No | Capability IDs (§5.1.1 format) the coordinator prefers but does not require. Missing optional capabilities do not block session establishment. |
 | plan_commit_required | boolean | No | If `true`, the coordinator requires the worker to send PLAN_COMMIT (§6.6, §6.11) after TASK_ACCEPT and before the first TASK_PROGRESS for every task in this session. A missing PLAN_COMMIT when this field is `true` is a protocol violation. Default: `false`. |
+| heartbeat_params | object | No | Structured heartbeat negotiation block. When present, defines the heartbeat behavior for this session including liveness semantics, task hash verification, and application-level status reporting. See §4.3.1 for field definitions and negotiation semantics. If omitted, heartbeat behavior is governed by the top-level `heartbeat_interval_ms`, `heartbeat_timeout_count`, and related fields. When both `heartbeat_params` and top-level heartbeat fields are present, `heartbeat_params` takes precedence. |
 | timestamp | ISO 8601 | Yes | When the SESSION_INIT was sent. |
 
 **SESSION_INIT_ACK fields:**
@@ -664,6 +669,7 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | lease_epoch | integer | No | Echoed from SESSION_INIT (confirms epoch synchronization). |
 | effective_cap_set | array | No | Intersection of the coordinator's `requested_mandatory` + `requested_optional` with the worker's capabilities, filtered by policy. Returned when SESSION_INIT includes `manifest_digest`. Enables 0-RTT capability agreement (§5.9). |
 | plan_commit_required | boolean | No | Echoed from SESSION_INIT. If the coordinator set `plan_commit_required: true`, the worker MUST echo it to confirm understanding of the plan commitment obligation. If the worker cannot support plan commitment, it MUST reject the session. |
+| heartbeat_params | object | No | Accepted or counter-proposed heartbeat params. The responding agent MUST echo back the accepted `heartbeat_params` or propose alternatives. If the coordinator sent `heartbeat_params` and the worker omits it from SESSION_INIT_ACK, this is a protocol violation — the worker MUST explicitly accept or counter-propose. For `interval_ms`, the effective value is the **maximum** of both proposals (slower rate wins). For `timeout_multiplier`, the effective value is the **maximum** of both proposals (more permissive wins). Boolean fields (`application_liveness`, `task_hash_verification`) are effective only if **both** sides set them to `true` — either side can opt out by setting `false`. See §4.3.1. |
 | timestamp | ISO 8601 | Yes | When the SESSION_INIT_ACK was sent. |
 
 **Version compatibility check:** Upon receiving SESSION_INIT (or SESSION_INIT_ACK), the receiving agent MUST check protocol and schema version compatibility per §10.3. If versions are incompatible, the agent sends PROTOCOL_MISMATCH or SCHEMA_MISMATCH (§10.4) and the session transitions to CLOSED. Version declaration at SESSION_INIT is a spec obligation, not an optional feature — forward compatibility (§10.5) depends on every session beginning with explicit version exchange.
@@ -699,7 +705,75 @@ requested_mandatory:
 requested_optional:
   - "cap:example.web.search@1"
 plan_commit_required: true
+heartbeat_params:
+  interval_ms: 5000
+  timeout_multiplier: 3
+  application_liveness: true
+  task_hash_verification: true
 timestamp: "2026-02-27T10:30:00Z"
+```
+
+#### 4.3.1 Heartbeat Params Negotiation
+
+<!-- Implements #71: SESSION_INIT heartbeat negotiation -->
+
+The `heartbeat_params` block provides structured heartbeat negotiation at session establishment. It consolidates heartbeat behavior configuration — interval, failure threshold, and the distinction between transport-level and application-level liveness — into a single negotiable object.
+
+**Why a dedicated block:** The existing top-level heartbeat fields (`heartbeat_interval_ms`, `heartbeat_timeout_count`) address transport liveness only. Production deployments revealed two additional negotiation axes that do not fit naturally as top-level fields: (1) whether heartbeats carry application-level status (the transport-vs-application liveness distinction), and (2) whether heartbeats include task hash verification for semantic drift detection. These are cross-cutting concerns that modify heartbeat message content, not just timing — grouping them in `heartbeat_params` makes the negotiation surface explicit and avoids scattered boolean flags at the SESSION_INIT top level.
+
+**`heartbeat_params` fields:**
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| interval_ms | integer | Yes | — | Interval in milliseconds between HEARTBEAT messages. This is the binding heartbeat cadence for the session. MUST be > 0. Equivalent to the top-level `heartbeat_interval_ms` when `heartbeat_params` is used. |
+| timeout_multiplier | integer | No | 3 | Number of consecutive missed heartbeats before declaring transport failure. The transport failure threshold is `interval_ms * timeout_multiplier`. Equivalent to the top-level `heartbeat_timeout_count` when `heartbeat_params` is used. MUST be ≥ 1. |
+| application_liveness | boolean | No | false | If `false` (default), HEARTBEAT messages answer **transport-level liveness only** — the agent process is running, but no claim is made about whether the agent is coherent, making progress, or working on the correct task. If `true`, HEARTBEAT messages MUST include an `app_status` field (see §4.5.3) reporting application-level health: `ACTIVE` (coherent and making progress), `SUSPECTED` (self-assessed liveness ambiguity — agent detects internal degradation), or `DEGRADED` (agent is running but operating at reduced capacity). |
+| task_hash_verification | boolean | No | false | If `true`, HEARTBEAT messages MUST include a `current_task_hash` field (see §4.5.3) containing the SHA-256 hash of the agent's current task specification (§6.1). This enables the counterparty to detect task context drift between heartbeats — if the received `current_task_hash` does not match the expected task hash, the agent may have lost or corrupted its task context (a context compaction zombie scenario per §8.9). If `false` (default), HEARTBEAT messages carry no task context and cannot detect semantic drift. |
+
+**Negotiation semantics:**
+
+- The coordinator proposes `heartbeat_params` in SESSION_INIT. The worker MUST respond with `heartbeat_params` in SESSION_INIT_ACK — either echoing the coordinator's proposal (acceptance) or proposing alternatives (counter-proposal). Omitting `heartbeat_params` from SESSION_INIT_ACK when the coordinator included it is a **protocol violation**.
+- **`interval_ms`:** The effective value is the **maximum** of both proposals. Neither side is forced to heartbeat faster than it can sustain. This is consistent with the existing `heartbeat_interval_ms` negotiation semantics.
+- **`timeout_multiplier`:** The effective value is the **maximum** of both proposals. The more permissive threshold wins — neither side should declare transport failure faster than its counterparty can tolerate.
+- **`application_liveness`:** Effective only if **both** sides set it to `true`. Either side can opt out by setting `false`. Application-level status reporting is a bilateral commitment — one side cannot unilaterally require the other to report `app_status`.
+- **`task_hash_verification`:** Effective only if **both** sides set it to `true`. Either side can opt out by setting `false`. Task hash verification imposes a per-heartbeat hash computation cost; agents that cannot sustain this cost opt out.
+- **Mismatch handling:** If the effective negotiation produces a configuration that either side considers unacceptable (e.g., `interval_ms` too high for the coordinator's latency requirements), the dissatisfied agent MUST reject the session by sending SESSION_CLOSE — not proceed with silently unsatisfied constraints.
+
+**Relationship to top-level heartbeat fields:**
+
+When `heartbeat_params` is present, it takes precedence over the top-level `heartbeat_interval_ms` and `heartbeat_timeout_count` fields for the parameters it covers. Specifically:
+
+| `heartbeat_params` field | Supersedes top-level field |
+|--------------------------|---------------------------|
+| `interval_ms` | `heartbeat_interval_ms` |
+| `timeout_multiplier` | `heartbeat_timeout_count` |
+| `application_liveness` | (no top-level equivalent) |
+| `task_hash_verification` | (no top-level equivalent) |
+
+The top-level fields remain valid for backward compatibility — agents that do not implement `heartbeat_params` continue using the existing top-level negotiation. When both are present and values conflict, `heartbeat_params` wins.
+
+**Example negotiation:**
+
+```yaml
+# Coordinator proposes in SESSION_INIT:
+heartbeat_params:
+  interval_ms: 5000
+  timeout_multiplier: 3
+  application_liveness: true
+  task_hash_verification: true
+
+# Worker counter-proposes in SESSION_INIT_ACK:
+heartbeat_params:
+  interval_ms: 10000       # worker needs slower cadence
+  timeout_multiplier: 4    # worker wants more permissive threshold
+  application_liveness: true   # worker agrees to app-level reporting
+  task_hash_verification: false # worker cannot sustain per-heartbeat hash cost
+
+# Effective negotiated values:
+# interval_ms: 10000 (max of 5000, 10000)
+# timeout_multiplier: 4 (max of 3, 4)
+# application_liveness: true (both agreed)
+# task_hash_verification: false (worker opted out — both must agree)
 ```
 
 ### 4.4 Role Assignment
@@ -785,6 +859,8 @@ HEARTBEAT is a minimal wire-protocol message for session liveness. It is distinc
 | session_id | string | Yes | Active session identifier. |
 | timestamp | ISO 8601 | Yes | When the HEARTBEAT was sent. Receivers SHOULD reject HEARTBEAT messages with timestamps more than `session_expiry_ms` in the past. |
 | sequence | integer | Yes | Monotonically increasing sequence number. Starts at 0 at session establishment. Gaps indicate missed messages but do not trigger expiry — only the absence of any HEARTBEAT within `session_expiry_ms` triggers expiry. |
+| current_task_hash | SHA-256 | Conditional | SHA-256 hash of the agent's current task specification (§6.1). **Required** when `heartbeat_params.task_hash_verification` was negotiated to `true` in SESSION_INIT / SESSION_INIT_ACK (§4.3.1). MUST be omitted when `task_hash_verification` is `false` or was not negotiated. The counterparty compares this hash against its own record of the task specification — a mismatch indicates the agent has lost or corrupted its task context (context compaction zombie per §8.9). If the agent has no active task, the value MUST be the SHA-256 of the empty string. See §8.9 and §8.14 for the relationship between task hash mismatch and SUSPECTED state detection. |
+| app_status | enum | Conditional | Application-level health status. **Required** when `heartbeat_params.application_liveness` was negotiated to `true` in SESSION_INIT / SESSION_INIT_ACK (§4.3.1). MUST be omitted when `application_liveness` is `false` or was not negotiated. Values: `ACTIVE` — agent is coherent and making progress on the current task; `SUSPECTED` — agent self-assesses liveness ambiguity (e.g., detects internal degradation, resource pressure, or context integrity concerns); `DEGRADED` — agent is running but operating at reduced capacity (e.g., rate-limited, partial capability loss, high latency). When `application_liveness` is `false` (default), HEARTBEAT answers **transport-level liveness only** — the agent process is running, but no claim is made about application-level coherence or progress. |
 
 **HEARTBEAT is bilateral.** Both the coordinator and the worker send HEARTBEAT messages independently at the negotiated `heartbeat_interval_ms` interval. Each side maintains its own expiry timer based on received HEARTBEATs from the counterparty. A session can be EXPIRED from one side's perspective while still ACTIVE from the other's — this asymmetry is intentional (see §4.2).
 
@@ -2506,6 +2582,7 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - Evidence layer architecture (§8.10) separates raw evidence (append-only, externally verifiable) from agent memory (compactable, agent-internal). EVIDENCE_RECORDs anchor SESSION_RESUME state hashes (§4.8) and provide ground truth for external verifiers. Without the evidence layer, external verification degrades to recursive self-attestation.
 - Structured divergence reporting (§8.11) defines DIVERGENCE_REPORT as a standalone protocol message with a required `reason_code` taxonomy, enabling verifiers to classify divergences programmatically rather than parsing free-text descriptions. Complements the inline `divergence_log` (§7.8) which covers plan-execution divergence.
 - Teardown-first recovery mandate (§8.13) formalizes teardown + reinitiate as the default recovery protocol. Agents MUST NOT resume from serialized in-memory state; recovery reads canonical state from durable persistent storage, reconciles against the evidence layer (§8.10), and initiates a fresh SESSION_INIT. Task idempotency (§7.10) is the prerequisite enabling safe replay after teardown.
+- SUSPECTED state and heartbeat negotiation prerequisites (§8.14) documents that SUSPECTED state detection via task hash mismatch requires `heartbeat_params.task_hash_verification = true` negotiated at SESSION_INIT (§4.3.1). Without this negotiation, HEARTBEAT messages carry no task context and task-context drift detection is unavailable. Application-level self-report of SUSPECTED requires `heartbeat_params.application_liveness = true`.
 
 ### 8.7 Verifier Isolation Requirements
 
@@ -2868,6 +2945,37 @@ The recovering agent's state reconstruction depends on storage that survives pro
 - **§8.10 (Evidence Layer):** The evidence layer provides the durable, externally verifiable state that the recovering agent reads during state reconstruction — replacing the compactable in-memory state that teardown-first explicitly prohibits.
 
 > Teardown-first recovery mandate formalized from Nanook's 6-week NATS deployment data and zombie states thread consensus. See [issue #60](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/60) and [issue #63](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/63). The core insight — re-establishment cost is cheap, bugs from stale resumed state are expensive — converged independently across multiple production deployments.
+
+### 8.14 SUSPECTED State and Heartbeat Negotiation Prerequisites
+
+<!-- Implements #71: cross-reference between SUSPECTED detection and heartbeat_params negotiation -->
+
+The SUSPECTED state (§4.2.1) can be entered via two distinct detection paths: **heartbeat gap** (transport-level) and **task hash mismatch** (semantic-level). These paths have different prerequisites that are negotiated at session establishment via `heartbeat_params` (§4.3.1).
+
+**Detection path prerequisites:**
+
+| Detection path | Trigger | Required negotiation | SESSION_INIT field |
+|---------------|---------|---------------------|--------------------|
+| Heartbeat gap | No HEARTBEAT received within `suspected_threshold_ms` | `suspected_threshold_ms` negotiated in SESSION_INIT / SESSION_INIT_ACK (§4.3) | `suspected_threshold_ms` |
+| Task hash mismatch | `current_task_hash` in received HEARTBEAT does not match expected task hash | `heartbeat_params.task_hash_verification` negotiated to `true` by **both** sides (§4.3.1) | `heartbeat_params.task_hash_verification` |
+| Application self-report | Agent reports `app_status: SUSPECTED` in HEARTBEAT | `heartbeat_params.application_liveness` negotiated to `true` by **both** sides (§4.3.1) | `heartbeat_params.application_liveness` |
+
+**Critical constraint — task hash mismatch requires explicit negotiation:** An agent that did not negotiate `heartbeat_params.task_hash_verification = true` in SESSION_INIT **cannot** detect SUSPECTED state via task hash mismatch, because HEARTBEAT messages in that session will not contain `current_task_hash`. The field is absent, not empty — there is no hash to compare. Agents that want task-context drift detection MUST negotiate `task_hash_verification = true` at session establishment. This is a bilateral requirement: both sides must agree (§4.3.1 negotiation semantics), because both sides bear the per-heartbeat hash computation cost.
+
+**Critical constraint — application self-report requires explicit negotiation:** An agent that did not negotiate `heartbeat_params.application_liveness = true` **cannot** self-declare SUSPECTED via the `app_status` field in HEARTBEAT. Without `application_liveness` negotiation, HEARTBEAT carries transport-level liveness only — there is no `app_status` field to populate. Agents that want to signal self-assessed degradation to their counterparty MUST negotiate `application_liveness = true` at session establishment.
+
+**Relationship to §8.9 (Two-Tier Heartbeat):**
+
+The `heartbeat_params` negotiation (§4.3.1) determines which heartbeat tiers are active and what data each heartbeat carries:
+
+- **Transport-only heartbeat** (`application_liveness: false`, `task_hash_verification: false`): HEARTBEAT carries `session_id`, `timestamp`, `sequence` only. Equivalent to Tier 1 transport liveness (§8.9.1). SUSPECTED detection is limited to heartbeat gap (via `suspected_threshold_ms`).
+- **Transport + task hash** (`task_hash_verification: true`): HEARTBEAT additionally carries `current_task_hash`. Enables lightweight semantic drift detection between Tier 2 SEMANTIC_CHALLENGE intervals (§8.9.2). A task hash mismatch detected in a HEARTBEAT is a **leading indicator** — it signals potential context corruption before the next scheduled SEMANTIC_CHALLENGE. On detecting a task hash mismatch, the coordinator SHOULD issue an immediate SEMANTIC_CHALLENGE to confirm the divergence before declaring the agent a semantic zombie.
+- **Transport + application status** (`application_liveness: true`): HEARTBEAT additionally carries `app_status`. Enables the agent to self-report degradation or suspected state. This is complementary to external detection — it does not replace Tier 2 verification but provides an earlier signal when the agent is aware of its own degradation.
+- **Full heartbeat** (`application_liveness: true`, `task_hash_verification: true`): HEARTBEAT carries all fields. Maximum detection surface — combines external task hash verification with agent self-report.
+
+**Backward compatibility:** Sessions that do not negotiate `heartbeat_params` (i.e., the field is omitted from both SESSION_INIT and SESSION_INIT_ACK) use the existing heartbeat behavior: transport-level liveness only, SUSPECTED detection via heartbeat gap only (if `suspected_threshold_ms` is configured). The `heartbeat_params` block is opt-in — it extends but does not replace the existing heartbeat negotiation surface.
+
+> Cross-reference: SESSION_INIT heartbeat negotiation formalized from [issue #71](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/71). The transport-vs-application liveness distinction and task hash verification as a per-session negotiated capability address the gap between transport liveness (agent is running) and semantic liveness (agent is coherent) identified in the two-tier heartbeat design (§8.9).
 
 ## 9. Security Considerations
 
