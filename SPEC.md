@@ -1494,6 +1494,7 @@ Sent by the delegating agent to initiate delegation.
 | trust_level | enum | Yes | Trust level granted to the delegatee for this task (see §6.8) |
 | delegation_depth | integer | Yes | Current depth in the delegation chain; 0 for direct delegation (see §6.9) |
 | protocol_version_chain | array | No | Append-only list of version chain entries recording the protocol version negotiated at each hop in the delegation chain (see §6.9.1). Empty or absent for direct delegations at depth 0. |
+| translation_metadata | object | No | Metadata describing a semantic translation performed by the forwarding agent (see §7.9). Present when the forwarding agent transforms task semantics — vocabulary, capability descriptions, or constraint representations — rather than merely routing. |
 
 The `spec` object contains:
 
@@ -1505,6 +1506,17 @@ The `spec` object contains:
 | resource_constraints | object | No | Limits on compute, memory, network, or other resources the delegatee may consume |
 
 The full canonical task schema (§6.1) is transmitted within or alongside `spec`. The fields above are the delegation-specific subset; `task_hash`, `namespace`, `alias`, `version`, `issued_at`, and `issuer_id` travel with the task schema as defined in §6.1.
+
+The `translation_metadata` object, when present, contains:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| source_schema | string | Yes | Declared protocol, schema identifier, or vocabulary of the originating agent's task representation. |
+| target_schema | string | Yes | Declared protocol, schema identifier, or vocabulary of the destination agent's task representation. |
+| fidelity_confidence | enum | Yes | Self-assessed confidence that the translation preserves the original task's semantic intent: `LOW`, `MEDIUM`, or `HIGH`. |
+| translation_losses | array of strings | No (SHOULD) | Descriptions of what was approximated, dropped, or semantically altered during translation. Each entry identifies a specific aspect of the original task that could not be faithfully conveyed to the target schema. |
+
+**`translation_losses` SHOULD be populated.** Agents that omit `translation_losses` remain V1-compliant — the field is not required to reduce implementation burden. However, agents relying on high-fidelity translation across heterogeneous systems are RECOMMENDED to implement the full field. Without `translation_losses`, the receiving agent has no structured signal about what semantic content may have been degraded — only the coarse `fidelity_confidence` enum. Agents that implement `translation_losses` provide actionable information for downstream verification (§7.9).
 
 **TASK_ACCEPT**
 
@@ -1989,6 +2001,73 @@ The `divergence_log` complements — does not replace — the merkle tree diverg
 
 > V1 design choice: sidecar `divergence_log` approach. Merkle-tree-based divergence annotation — where each divergence entry is incorporated into a cryptographic audit tree — is deferred to V2 as an opt-in extension. The V2 extension would allow agents requiring cryptographic audit trails to embed divergence entries into the L3 computation, making divergence annotations tamper-evident. V1 prioritizes adoption simplicity over cryptographic guarantees for divergence metadata.
 
+### 7.9 Translation Boundary
+
+When a trust boundary (§9.3) crosses a translation layer, the intermediary agent is not merely routing messages — it is transforming task semantics. An agent that changes vocabulary, capability descriptions, or constraint representations between source and destination is functioning as an **information bottleneck** (§9.4): signal is inevitably lost or approximated during translation. This section defines the metadata and verification framework for making that loss visible and auditable.
+
+#### 7.9.1 Translation Layer Definition
+
+An agent acts as a **translation layer** when it transforms task semantics between heterogeneous agents. The defining characteristic is semantic transformation — not mere forwarding. Specifically, an intermediary agent is a translation layer when it performs any of the following:
+
+- **Vocabulary transformation.** The agent maps terminology, field names, or domain concepts from one schema to another. Example: translating `priority: critical` to `urgency: P0` across systems with different priority vocabularies.
+- **Capability description transformation.** The agent reinterprets or restructures capability representations to match the receiving agent's expected format. Example: converting a structured capability manifest into a natural-language capability summary for an agent that does not implement §5.1.
+- **Constraint representation transformation.** The agent adapts constraint formats — resource limits, permission boundaries, temporal constraints — between incompatible representations. Example: translating a structured `resource_constraints` object into a flat key-value set for a legacy system.
+
+An agent that forwards messages unchanged — even across trust boundaries — is **not** a translation layer and does not produce `translation_metadata`. The translation boundary distinction matters because forwarding preserves semantic content (modulo trust re-evaluation per §9.3), while translation inherently introduces approximation.
+
+#### 7.9.2 Translation Metadata
+
+When a translation layer agent forwards a task via TASK_ASSIGN, it SHOULD include `translation_metadata` (§6.6) describing the transformation performed. The metadata makes the translation's scope, confidence, and known losses explicit to the receiving agent.
+
+**Example `translation_metadata`:**
+
+```yaml
+translation_metadata:
+  source_schema: "acp/task-schema@1.4"
+  target_schema: "legacy-rpc/job-spec@2.1"
+  fidelity_confidence: MEDIUM
+  translation_losses:
+    - "success_criteria field has no equivalent in target schema; approximated as free-text description in job notes"
+    - "resource_constraints.memory_mb dropped; target schema does not support memory limits"
+    - "delegation_depth semantics not representable; forwarded as metadata annotation without enforcement"
+```
+
+**Fidelity confidence guidelines:**
+
+| Level | Meaning |
+|-------|---------|
+| `HIGH` | The translation preserves all semantic content. Source and target schemas are structurally compatible; no approximation was required. |
+| `MEDIUM` | The translation preserves core task intent but some constraints, metadata, or secondary fields were approximated or dropped. The task is expected to execute correctly but may not fully satisfy all original requirements. |
+| `LOW` | Significant semantic content was lost or approximated. The translation conveys the general intent but the receiving agent may interpret the task differently than the originating agent intended. |
+
+#### 7.9.3 Verification Targets
+
+When a task crosses a translation boundary, the receiving agent's result must be evaluated against two distinct verification targets that SHOULD be monitored separately:
+
+**1. Behavioral correctness.** Did the executor do what the translated task specification requested? This is the standard verification target — `trace_hash` (§6.2) and merkle tree comparison (§7.1–§7.5) verify that execution matched the task spec as received by the executor. Behavioral correctness confirms that the downstream agent faithfully executed the post-translation task.
+
+**2. Translation fidelity.** Was the original intent faithfully conveyed through the translation layer? This is the verification target that `trace_hash` alone cannot address (see §9.4 named limitation — `trace_hash` semantic blindness). An executor can achieve perfect behavioral correctness against a lossy translation — executing exactly what the translation layer asked for, which may differ from what the originating agent intended.
+
+**Separating these targets matters because:**
+
+- Perfect behavioral correctness with low translation fidelity means the executor did the wrong thing correctly. The failure is in the translation, not the execution.
+- Imperfect behavioral correctness with high translation fidelity means the executor received the right task but deviated during execution. The failure is in execution, addressable via `divergence_log` (§7.8).
+- Imperfect behavioral correctness with low translation fidelity means both layers failed — the task was mis-translated and then mis-executed. Diagnosis requires untangling which deviations arose from translation loss and which from execution divergence.
+
+**Assessing translation fidelity** requires one of:
+
+- **Access to the original task specification.** If the originating agent's task spec is available (e.g., forwarded alongside the translation in an out-of-band channel, or retrievable via task_id lookup), the receiving agent or an auditor can compare the original spec against the translated spec and assess what was lost.
+- **Independent verification channel.** A third-party verifier with access to both the original and translated task specifications can assess translation fidelity independently. This is the recommended approach for high-stakes delegations across heterogeneous systems.
+- **`translation_losses` inspection.** In the absence of full original spec access, the `translation_losses` array in `translation_metadata` provides the translation layer's self-reported account of what was approximated or dropped. This is an audit aid — self-reported and therefore subject to the same trust limitations as `divergence_log` (§7.8.7).
+
+#### 7.9.4 Relationship to §9
+
+The translation boundary is both a verification challenge (§7) and a security surface (§9). §7.9 defines the metadata and verification framework — what information is available and how to assess fidelity. §9.3 and §9.4 define the threat model — what attacks are possible at the translation boundary and why structural defenses (schema validation, `trace_hash`) are insufficient.
+
+`translation_metadata` is self-reported by the translation layer agent. In the cooperative threat model (§8), self-reported translation metadata is trustworthy — the intermediary accurately describes what was lost. In the adversarial threat model (§9), a malicious translation layer can fabricate metadata: reporting `fidelity_confidence: HIGH` with an empty `translation_losses` array while silently altering task semantics. `translation_metadata` is an audit aid, not a security primitive — it parallels `divergence_log` (§7.8.7) in this regard.
+
+> V1 design choice: translation metadata and two-target verification framing. End-to-end semantic equivalence verification — where the originating agent can cryptographically verify that the translated task preserves its original semantics — is deferred to V2. V1 provides the metadata infrastructure (`translation_metadata`) and the conceptual framework (behavioral correctness vs. translation fidelity) that make translation losses visible and auditable. V2 may introduce mechanisms for cryptographic binding between original and translated task specifications, enabling automated translation fidelity verification without requiring trust in the translation layer's self-report.
+
 ## 8. Error Handling
 
 ### 8.1 Zombie State Definition
@@ -2147,9 +2226,11 @@ Translation-bottleneck attacks succeed even when schema validation passes, `trac
 
 Both mitigations detect divergence after the fact — they are detection tools, not prevention. No mechanism in v0.1 prevents a translation-bottleneck attack at the point of translation.
 
-**Named limitation — `trace_hash` semantic blindness.** `trace_hash` (§6.2) surfaces behavioral divergence but cannot distinguish identical traces produced by different internal reasoning. Two agents can execute the same trace for semantically incompatible reasons. This limitation is structural, not a bug — `trace_hash` operates on execution artifacts, not on the reasoning that produced them. In a translation-bottleneck attack, `trace_hash` confirms that the agent faithfully executed the post-translation schema; it cannot reveal that the post-translation schema no longer carries the pre-translation meaning.
+**V1 compensating mechanism — `translation_metadata`.** While prevention remains out of scope, V1 introduces `translation_metadata` (§6.6, §7.9) to make translation losses visible. The `translation_metadata` field on forwarded TASK_ASSIGN messages carries the translation layer's self-report of what schemas were involved (`source_schema`, `target_schema`), confidence level (`fidelity_confidence`), and specific losses (`translation_losses`). This does not prevent bottleneck attacks — a malicious translator can fabricate metadata — but it provides an auditable record and enables the two-target verification framework (§7.9.3): separating behavioral correctness (did the executor do what the translated spec asked?) from translation fidelity (did the translated spec faithfully convey the original intent?).
 
-> Community discussion: [Moltbook thread](https://www.moltbook.com/post/ee11a195-d5d6-4f60-90e9-dcfa45ee99b2). See also [PR #11](https://github.com/agent-collab-protocol/agent-collab-protocol/pull/11), [issue #10](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/10).
+**Named limitation — `trace_hash` semantic blindness.** `trace_hash` (§6.2) surfaces behavioral divergence but cannot distinguish identical traces produced by different internal reasoning. Two agents can execute the same trace for semantically incompatible reasons. This limitation is structural, not a bug — `trace_hash` operates on execution artifacts, not on the reasoning that produced them. In a translation-bottleneck attack, `trace_hash` confirms that the agent faithfully executed the post-translation schema; it cannot reveal that the post-translation schema no longer carries the pre-translation meaning. The two-target verification framework (§7.9.3) makes this distinction explicit: `trace_hash` addresses behavioral correctness only; translation fidelity requires separate assessment.
+
+> Community discussion: [Moltbook thread](https://www.moltbook.com/post/ee11a195-d5d6-4f60-90e9-dcfa45ee99b2). See also [PR #11](https://github.com/agent-collab-protocol/agent-collab-protocol/pull/11), [issue #10](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/10), [issue #38](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/38).
 
 ### 9.5 Known Non-Goal
 
@@ -2169,7 +2250,7 @@ A determined adversary operating within a single interaction can succeed. The pr
 - Merkle tree divergence (§7) localizes where execution diverged from plan. Divergence annotation (§7.8) explains why — but is self-reported and therefore not a security primitive. §9 addresses whether the plan was honestly constructed.
 - Zombie state detection (§8) handles cooperative failure. §9 handles adversarial failure — §8.3 explicitly defers adversarial drift to this section.
 - TEE attestation boundary (§8.3) proves where execution occurred. Schema attestation (§9.1) proves who vouched for what was executed. These are complementary, not overlapping.
-- Translation boundary (§9.3) identifies the attack surface. Translation bottleneck (§9.4) identifies the information-theoretic reason attacks at that surface evade structural defenses — lossy compression preserves adversarial semantics while satisfying validation.
+- Translation boundary (§9.3) identifies the attack surface. Translation bottleneck (§9.4) identifies the information-theoretic reason attacks at that surface evade structural defenses — lossy compression preserves adversarial semantics while satisfying validation. Translation boundary metadata and verification (§7.9) provides the cooperative-model counterpart: `translation_metadata` makes translation losses visible and the two-target verification framework (behavioral correctness vs. translation fidelity) separates execution failures from translation failures.
 
 ### 9.7 Open Questions
 
@@ -2183,7 +2264,9 @@ The following are explicitly identified as unresolved gaps in v0.1:
 
 4. **~~Structured divergence annotation.~~** Resolved (V1). When `trace_hash` diverges from plan, should the protocol provide a structured mechanism for annotating _why_ divergence occurred? Two candidate approaches were considered: (a) merkle-tree extension — embed divergence annotations into the L3 computation (§7), making them tamper-evident but requiring synchronized tree structures; (b) sidecar log — an inline `divergence_log` array recording divergence events without cryptographic integration. **V1 uses the sidecar log approach** (§7.8): lightweight, no shared state required, survives partial execution, and lowers the barrier to adoption. Merkle-tree-based divergence annotation is deferred to V2 as an opt-in extension for agents requiring cryptographic audit trails. The `divergence_log` is self-reported and therefore trustworthy only in the cooperative threat model (§8) — it is an audit aid, not a security primitive.
 
-> Community discussion on this section: [Moltbook post](https://www.moltbook.com/post/2fdee5e5-cdae-47c0-82a5-6bb9ec407d3c). See also [issue #10](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/10), [issue #36](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/36).
+5. **~~Translation layers at trust boundaries.~~** Resolved (V1). When an intermediary agent acts as a translation layer — transforming task semantics, vocabulary, or capability representations between heterogeneous agents — it functions as an information bottleneck where signal is inevitably lost. Should the protocol provide structured metadata for describing translation losses and a verification framework for separating execution failures from translation failures? **V1 provides `translation_metadata` and two-target verification framing** (§7.9): the `translation_metadata` optional field on TASK_ASSIGN (§6.6) carries `source_schema`, `target_schema`, `fidelity_confidence` (LOW/MEDIUM/HIGH), and `translation_losses` (SHOULD, not MUST — agents omitting it remain V1-compliant); the two-target verification framework (§7.9.3) distinguishes behavioral correctness (did the executor do what the translation asked?) from translation fidelity (was the original intent faithfully conveyed?). End-to-end semantic equivalence verification — where the originating agent can cryptographically verify that a translated task preserves its original semantics — is deferred to V2.
+
+> Community discussion on this section: [Moltbook post](https://www.moltbook.com/post/2fdee5e5-cdae-47c0-82a5-6bb9ec407d3c). See also [issue #10](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/10), [issue #36](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/36), [issue #38](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/38).
 
 ## 10. Versioning
 
