@@ -350,9 +350,59 @@ namespace uses reverse-DNS notation to prevent task type collisions across ecosy
 
 ### 6.4 Task Hash Computation
 
-task_hash = SHA-256(canonical_json(task_schema))
+Task identity is computed via a MANIFEST — a sorted, deterministic list of `(key, type, value_hash)` tuples derived from the task schema fields. The MANIFEST separates task representation from task identity: each agent uses its own internal schema and serialization format; coordination requires only that agents agree on the sorted tuple structure.
 
-canonical_json MUST produce deterministic output regardless of key insertion order. Implementations SHOULD follow RFC 8785 (JSON Canonicalization Scheme). Exclude task_hash and post-execution fields (trace_hash) from hash input.
+**Canonical hashing method:**
+
+```
+manifest = sorted([
+  (key, type(val).__name__, SHA-256(serialize(val)))
+  for key, val in task.items()
+  if key not in EXCLUDED_FIELDS
+])
+task_hash = SHA-256(manifest)
+```
+
+`EXCLUDED_FIELDS` = `{task_hash, trace_hash}` — the hash output and post-execution fields MUST be excluded from hash input.
+
+**MANIFEST construction rules:**
+
+1. **Key:** The field name as a UTF-8 string, exactly as defined in §6.1 (e.g., `intent`, `scope`, `constraints`).
+2. **Type:** The canonical type name of the value. Implementations MUST map to one of the following normalized type strings: `string`, `integer`, `float`, `boolean`, `null`, `object`, `array`, `datetime`. Language-specific type names (e.g., Python's `str`, Go's `int64`, Rust's `String`) MUST be mapped to these canonical names.
+3. **Value hash:** `SHA-256(serialize(val))` where `serialize` produces a byte representation of the value. For scalar types (string, integer, float, boolean, null), serialize as the UTF-8 encoding of the canonical string representation. For composite types (object, array), serialize by recursively constructing a sub-MANIFEST and hashing it — the same sorted-tuple procedure applied at each level of nesting.
+4. **Sorting:** Tuples are sorted lexicographically by key (UTF-8 byte order). Key uniqueness is guaranteed by the task schema definition (§6.1).
+5. **Final hash:** `task_hash = SHA-256(canonical_serialize(manifest))` where `canonical_serialize` encodes the sorted tuple list as a length-prefixed sequence of `(key_bytes, type_bytes, value_hash_bytes)`.
+
+**Why MANIFEST, not canonical JSON:**
+
+Two implementations can diverge on serialization format (JSON, CBOR, MessagePack, Protobuf), runtime language, key ordering conventions, floating-point representation, and whitespace handling — and still produce identical `task_hash` values, because identity is computed over the sorted tuple structure rather than a serialized document. This prevents canonicalization drift: the failure mode where two agents produce different canonical forms of the same logical task due to differences in their JSON canonicalization libraries, Unicode normalization, or number encoding.
+
+RFC 8785 (JCS) remains a valid serialization choice for `serialize` within each value hash, but the MANIFEST structure removes the requirement that all implementations use the same document-level canonicalization scheme. The canonical unit is the individual field value, not the whole document.
+
+**Example:**
+
+Given a task with fields:
+
+```yaml
+intent: "Summarize document"
+scope:
+  include: ["chapters 1-3"]
+  exclude: ["appendix"]
+constraints:
+  timeout_seconds: 300
+```
+
+The MANIFEST (before final hashing) is:
+
+```
+[
+  ("constraints", "object", SHA-256(<sub-manifest of constraints>)),
+  ("intent",      "string", SHA-256("Summarize document")),
+  ("scope",       "object", SHA-256(<sub-manifest of scope>))
+]
+```
+
+Two agents — one in Python using `json.dumps`, one in Rust using `serde_cbor` — construct the same MANIFEST and produce the same `task_hash`, because neither depends on the other's serialization format. The sorted tuple structure is the shared contract.
 
 ### 6.5 Delegation Protocol
 
@@ -632,7 +682,7 @@ Root mismatch is the entry point. Agents SHOULD NOT compare subtrees unless the 
 
 L3 is equivalent to `trace_hash` in §6.2. Systems that implement only §6 already produce L3. Upgrading to §7 is incremental: add L1 and L2, then compute the merkle root.
 
-L1 is derivable from the canonical task schema (§6.1) using the same canonical JSON approach specified in §6.4. L2 requires the executing agent to serialize its plan — see §7.7 open questions on canonical format.
+L1 is derivable from the canonical task schema (§6.1) using the same MANIFEST canonicalization approach specified in §6.4. L2 requires the executing agent to serialize its plan — see §7.7 open questions on canonical format.
 
 Orchestrators MAY use merkle root divergence as a renegotiation trigger, superseding the simpler `trace_hash` divergence signal described in §6.2.
 
@@ -672,7 +722,7 @@ Subtask ordering in the concatenation MUST be deterministic — ordered by `task
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
-1. **Canonical serialization format for L1 and L2.** L3 follows the §6.4 canonical JSON approach. L1 may follow the same approach (it derives from the task schema). L2 has no defined schema yet — plan representations vary across agent architectures.
+1. **Canonical serialization format for L1 and L2.** L3 follows the §6.4 MANIFEST canonicalization approach. L1 may follow the same approach (it derives from the task schema). L2 has no defined schema yet — plan representations vary across agent architectures.
 
 2. **Partial tree verification for scale.** Is submitting only changed levels acceptable for repeated tasks? Full tree recomputation may be wasteful when only L3 changes across executions of the same plan.
 
