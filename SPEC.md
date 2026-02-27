@@ -586,6 +586,7 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | manifest_digest | string | No | Merkle root over the coordinator's capability set: each leaf is `SHA-256(cap_id ‖ impl_hash ‖ policy_hash)`. Enables 0-RTT capability intersection (§5.9). |
 | requested_mandatory | array | No | Capability IDs (§5.1.1 format) the coordinator requires the worker to support. If any are missing from the worker's manifest, the session MUST NOT proceed to ACTIVE. |
 | requested_optional | array | No | Capability IDs (§5.1.1 format) the coordinator prefers but does not require. Missing optional capabilities do not block session establishment. |
+| plan_commit_required | boolean | No | If `true`, the coordinator requires the worker to send PLAN_COMMIT (§6.6, §6.11) after TASK_ACCEPT and before the first TASK_PROGRESS for every task in this session. A missing PLAN_COMMIT when this field is `true` is a protocol violation. Default: `false`. |
 | timestamp | ISO 8601 | Yes | When the SESSION_INIT was sent. |
 
 **SESSION_INIT_ACK fields:**
@@ -606,6 +607,7 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | session_ttl | ISO 8601 duration | No | Accepted or counter-proposed session TTL. |
 | lease_epoch | integer | No | Echoed from SESSION_INIT (confirms epoch synchronization). |
 | effective_cap_set | array | No | Intersection of the coordinator's `requested_mandatory` + `requested_optional` with the worker's capabilities, filtered by policy. Returned when SESSION_INIT includes `manifest_digest`. Enables 0-RTT capability agreement (§5.9). |
+| plan_commit_required | boolean | No | Echoed from SESSION_INIT. If the coordinator set `plan_commit_required: true`, the worker MUST echo it to confirm understanding of the plan commitment obligation. If the worker cannot support plan commitment, it MUST reject the session. |
 | timestamp | ISO 8601 | Yes | When the SESSION_INIT_ACK was sent. |
 
 **Version compatibility check:** Upon receiving SESSION_INIT (or SESSION_INIT_ACK), the receiving agent MUST check protocol and schema version compatibility per §10.3. If versions are incompatible, the agent sends PROTOCOL_MISMATCH or SCHEMA_MISMATCH (§10.4) and the session transitions to CLOSED. Version declaration at SESSION_INIT is a spec obligation, not an optional feature — forward compatibility (§10.5) depends on every session beginning with explicit version exchange.
@@ -639,6 +641,7 @@ requested_mandatory:
   - "cap:example.code.execute@1"
 requested_optional:
   - "cap:example.web.search@1"
+plan_commit_required: true
 timestamp: "2026-02-27T10:30:00Z"
 ```
 
@@ -1479,14 +1482,15 @@ Two agents — one in Python using `json.dumps`, one in Rust using `serde_cbor` 
 1. Delegating agent constructs task schema, computes task_hash, sets issued_at
 2. Task transmitted to executing agent via session message format (§4.3)
 3. Executing agent acknowledges receipt (§7)
-4. Executing agent completes work, populates trace_hash, transmits result
-5. Delegating agent verifies task_hash integrity; optionally validates trace_hash against expected behavior
+4. *(Optional)* Executing agent computes plan_hash, sends PLAN_COMMIT (§6.6, §6.11) to delegating agent before beginning work. REQUIRED when session was established with `plan_commit_required: true` (§4.3).
+5. Executing agent completes work, populates trace_hash, transmits result
+6. Delegating agent verifies task_hash integrity; optionally validates trace_hash against expected behavior. If PLAN_COMMIT was received, delegating agent verifies plan_hash_ref in the result for three-level alignment (§6.11).
 
 ### 6.6 Delegation Message Types
 
 > **Draft — community discussion in progress via [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15).**
 
-The delegation protocol uses eight message types. All messages MUST include `task_id` for correlation.
+The delegation protocol uses nine message types. All messages MUST include `task_id` for correlation.
 
 **TASK_ASSIGN**
 
@@ -1536,6 +1540,27 @@ Sent by the delegatee to confirm it will execute the task.
 
 A TASK_ACCEPT is a commitment. After sending TASK_ACCEPT, the delegatee is responsible for eventually sending TASK_COMPLETE or TASK_FAIL.
 
+**PLAN_COMMIT**
+
+Sent by the delegatee to the coordinator after TASK_ACCEPT (and after SESSION_INIT_ACK), before the first TASK_PROGRESS. PLAN_COMMIT creates a verifiable pre-execution commitment — the delegatee hashes its execution plan before starting work, creating an auditable record the coordinator can verify against actual results. Unlike declared intent, a pre-execution commitment with a prior hash is falsifiable.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| task_id | UUID v4 | Yes | Echoed from TASK_ASSIGN |
+| session_id | string | Yes | Echoed from TASK_ASSIGN |
+| plan_hash | SHA-256 | Yes | Hash of the delegatee's canonical plan representation. MUST be deterministic for the same logical plan. Recommended: SHA-256 of canonical UTF-8 JSON. The canonical representation is implementation-defined but MUST be documented in the agent's capability manifest (§5.1). |
+| task_hash_ref | SHA-256 | Yes | The `task_hash` (§6.1) of the task this plan was made against. Binds the plan commitment to a specific task version — any task modification invalidates the prior commitment and requires a new PLAN_COMMIT. |
+| spec_version | semver | Yes | Protocol spec version governing this plan commitment (§10). |
+| timestamp | ISO 8601 | Yes | When the PLAN_COMMIT was sent. |
+
+**PLAN_COMMIT semantics:**
+
+- PLAN_COMMIT is optional by default. It becomes mandatory when `plan_commit_required: true` was negotiated in SESSION_INIT (§4.3). When mandatory, the coordinator MUST NOT accept TASK_PROGRESS before receiving PLAN_COMMIT — a TASK_PROGRESS arriving before PLAN_COMMIT is a protocol violation.
+- The coordinator MUST reject a PLAN_COMMIT if `task_hash_ref` does not match the current `task_hash` for the referenced task. This prevents stale commitments: if the task changes after PLAN_COMMIT is sent, the hash is stale and the delegatee MUST send a new PLAN_COMMIT against the updated task.
+- The spec MUST NOT mandate a specific internal plan representation format — agent architectures vary too widely. It MUST require that `plan_hash` is deterministic for the same logical plan.
+- PLAN_COMMIT MAY be sent even when `plan_commit_required` is `false` — the coordinator SHOULD accept and store it for audit purposes regardless.
+- A delegatee MAY send a new PLAN_COMMIT to supersede a previous one (e.g., after receiving updated task parameters). Only the most recent PLAN_COMMIT is considered the active commitment.
+
 **TASK_REJECT**
 
 Sent by the delegatee to decline the task.
@@ -1577,6 +1602,7 @@ Sent by the delegatee when the task finishes successfully.
 | version_chain_summary | object | No | Summary of the protocol version chain across all hops that contributed to this result (see §6.9.1). Present when the task involved sub-delegation. |
 | divergence_log | array | No | Array of divergence entries recording each point where execution departed from the committed plan (see §7.8). Present when `trace_hash` differs from the committed plan hash (L2, §7.4). |
 | delegation_chain | array of strings | No | Ordered list of agent identifiers representing every agent that handled or forwarded the task, in execution order (see §6.9.2). Present when the task involved sub-delegation. |
+| plan_hash_ref | SHA-256 | No | Back-reference to the `plan_hash` from the most recent PLAN_COMMIT (§6.6, §6.11) for this task. Enables audit log correlation and three-level alignment verification: L1 (`task_hash`) → L2 (`plan_hash_ref`) → L3 (`trace_hash`). Present when PLAN_COMMIT was sent during execution. |
 
 The delegating agent SHOULD verify that `result` conforms to `expected_output_format` from the original TASK_ASSIGN. Non-conforming results are not a protocol error — the delegating agent decides whether to accept, reject, or request rework.
 
@@ -1595,6 +1621,7 @@ Sent by the delegatee when the task cannot be completed.
 | version_chain_summary | object | No | Summary of the protocol version chain across downstream hops (see §6.9.1). Present when the task involved sub-delegation, even on failure — enables the originating agent to assess whether version degradation contributed to the failure. |
 | divergence_log | array | No | Array of divergence entries recording plan departures that occurred before failure (see §7.8). Present when any execution occurred before failure and the execution diverged from the committed plan. |
 | delegation_chain | array of strings | No | Ordered list of agent identifiers representing every agent that handled or forwarded the task, in execution order (see §6.9.2). Present when the task involved sub-delegation, even on failure — enables post-hoc audit of which agents were involved before the failure occurred. |
+| plan_hash_ref | SHA-256 | No | Back-reference to the `plan_hash` from the most recent PLAN_COMMIT (§6.6, §6.11) for this task. Present when PLAN_COMMIT was sent before failure — enables post-hoc analysis of whether failure was a plan-level or execution-level problem. |
 
 TASK_FAIL with `partial_results` is preferred over TASK_FAIL without — even incomplete output may be useful for recovery or reassignment. The delegating agent owns the recovery decision (see §6.10).
 
@@ -1643,11 +1670,13 @@ Sent by the delegating agent to explicitly cancel an in-flight task. TASK_CANCEL
 The delegation lifecycle follows a linear state machine:
 
 ```
-TASK_ASSIGN → TASK_ACCEPT → TASK_PROGRESS*    → TASK_COMPLETE
-                            TASK_CHECKPOINT*  → TASK_FAIL
-                                              ← TASK_CANCEL (delegator-initiated)
+TASK_ASSIGN → TASK_ACCEPT → [PLAN_COMMIT] → TASK_PROGRESS*    → TASK_COMPLETE
+                                             TASK_CHECKPOINT*  → TASK_FAIL
+                                                               ← TASK_CANCEL (delegator-initiated)
            → TASK_REJECT
 ```
+
+`[PLAN_COMMIT]` is optional by default; it becomes mandatory when `plan_commit_required: true` was negotiated in SESSION_INIT (§4.3).
 
 **State transitions:**
 
@@ -1655,8 +1684,10 @@ TASK_ASSIGN → TASK_ACCEPT → TASK_PROGRESS*    → TASK_COMPLETE
 |---------------|---------------------|--------|
 | (initial) | TASK_ASSIGN | Delegator |
 | TASK_ASSIGN sent | TASK_ACCEPT, TASK_REJECT | Delegatee |
-| TASK_ACCEPT sent | TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
+| TASK_ACCEPT sent | PLAN_COMMIT, TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
 | TASK_ACCEPT sent | TASK_CANCEL | Delegator |
+| PLAN_COMMIT sent | PLAN_COMMIT (supersede), TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
+| PLAN_COMMIT sent | TASK_CANCEL | Delegator |
 | TASK_PROGRESS sent | TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
 | TASK_PROGRESS sent | TASK_CANCEL | Delegator |
 | TASK_CHECKPOINT sent | TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
@@ -1666,7 +1697,7 @@ TASK_ASSIGN → TASK_ACCEPT → TASK_PROGRESS*    → TASK_COMPLETE
 | TASK_FAIL sent | (terminal) | — |
 | TASK_REJECT sent | (terminal) | — |
 
-Messages received out of sequence MUST be rejected. An agent that receives TASK_PROGRESS for a task_id it never sent TASK_ASSIGN for MUST ignore the message and MAY log it as anomalous.
+Messages received out of sequence MUST be rejected. An agent that receives TASK_PROGRESS for a task_id it never sent TASK_ASSIGN for MUST ignore the message and MAY log it as anomalous. When `plan_commit_required: true` is active (§4.3), TASK_PROGRESS received before PLAN_COMMIT for the same `task_id` is a protocol violation — the coordinator MUST reject it.
 
 **Timeout behavior:** If `timeout_seconds` is set in the task schema (§6.1) and the delegatee has not sent TASK_COMPLETE or TASK_FAIL within that window after TASK_ACCEPT, the delegator MAY treat the task as failed. The delegator SHOULD send no message — timeout is a delegator-side decision, not a protocol message. The delegatee may still be executing (zombie state, §8.1); the external verifier (§4.7.2) handles liveness determination.
 
@@ -1879,11 +1910,61 @@ delegation_chain:
 
 **Relationship to §8:** TASK_FAIL is the cooperative failure mechanism — the delegatee knows it failed and reports. Zombie state (§8.1) is the uncooperative failure mechanism — the delegatee does not know it failed. Both terminate the same way from the delegator's perspective (the task did not complete), but require different detection paths: TASK_FAIL is self-reported; zombie state is externally detected (§4.7.2).
 
-### 6.11 Open Questions
+### 6.11 Pre-execution Plan Commitment
+
+Pre-execution plan commitment creates a verifiable paper trail that distinguishes "agent deviated from its planned approach" from "agent was given bad information." Without a prior commitment, any post-hoc explanation of divergence is unfalsifiable — the agent could claim it always intended to execute the way it did. With PLAN_COMMIT (§6.6), the coordinator holds a timestamped, hash-anchored record of what the delegatee said it would do before it started doing it.
+
+#### 6.11.1 Three-Level Alignment Verification
+
+Plan commitment enables three-level alignment verification across the task lifecycle:
+
+| Level | Hash | What it captures | When computed |
+|-------|------|-------------------|---------------|
+| L1 | `task_hash` (§6.1) | What was requested | Pre-delegation (by delegator) |
+| L2 | `plan_hash` (PLAN_COMMIT) | What the delegatee committed to before execution | Post-acceptance, pre-execution (by delegatee) |
+| L3 | `trace_hash` (§6.2) | What was actually done | Post-execution (by delegatee) |
+
+**Divergence diagnosis:**
+
+| Divergence | Diagnosis |
+|------------|-----------|
+| L1 → L2 mismatch | Scope misunderstanding or negotiation drift at planning time. The delegatee's plan does not match the task as specified. Detectable before any execution occurs. |
+| L2 → L3 mismatch | Execution drift, zombie behavior (§8.1), or context compaction failure mid-task (§8.5). The delegatee planned one thing and did another. |
+| L1 → L2 match, L2 → L3 mismatch | Clean planning, dirty execution — the plan was faithful to the task but execution diverged. |
+| L1 → L2 mismatch, L2 → L3 match | The plan was wrong but faithfully executed — the delegatee did exactly what it planned, but planned the wrong thing. |
+
+This three-level structure integrates with the §7 merkle tree: L1, L2, and L3 correspond directly to the three tree levels.
+
+#### 6.11.2 Re-commitment Gap
+
+If a task changes after `plan_hash` is committed (e.g., via updated constraints or scope), the existing PLAN_COMMIT is stale. The `task_hash_ref` field in PLAN_COMMIT solves this:
+
+- Every PLAN_COMMIT includes `task_hash_ref` — the `task_hash` of the task the plan was made against.
+- The coordinator MUST reject any PLAN_COMMIT where `task_hash_ref` does not match the current `task_hash` for the referenced `task_id`.
+- Any task modification that changes `task_hash` automatically invalidates the prior PLAN_COMMIT. The delegatee MUST send a new PLAN_COMMIT against the updated task before continuing execution.
+- This ensures the plan commitment chain is never broken: every active `plan_hash` is anchored to the current task specification.
+
+#### 6.11.3 Canonicalization
+
+The spec MUST NOT mandate a specific internal plan representation format — agent architectures vary too widely (tree-of-thought planners, linear step sequences, constraint satisfaction solvers, reactive planners with no explicit plan). It MUST require that `plan_hash` is deterministic for the same logical plan.
+
+**Recommended:** SHA-256 of canonical UTF-8 JSON representation of the plan. The canonical representation is implementation-defined but MUST be documented in the agent's capability manifest (§5.1). This enables coordinators to assess whether they can independently verify plan hashes from agents with documented plan formats.
+
+#### 6.11.4 Integration with Semantic Liveness (§8.9)
+
+SEMANTIC_RESPONSE messages (§8.9.2) MAY include the agent's current `plan_hash` as part of state verification. This adds a third verification axis to the existing `task_hash` check:
+
+1. `task_hash` verification: does the agent still hold the correct task specification?
+2. `plan_hash` verification: does the agent still hold the correct execution plan?
+3. `current_state_hash` verification: is the agent's working state internally consistent?
+
+An agent that passes `task_hash` verification but fails `plan_hash` verification has lost its plan context — it knows what was requested but has forgotten what it committed to doing about it. This is a distinct failure mode from full context compaction (which loses both) and detectable only when PLAN_COMMIT is in use.
+
+### 6.12 Open Questions
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
-1. **~~TASK_CANCEL as a first-class message.~~** Resolved: TASK_CANCEL is now defined as the eighth delegation message type (§6.6). Cancellation uses TASK_CANCEL (delegator → delegatee) with explicit `reason` field. The delegatee responds with TASK_FAIL (error code `cancelled`) or TASK_COMPLETE (if already finished). Session expiry (§4.2 EXPIRED state, §4.5.3) mandates TASK_CANCEL for all in-flight subtasks to prevent phantom completions.
+1. **~~TASK_CANCEL as a first-class message.~~** Resolved: TASK_CANCEL is now defined as a delegation message type (§6.6). Cancellation uses TASK_CANCEL (delegator → delegatee) with explicit `reason` field. The delegatee responds with TASK_FAIL (error code `cancelled`) or TASK_COMPLETE (if already finished). Session expiry (§4.2 EXPIRED state, §4.5.3) mandates TASK_CANCEL for all in-flight subtasks to prevent phantom completions.
 
 2. **Idempotency of TASK_ASSIGN.** If a delegator retransmits TASK_ASSIGN (e.g., due to transport-layer uncertainty about delivery), should the delegatee treat the duplicate as a new task or deduplicate by `task_id`? Deduplication is safer but requires the delegatee to maintain state about previously seen task_ids.
 
@@ -1933,7 +2014,7 @@ Root mismatch is the entry point. Agents SHOULD NOT compare subtrees unless the 
 
 L3 is equivalent to `trace_hash` in §6.2. Systems that implement only §6 already produce L3. Upgrading to §7 is incremental: add L1 and L2, then compute the merkle root.
 
-L1 is derivable from the canonical task schema (§6.1) using the same MANIFEST canonicalization approach specified in §6.4. L2 requires the executing agent to serialize its plan — see §7.7 open questions on canonical format.
+L1 is derivable from the canonical task schema (§6.1) using the same MANIFEST canonicalization approach specified in §6.4. L2 is transmitted via PLAN_COMMIT (§6.6, §6.11) as `plan_hash` — the executing agent serializes its plan, hashes it, and commits the hash before execution. See §7.7 open questions on canonical format.
 
 Orchestrators MAY use merkle root divergence as a renegotiation trigger, superseding the simpler `trace_hash` divergence signal described in §6.2.
 
@@ -1941,15 +2022,18 @@ Orchestrators MAY use merkle root divergence as a renegotiation trigger, superse
 
 L1 and L2 CAN be computed and committed before execution begins. L3 is post-execution only.
 
-The executing agent commits to a plan (L2) before starting work. After execution completes and L3 is available, any mismatch between the committed L2 and the actual L3 is detectable — the agent planned one thing and did another.
+The executing agent commits to a plan (L2) before starting work. After execution completes and L3 is available, any mismatch between the committed L2 and the actual L3 is detectable — the agent planned one thing and did another. The key insight: pre-execution commitment is verifiable, not merely declared. A delegatee that hashes its execution plan before starting creates an auditable commitment the coordinator can verify against actual results. Declared intent with no prior commitment is unfalsifiable.
+
+**Wire-level mechanism:** The PLAN_COMMIT message (§6.6, §6.11) is the protocol-level realization of L2 commitment. PLAN_COMMIT transmits the `plan_hash` (L2) to the coordinator before execution begins, with a `task_hash_ref` binding the plan to a specific task version (L1). The `plan_hash_ref` field on TASK_COMPLETE and TASK_FAIL (§6.6) closes the loop by back-referencing the committed plan for three-level alignment verification.
 
 Pre-execution commitment sequence:
 
 1. Delegating agent transmits task (L1 is computable by both sides)
-2. Executing agent decomposes task, computes L2, commits L2 to delegating agent
-3. Executing agent performs work
-4. Executing agent computes L3, computes merkle root, transmits result with full tree
-5. Delegating agent verifies L1, checks L2 against committed value, validates merkle root
+2. Executing agent decomposes task, computes L2, sends PLAN_COMMIT (§6.6) to delegating agent with `plan_hash` and `task_hash_ref`
+3. Delegating agent validates `task_hash_ref` matches current task — rejects if stale
+4. Executing agent performs work
+5. Executing agent computes L3, computes merkle root, transmits result with full tree and `plan_hash_ref`
+6. Delegating agent verifies L1, checks L2 against committed value via `plan_hash_ref`, validates merkle root
 
 ### 7.5 Subtask Composition
 
@@ -1973,7 +2057,7 @@ Subtask ordering in the concatenation MUST be deterministic — ordered by `task
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
-1. **Canonical serialization format for L1 and L2.** L3 follows the §6.4 MANIFEST canonicalization approach. L1 may follow the same approach (it derives from the task schema). L2 has no defined schema yet — plan representations vary across agent architectures.
+1. **Canonical serialization format for L1 and L2.** L3 follows the §6.4 MANIFEST canonicalization approach. L1 may follow the same approach (it derives from the task schema). L2 has no defined schema yet — plan representations vary across agent architectures. **Partially addressed (V1):** PLAN_COMMIT (§6.6, §6.11) requires `plan_hash` to be deterministic for the same logical plan and recommends SHA-256 of canonical UTF-8 JSON, but the internal plan representation remains implementation-defined. The canonical format MUST be documented in the agent's capability manifest (§5.1). A universal plan schema remains deferred.
 
 2. **Partial tree verification for scale.** Is submitting only changed levels acceptable for repeated tasks? Full tree recomputation may be wasteful when only L3 changes across executions of the same plan.
 
@@ -2273,6 +2357,7 @@ Tier 2 is an expensive, periodic challenge-response mechanism for detecting agen
 | session_id | string | Yes | Active session identifier. |
 | current_state_hash | SHA-256 | Yes | Hash of the agent's current working state, computed as `SHA-256(task_hash ‖ local_state_snapshot ‖ challenge_nonce)`. The inclusion of `challenge_nonce` prevents replaying a previously valid response. |
 | checkpoint_ref | string | Yes | Echoed or updated checkpoint reference. If the agent has advanced beyond the challenger's `checkpoint_ref`, it returns the more recent checkpoint. |
+| plan_hash | SHA-256 | No | The `plan_hash` from the agent's most recent PLAN_COMMIT (§6.6, §6.11) for the challenged task. When present, adds a third verification axis: the coordinator can detect mid-task execution drift against the original plan commitment, not just against the task specification. Coordinators SHOULD cross-reference this with the stored PLAN_COMMIT to verify the agent still holds the correct plan context. |
 | timestamp | ISO 8601 | Yes | When the SEMANTIC_RESPONSE was sent. |
 
 **Tier 2 behavior:**
