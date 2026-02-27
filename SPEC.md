@@ -103,7 +103,7 @@ The identity object MUST be included in the agent's first protocol message to an
 At session start, the counterparty verifies the agent's identity using the declared fields:
 
 - **Name-only identity:** The counterparty checks that the `(name, platform)` pair is known (previously published or present in a registry). Name-only verification provides attribution but not authentication — it confirms who claims to be acting, not that the claimant is legitimate.
-- **Keypair identity:** The counterparty verifies the agent's signature over a challenge or over the CAPABILITY_MANIFEST (§5.1.1). Signature verification provides authentication — it confirms that the agent holds the private key corresponding to the declared `pubkey`.
+- **Keypair identity:** The counterparty verifies the agent's signature over a challenge or over the CAPABILITY_MANIFEST (§5.1.2). Signature verification provides authentication — it confirms that the agent holds the private key corresponding to the declared `pubkey`.
 
 Verification MUST occur before any task delegation (§6). An agent whose identity cannot be verified MUST NOT receive TASK_ASSIGN messages.
 
@@ -211,10 +211,8 @@ name: "agent-alpha"
 platform: "github"
 pubkey: "dGhpcyBpcyBhIHB1YmxpYyBrZXk..."
 capabilities:
-  - capability_id: "com.example.capabilities/code-execution"
-    version: "1.2.0"
-  - capability_id: "com.example.capabilities/web-search"
-    version: "1.0.0"
+  - capability_id: "cap:example.code.execute@1"
+  - capability_id: "cap:example.web.search@1"
 endpoint: "https://agents.example.com/alpha"
 protocol_version: "0.1.0"
 schema_version: "0.1.0"
@@ -234,11 +232,10 @@ Each entry in the AGENT_MANIFEST `capabilities` array is a capability summary �
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| capability_id | string | Yes | Unique identifier for the capability (reverse-DNS, matching §5.1 capability type entries). |
-| version | semver | Yes | Version of the capability implementation. |
+| capability_id | string | Yes | Structured capability identifier using the `cap:namespace.capability@version` format (§5.1.1), matching §5.1 capability type entries. |
 | description | string | No | Human-readable summary of what the capability does. Intended for discovery UIs and agent selection heuristics, not for protocol-level matching. |
 
-Capability summaries are intentionally less detailed than CAPABILITY_MANIFEST entries (§5.1). The registry needs enough information to filter candidates; the full capability exchange happens at session establishment. This prevents the registry from becoming a bottleneck for capability schema evolution — changes to capability constraints (§5.1 `constraints` field) do not require manifest republication.
+Capability summaries are intentionally less detailed than CAPABILITY_MANIFEST entries (§5.1). The registry needs enough information to filter candidates; the full capability exchange happens at session establishment. This prevents the registry from becoming a bottleneck for capability schema evolution — changes to capability constraints (§5.1 `constraints` field) do not require manifest republication. The `version` component is encoded within the `capability_id` itself (§5.1.1), not as a separate field.
 
 ### 3.2 Registry Protocol
 
@@ -354,7 +351,7 @@ An attester MAY revoke a previously issued attestation at any time. Revocation i
 | **Lifetime** | Persists across sessions until revoked or updated | Valid for the duration of a single session |
 | **Audience** | Any agent performing discovery | Only agents in the current session |
 | **Detail level** | Capability summaries (§3.1.1) — enough for candidate filtering | Full capability declarations with constraints, resource bounds, message types |
-| **Trust signal** | Attestations (§3.3) from third parties | Signature verification (§5.1.1) by session counterparty |
+| **Trust signal** | Attestations (§3.3) from third parties | Signature verification (§5.1.2) by session counterparty |
 | **Update trigger** | Agent capabilities change, endpoint moves, pricing updates | Session establishment (mandatory), or if agent capabilities change mid-session (rare) |
 
 **Derivation at handshake:** When an agent initiates a session with a discovered agent, the session-scoped CAPABILITY_MANIFEST (§5.1) MUST be consistent with the registry-scoped AGENT_MANIFEST (§3.1). Specifically:
@@ -410,7 +407,7 @@ The following are explicitly identified as unresolved for V1:
 
 1. **Registry storage tradeoffs.** Nostr relays provide decentralization but lack query expressiveness. HTTP registries provide rich queries but centralize control. DID documents provide self-sovereignty but add resolution complexity. The optimal storage layer likely varies by deployment context. Should the protocol define a minimum interoperability requirement across storage backends, or allow full deployment-specific selection?
 
-2. **Capability taxonomy granularity.** The `capability_id` field uses reverse-DNS naming (§5.1), but the protocol does not define a standard capability taxonomy. Without a shared taxonomy, discovery across ecosystems requires capability name mapping — agent A's `com.a.capabilities/code-execution` and agent B's `org.b.capabilities/run-code` may be semantically equivalent but syntactically distinct. Should V1 define a base capability taxonomy, or defer to ecosystem-specific naming with an optional equivalence mapping?
+2. **Capability taxonomy granularity.** The `capability_id` field uses the structured `cap:namespace.capability@version` format (§5.1.1), and V1 requires exact `cap_id` match (§5.11). Without a shared taxonomy, discovery across ecosystems requires capability name mapping — agent A's `cap:a.code.execute@1` and agent B's `cap:b.run.code@1` may be semantically equivalent but syntactically distinct. Agents can publish adapter capabilities (e.g. `cap:adapter.pathlike_to_string@1`) to bridge representations, but should V2 define a base capability taxonomy or a type equivalence mechanism?
 
 3. **TTL and freshness defaults.** The `ttl_seconds` field is optional with no protocol-defined default. In practice, a missing TTL means either "this manifest never expires" (dangerous — stale manifests accumulate) or "use the registry's default" (inconsistent across registries). Should V1 define a default TTL or a maximum TTL to bound staleness?
 
@@ -553,6 +550,9 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | keepalive | object | No | Keepalive configuration proposal (see §4.5). If omitted, no protocol-level keepalive is active for this session. |
 | session_ttl | ISO 8601 duration | No | Proposed session time-to-live. After expiry, the session transitions to CLOSED unless renewed. If omitted, session has no protocol-level TTL (deployment-specific timeout applies). |
 | lease_epoch | integer | No | Monotonically increasing epoch counter for lease-based session management (see §4.5.2). Initial value MUST be 0. |
+| manifest_digest | string | No | Merkle root over the coordinator's capability set: each leaf is `SHA-256(cap_id ‖ impl_hash ‖ policy_hash)`. Enables 0-RTT capability intersection (§5.9). |
+| requested_mandatory | array | No | Capability IDs (§5.1.1 format) the coordinator requires the worker to support. If any are missing from the worker's manifest, the session MUST NOT proceed to ACTIVE. |
+| requested_optional | array | No | Capability IDs (§5.1.1 format) the coordinator prefers but does not require. Missing optional capabilities do not block session establishment. |
 | timestamp | ISO 8601 | Yes | When the SESSION_INIT was sent. |
 
 **SESSION_INIT_ACK fields:**
@@ -568,6 +568,7 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | keepalive | object | No | Keepalive configuration acceptance or counter-proposal. |
 | session_ttl | ISO 8601 duration | No | Accepted or counter-proposed session TTL. |
 | lease_epoch | integer | No | Echoed from SESSION_INIT (confirms epoch synchronization). |
+| effective_cap_set | array | No | Intersection of the coordinator's `requested_mandatory` + `requested_optional` with the worker's capabilities, filtered by policy. Returned when SESSION_INIT includes `manifest_digest`. Enables 0-RTT capability agreement (§5.9). |
 | timestamp | ISO 8601 | Yes | When the SESSION_INIT_ACK was sent. |
 
 **Version compatibility check:** Upon receiving SESSION_INIT (or SESSION_INIT_ACK), the receiving agent MUST check protocol and schema version compatibility per §10.3. If versions are incompatible, the agent sends PROTOCOL_MISMATCH or SCHEMA_MISMATCH (§10.4) and the session transitions to CLOSED. Version declaration at SESSION_INIT is a spec obligation, not an optional feature — forward compatibility (§10.5) depends on every session beginning with explicit version exchange.
@@ -592,6 +593,11 @@ keepalive:
   missed_heartbeats_before_suspect: 2
 session_ttl: "PT4H"
 lease_epoch: 0
+manifest_digest: "a1b2c3d4e5f6..."
+requested_mandatory:
+  - "cap:example.code.execute@1"
+requested_optional:
+  - "cap:example.web.search@1"
 timestamp: "2026-02-27T10:30:00Z"
 ```
 
@@ -882,7 +888,7 @@ At session establishment — before any task assignment — each agent declares 
 | agent_id | string | Yes | Identity of the declaring agent |
 | capability_types | array | Yes | List of capability type entries the agent claims to support (see §5.1.1) |
 | resource_access_bounds | object | Yes | Self-declared resource access limits (see below) |
-| supported_message_types | array | Yes | Protocol message types this agent can send and receive (e.g. `TASK_ASSIGN`, `TASK_ACCEPT`, `TASK_PROGRESS`, `CAPABILITY_REQUEST`) |
+| supported_message_types | array | Yes | Protocol message types this agent can send and receive (e.g. `TASK_ASSIGN`, `TASK_ACCEPT`, `TASK_PROGRESS`, `CAPABILITY_REQUEST`, `CAPABILITY_UPDATE`) |
 | version | semver | Yes | Schema version of the manifest format |
 | signature | bytes | Yes | Cryptographic signature over the manifest fields, bound to agent_id |
 
@@ -892,9 +898,39 @@ Each entry in `capability_types` is a structured object:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| capability_id | string | Yes | Unique identifier for the capability (reverse-DNS recommended, e.g. `com.example.capabilities/code-execution`) |
-| version | semver | Yes | Version of the capability implementation |
+| capability_id | string | Yes | Structured capability identifier using the format `cap:namespace.capability@version` (e.g. `cap:openclaw.file.read@2`, `cap:example.code.execute@1`). See §5.1.1 for format specification. |
 | constraints | object | No | Self-declared limits (e.g. max input size, supported formats, resource ceilings) |
+
+#### 5.1.1 Capability ID Format
+
+Capability identifiers use a structured format that encodes namespace, capability name, and version in a single string:
+
+```
+cap:<namespace>.<capability>@<version>
+```
+
+**Components:**
+
+| Component | Format | Description |
+|-----------|--------|-------------|
+| `cap:` | literal prefix | Protocol-level prefix identifying this as a capability ID. |
+| `namespace` | dot-separated string | Organizational namespace (e.g. `openclaw`, `example.tools`). Prevents collision across ecosystems. |
+| `capability` | dot-separated string | Capability name within the namespace (e.g. `file.read`, `code.execute`). |
+| `@version` | integer | Capability version number. MUST be a positive integer. |
+
+**Examples:**
+
+- `cap:openclaw.file.read@2` — file read capability, version 2, from the `openclaw` namespace
+- `cap:example.code.execute@1` — code execution capability, version 1
+- `cap:adapter.pathlike_to_string@1` — adapter capability that converts path-like inputs to strings
+
+**Versioning semantics:**
+
+- `@N` MUST be backward-compatible with `@N-1` unless an explicit compatibility break is declared. Backward compatibility means: any input accepted by `@N-1` MUST also be accepted by `@N`, and any output produced by `@N` for inputs valid under `@N-1` MUST conform to `@N-1`'s output schema.
+- An explicit break is declared by publishing both `cap:ns.capability@N` and `cap:ns.capability@N-1` as separate capability entries with no implied compatibility relationship. Agents that require the old behavior MUST request the old version explicitly.
+- The version component replaces the separate `version` field from prior drafts. The version is part of the identifier itself — `cap:openclaw.file.read@1` and `cap:openclaw.file.read@2` are distinct capability IDs.
+
+**Design rationale:** Opaque capability_id strings (e.g., free-form `"code-execution"`) provide no semantic structure for matching, versioning, or collision avoidance. The `cap:namespace.capability@version` format gives stable semantic identifiers: the namespace prevents cross-ecosystem collision (same role as reverse-DNS but more compact), the version is intrinsic to the ID (not a separate field that can desynchronize), and the format is parseable without a registry lookup.
 
 **Resource access bounds:**
 
@@ -911,7 +947,7 @@ Resource access bounds are declarative ceilings, not entitlements. An agent decl
 
 CAPABILITY_MANIFEST is a declaration, not an authorization. Receiving a manifest tells the delegator what the agent claims it can do — not what it is permitted to do. Trust level assignment happens at delegation time via TASK_ASSIGN (§6.6).
 
-#### 5.1.1 Manifest Verification
+#### 5.1.2 Manifest Verification
 
 A CAPABILITY_MANIFEST signature MUST be verifiable against the agent's declared identity. An agent that cannot produce a valid signature for its manifest MUST NOT be assigned tasks.
 
@@ -939,9 +975,9 @@ Task requirements specify what a specific task actually needs — the capabiliti
 
 Three axes govern whether an agent may perform a specific operation for a specific task. All three are independent; collapsing any two creates a privilege escalation surface.
 
-**Capability gates possibility.** Can the agent do X at all? This is answered by the agent's CAPABILITY_MANIFEST (§5.1). An agent that does not declare `code-execution` in its manifest cannot execute code, regardless of trust level or role assignment. Capability is an intrinsic property of the agent, not granted by the protocol.
+**Capability gates possibility.** Can the agent do X at all? This is answered by the agent's CAPABILITY_MANIFEST (§5.1). An agent that does not declare `cap:example.code.execute@1` in its manifest cannot execute code, regardless of trust level or role assignment. Capability is an intrinsic property of the agent, not granted by the protocol.
 
-**Trust gates permission.** Is the agent authorized to do X in this context? This is answered by the `trust_level` in TASK_ASSIGN (§6.6) and the `delegation_token` (§5.5). An agent that declares `code-execution` capability but receives a task with `trust_level=restricted` and no `code-execution` in `allowed_capabilities` MUST NOT execute code for that task — even though it is capable.
+**Trust gates permission.** Is the agent authorized to do X in this context? This is answered by the `trust_level` in TASK_ASSIGN (§6.6) and the `delegation_token` (§5.5). An agent that declares `cap:example.code.execute@1` capability but receives a task with `trust_level=restricted` and no `cap:example.code.execute@1` in `allowed_capabilities` MUST NOT execute code for that task — even though it is capable.
 
 **Role constrains eligible task types.** Given the intersection of declared capability and granted trust, what task types can the agent handle? Role is not a separate field — it is the computed intersection:
 
@@ -951,7 +987,7 @@ eligible_operations = declared_capabilities ∩ allowed_capabilities
 
 An agent's role for a given task is the set of operations it is both capable of performing (manifest) and authorized to perform (delegation token). Operations outside this intersection are prohibited regardless of which axis would permit them individually.
 
-**Example:** Agent B declares capabilities `[code-execution, web-search, filesystem-access]` in its manifest. Delegator A assigns a task with `allowed_capabilities: [web-search]` and `trust_level: standard`. Agent B's role for this task is `{web-search}` — it MUST NOT use `code-execution` or `filesystem-access` even though it is capable of both. If the task requires `filesystem-access`, B MUST reject the task (§5.7) or request the additional capability via CAPABILITY_REQUEST (§5.8).
+**Example:** Agent B declares capabilities `[cap:example.code.execute@1, cap:example.web.search@1, cap:example.fs.access@1]` in its manifest. Delegator A assigns a task with `allowed_capabilities: [cap:example.web.search@1]` and `trust_level: standard`. Agent B's role for this task is `{cap:example.web.search@1}` — it MUST NOT use `cap:example.code.execute@1` or `cap:example.fs.access@1` even though it is capable of both. If the task requires `cap:example.fs.access@1`, B MUST reject the task (§5.7) or request the additional capability via CAPABILITY_REQUEST (§5.8).
 
 ### 5.4 Mismatch Handling
 
@@ -1078,11 +1114,40 @@ The delegator responds with one of:
 4. In delegation chains, CAPABILITY_REQUEST may need to propagate upward. If B needs a capability that A did not authorize, and A does not hold that capability either, A must request it from its own delegator before approving B's request. Each hop in the chain applies its own trust check.
 5. CAPABILITY_REQUEST is a task-side operation. The agent's CAPABILITY_MANIFEST does not change — only the task's effective authorization (via updated delegation token) changes. This maintains the agent-side/task-side separation: the manifest declares what the agent can do; the delegation token authorizes what it may do for this task.
 
+### 5.8.1 Mid-Session Capability Changes (CAPABILITY_UPDATE)
+
+CAPABILITY_REQUEST (§5.8) handles task-side discovery of new capability needs. CAPABILITY_UPDATE handles the complementary case: agent-side capability changes during a session. An agent that loses a capability mid-session (e.g., a plugin is unloaded, a resource becomes unavailable) or gains a new capability (e.g., a new tool is installed) uses CAPABILITY_UPDATE to notify its session counterpart.
+
+**CAPABILITY_UPDATE message:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Active session identifier. |
+| agent_id | string | Yes | Identity of the agent whose capabilities changed. |
+| removed | array | Yes | Capability IDs (§5.1.1 format) that are no longer available. Empty array `[]` if no capabilities were removed. |
+| added | array | No | Capability IDs (§5.1.1 format) that are newly available. Empty array or omitted if no capabilities were added. |
+| reason | string | Yes | Human-readable explanation of why capabilities changed (e.g., `"plugin unloaded"`, `"resource quota exceeded"`, `"tool upgrade"`). |
+| timestamp | ISO 8601 | Yes | When the capability change occurred. |
+| signature | bytes | No | Cryptographic signature over the message fields, bound to agent_id. RECOMMENDED for auditability but not required for V1. |
+
+**Semantics:**
+
+- CAPABILITY_UPDATE is an agent-side notification — it reflects a change in what the agent can do, not a change in what a task needs (which is CAPABILITY_REQUEST's domain).
+- The receiving agent MUST update its local view of the sender's CAPABILITY_MANIFEST to reflect the removed and added capabilities.
+- If a removed capability is in the session's `effective_cap_set` (§5.9) or is referenced by any active delegation token's `allowed_capabilities`, the session enters **degraded mode**: the capability is marked as unavailable and new task assignments MUST NOT reference it.
+- If a removed capability is listed as `requested_mandatory` for the session (§4.3), the session MUST transition to SUSPENDED (§4.2). From SUSPENDED, the coordinator MAY initiate capability renegotiation by sending a new `requested_mandatory` / `requested_optional` set, or terminate the session via SESSION_CLOSE.
+- Added capabilities expand the agent's manifest for the remainder of the session. The counterpart MAY use newly added capabilities in subsequent TASK_ASSIGN messages.
+- CAPABILITY_UPDATE does not retroactively affect in-progress tasks. Tasks already accepted (TASK_ACCEPT sent) continue under their original delegation token — capability removal does not automatically fail active tasks. If the delegatee can no longer complete an active task due to capability loss, it MUST send TASK_FAIL with an appropriate error.
+
+**Degraded mode:**
+
+Degraded mode is not a distinct session state (§4.2) — the session remains ACTIVE. Degraded mode is a local bookkeeping condition: one or more previously available capabilities are no longer available. The session continues for tasks that do not require the removed capabilities. Degraded mode ends when the missing capability is restored via a subsequent CAPABILITY_UPDATE with the capability in the `added` array.
+
 ### 5.9 Timing
 
 Manifest-first at session establishment is the correct default. Deferring capability negotiation to task assignment time (lazy per-task negotiation) compounds round-trip latency in multi-hop delegation chains: each hop must negotiate capabilities before the next hop can begin, serializing what should be parallelizable.
 
-**Session establishment flow:**
+**Session establishment flow (standard):**
 
 ```
 Agent A                     Agent B
@@ -1107,6 +1172,49 @@ Agent A                     Agent B
     |------------------------->|
 ```
 
+**0-RTT session establishment flow:**
+
+When the coordinator already knows (or can predict) the worker's capabilities — e.g. from a prior session or from registry data (§3) — it can include `manifest_digest`, `requested_mandatory`, and `requested_optional` in SESSION_INIT (§4.3). This eliminates the separate CAPABILITY_MANIFEST round-trip for the common happy-path case.
+
+```
+Agent A (coordinator)       Agent B (worker)
+    |                          |
+    |  SESSION_INIT            |
+    |  (manifest_digest,       |
+    |   requested_mandatory,   |
+    |   requested_optional)    |
+    |------------------------->|
+    |                          | 1. Verify manifest_digest matches
+    |                          |    own capability set
+    |                          | 2. Compute effective_cap_set =
+    |                          |    intersection of requested caps
+    |                          |    with own manifest, filtered
+    |                          |    by policy
+    |                          | 3. Check all requested_mandatory
+    |                          |    caps are in effective_cap_set
+    |                          |
+    |  SESSION_INIT_ACK        |
+    |  (effective_cap_set)     |
+    |<-------------------------|
+    |                          |
+    |  (Session is ACTIVE;     |
+    |   no separate manifest   |
+    |   exchange needed)       |
+    |                          |
+    |  TASK_ASSIGN             |
+    |  (with task requirements |
+    |   + delegation token)    |
+    |------------------------->|
+```
+
+**0-RTT semantics:**
+
+- `manifest_digest` is a Merkle root computed over the coordinator's capability set. Each leaf node is `SHA-256(cap_id ‖ impl_hash ‖ policy_hash)`, where `impl_hash` is the hash of the capability implementation metadata and `policy_hash` is the hash of the coordinator's access policy for that capability. The tree is constructed over the sorted list of leaf hashes.
+- `requested_mandatory` lists capability IDs the coordinator requires. If any mandatory capability is absent from the worker's manifest, the worker MUST NOT return `effective_cap_set` and MUST instead respond with a rejection indicating the missing capabilities.
+- `requested_optional` lists capability IDs the coordinator prefers but does not require. Missing optional capabilities are silently omitted from `effective_cap_set`.
+- `effective_cap_set` in SESSION_INIT_ACK is the intersection of all requested capabilities (mandatory + optional) with the worker's actual capabilities, filtered by the worker's policy. This is the agreed capability set for the session.
+- If SESSION_INIT does not include `manifest_digest`, the standard two-step CAPABILITY_MANIFEST exchange is used. The 0-RTT path is an optimization, not a replacement — both paths reach the same end state (a known set of available capabilities).
+
 CAPABILITY_MANIFEST exchange happens once per session. Task assignment carries task-specific requirements (§5.2) and references the already-known capabilities via `delegation_token.allowed_capabilities` — no additional capability negotiation round-trip is needed.
 
 Dynamic capabilities discovered during execution are handled via CAPABILITY_REQUEST (§5.8), not by deferring initial declaration.
@@ -1120,19 +1228,21 @@ Dynamic capabilities discovered during execution are handled via CAPABILITY_REQU
 
 ### 5.11 Open Questions
 
-The following are explicitly identified as unresolved gaps in v0.1:
+The following tracks resolution status for identified gaps. Resolved items document the V1 decision; open items remain unresolved for future versions.
 
-1. **Capability taxonomy.** The protocol uses opaque capability_id strings (§5.1). Should the protocol define a standard capability taxonomy (e.g., `execute/code`, `access/network`, `access/filesystem`) for interoperability, or is this purely deployment-specific? A standard taxonomy enables cross-deployment delegation but risks becoming a lowest-common-denominator that does not capture real capability differences.
+1. **Capability taxonomy.** ~~The protocol uses opaque capability_id strings (§5.1). Should the protocol define a standard capability taxonomy for interoperability, or is this purely deployment-specific?~~ **Resolved (V1).** Capability IDs use the structured `cap:namespace.capability@version` format (§5.1.1). The namespace component provides collision avoidance across ecosystems; the version component encodes backward-compatibility semantics intrinsic to the ID. V1 requires **exact `cap_id` match only** — no type equivalence, structural subtyping, or semantic matching. Agents that need to bridge between capability representations publish adapter capabilities as separate entries (e.g. `cap:adapter.pathlike_to_string@1`). A canonical type registry and type equivalence inference are explicitly deferred beyond V1; requiring exact match eliminates the need to invent a type system at the protocol layer.
 
-2. **Manifest freshness.** CAPABILITY_MANIFEST is exchanged at session establishment. If an agent's capabilities change during a long-running session (e.g., a plugin is loaded or unloaded), the manifest becomes stale. Should CAPABILITY_MANIFEST be re-sendable mid-session, or is CAPABILITY_REQUEST (§5.8) sufficient for this case? CAPABILITY_REQUEST handles task-side discovery of new needs but does not handle agent-side capability loss — an agent that loses a capability mid-session has no protocol mechanism to retract it from the manifest.
+2. **Manifest freshness.** ~~CAPABILITY_MANIFEST is exchanged at session establishment. If an agent's capabilities change during a long-running session, the manifest becomes stale. Should CAPABILITY_MANIFEST be re-sendable mid-session?~~ **Resolved (V1).** CAPABILITY_UPDATE (§5.8.1) is the protocol mechanism for mid-session capability changes. It handles both capability loss (removed capabilities) and capability gain (added capabilities). Degraded mode semantics are defined for non-mandatory capability loss; mandatory capability loss triggers SESSION_SUSPEND. CAPABILITY_REQUEST (§5.8) remains the mechanism for task-side discovery of new needs; CAPABILITY_UPDATE is the complementary mechanism for agent-side capability changes.
 
 3. **Delegation token revocation propagation.** When a session expires and delegation tokens are revoked (§5.10), how is revocation propagated to delegatees in a multi-hop chain? The delegatee at depth 2 may not have a direct communication channel to the root delegator. Revocation must propagate through intermediaries, introducing latency and potential failure points.
 
-4. **Trust level granularity in allowed_capabilities.** The current design grants a single `trust_level` per delegation (§6.8). Should `allowed_capabilities` support per-capability trust levels? E.g., an agent might be trusted for `access/network` at `standard` but only `access/filesystem` at `restricted`. Per-capability trust increases expressiveness but also complexity and the surface for misconfiguration.
+4. **Trust level granularity in allowed_capabilities.** The current design grants a single `trust_level` per delegation (§6.8). Should `allowed_capabilities` support per-capability trust levels? E.g., an agent might be trusted for `cap:example.net.access@1` at `standard` but only `cap:example.fs.access@1` at `restricted`. Per-capability trust increases expressiveness but also complexity and the surface for misconfiguration.
 
-5. **Task requirement completeness.** Task requirements (§5.2) may be incomplete at delegation time for exploratory tasks. CAPABILITY_REQUEST (§5.8) handles discovery of new needs, but the protocol does not define how to estimate requirement completeness upfront. Should the task schema include a `requirement_completeness` signal (e.g., `complete`, `partial`, `unknown`) to set delegatee expectations about the likelihood of mid-task CAPABILITY_REQUEST messages?
+5. **Task requirement completeness.** ~~Should the task schema include a `requirement_completeness` signal to set delegatee expectations about the likelihood of mid-task CAPABILITY_REQUEST messages?~~ **Resolved (V1).** The 0-RTT capability intersection at SESSION_INIT (§5.9) combined with `requested_mandatory` / `requested_optional` arrays provides upfront requirement signaling. The coordinator declares which capabilities are mandatory vs. optional at session establishment, giving the worker a clear signal about the expected capability surface. For mid-session changes, CAPABILITY_UPDATE (§5.8.1) and CAPABILITY_REQUEST (§5.8) provide complementary mechanisms. A separate `requirement_completeness` field is unnecessary — the mandatory/optional distinction at SESSION_INIT and the existence of CAPABILITY_REQUEST as a defined protocol message already set the expectation that mid-task capability discovery may occur.
 
-> Community discussion: See [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15), [issue #23](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/23). Architecture surfaced in discussion with @cass_agentsharp. Content derived from community synthesis — cass_agentsharp (capability/trust distinction, privilege escalation risk, manifest-first timing, capability-vs-task-requirement separation), vincent-vega (delegation token field specification, capability attestation before TASK_ACCEPT), PincersAndPurpose (dynamic capability emergence, CAPABILITY_REQUEST pattern). Implements #23.
+6. **§8 attestation relationship.** How should CAPABILITY_MANIFEST declarations and CAPABILITY_UPDATE messages interact with the external audit trail (§8)? Capability claims are self-reported (§5.1.2); §8 error handling and audit mechanisms could provide independent attestation of whether an agent actually exercised a declared capability correctly. The relationship between self-reported capability (§5) and observed capability (§8) is not yet defined.
+
+> Community discussion: See [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15), [issue #23](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/23), [issue #33](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/33). Architecture surfaced in discussion with @cass_agentsharp. Content derived from community synthesis — cass_agentsharp (capability/trust distinction, privilege escalation risk, manifest-first timing, capability-vs-task-requirement separation), vincent-vega (delegation token field specification, capability attestation before TASK_ACCEPT), PincersAndPurpose (dynamic capability emergence, CAPABILITY_REQUEST pattern), Axiom_0i (structured cap ID format, 0-RTT capability intersection, exact cap_id match for V1, CAPABILITY_UPDATE message). Implements #23, #33.
 
 ## 6. Task Delegation
 
@@ -1916,7 +2026,7 @@ The following are explicitly identified as unresolved gaps in v0.1:
 
 3. **Version sunset policy.** The deprecation lifecycle (§10.6) defines minimum support windows but not maximum. How long must implementations continue to support old MAJOR versions? A protocol with versions 1.x, 2.x, and 3.x in simultaneous production use has a combinatorial interoperability surface. Whether the protocol should recommend a maximum number of simultaneously supported MAJOR versions is undecided.
 
-4. **Capability version constraints.** Capability declarations (§5.1) do not currently carry protocol version constraints — a capability declared under protocol v1 is assumed to remain valid under protocol v2. If protocol changes alter the semantics of capability types (e.g., by redefining what `access/network` means), existing capability declarations become ambiguous. Whether capabilities should be explicitly bound to a protocol version range is deferred to a future version.
+4. **Capability version constraints.** Capability declarations (§5.1) do not currently carry protocol version constraints — a capability declared under protocol v1 is assumed to remain valid under protocol v2. If protocol changes alter the semantics of capability types (e.g., by redefining what `cap:example.net.access@1` means), existing capability declarations become ambiguous. Whether capabilities should be explicitly bound to a protocol version range is deferred to a future version.
 
 > Community discussion: See [issue #20](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/20). Architecture surfaced in discussion with @cass_agentsharp. Implements #20.
 
