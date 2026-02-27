@@ -1341,7 +1341,7 @@ Dynamic capabilities discovered during execution are handled via CAPABILITY_REQU
 ### 5.10 Relationship to Other Sections
 
 - **§4 (Session Lifecycle).** Trust anchor requirements from §4.7.2 apply to delegation tokens. The `signature` field in the delegation token, and the chain of signatures across delegation hops, are verification artifacts. External verifiers (§4.7.2) MAY validate delegation token chains as part of runtime liveness verification — a token with an expired TTL or broken signature chain is evidence of anomalous state.
-- **§6 (Task Delegation).** TASK_ASSIGN (§6.6) carries the `delegation_token` defined in §5.5 and the task requirements defined in §5.2. The trust semantics in §6.8 and delegation chains in §6.9 operate on the authorization context established by role negotiation. §5 defines the authorization structure (capability manifest + task requirements + privilege model); §6 defines the delegation lifecycle that uses it.
+- **§6 (Task Delegation).** TASK_ASSIGN (§6.6) carries the `delegation_token` defined in §5.5 and the task requirements defined in §5.2. The trust semantics in §6.8 and delegation chains in §6.9 operate on the authorization context established by role negotiation. §5 defines the authorization structure (capability manifest + task requirements + privilege model); §6 defines the delegation lifecycle that uses it. Version negotiation scoping (§5.11, item 7) is per-hop — each session negotiates independently. The `protocol_version_chain` in TASK_ASSIGN and `version_chain_summary` in TASK_COMPLETE/TASK_PROGRESS/TASK_FAIL (§6.9.1) provide the compensating visibility mechanism.
 - **§4 (Session Lifecycle) / §8 (Error Handling).** Session expiry auto-revokes all active delegation tokens for that session. When a session ends (§4.8 SESSION_RESUME mismatch leading to RESTART, or normal termination via §4.9 SESSION_CLOSE), all delegation tokens issued within that session become invalid. Capability manifests remain valid — they are agent-side declarations independent of any session. A delegatee that continues operating on an expired session's token is in violation — the external verifier (§4.7.2) SHOULD detect this via TTL expiry.
 - **§9 (Security Considerations).** Capability/trust collapse is the primary privilege escalation vector in multi-agent delegation chains. The privilege model (§5.3) prevents this collapse by maintaining the three-axis separation. §9.2's trust topologies determine how trust levels are assigned; §5 ensures that those trust levels are carried explicitly in delegation tokens rather than inferred from capability declarations. The translation boundary risk (§9.3) applies to CAPABILITY_MANIFEST exchange across trust domains — a manifest attested in one domain does not carry attestation into another.
 - **§8 (Error Handling — Verifiable Intent).** §5 is the **declaration layer**: it specifies *what* capabilities an agent claims and *what* capabilities a session or task requires. §8 is the **trust layer**: it specifies *how* to verify that declarations are honest and that agents actually exercise declared capabilities correctly. In basic deployments, §5 alone is sufficient — capability declarations are self-reported (§5.1.2), cryptographically bound to agent identity, and matched against task requirements at delegation time. In high-trust deployments where spoofed capability declarations are a threat model concern, §8 attestation provides independent verification: CAPABILITY_MANIFEST declarations and CAPABILITY_UPDATE messages carry attestation signatures per §8 rules, and the external audit trail (§8.5, §8.8) provides post-hoc evidence of whether an agent actually exercised a declared capability correctly. The relationship is additive: §5 specifies what to declare; §8 specifies how to prove it. §8 attestation is not required for §5 to function, but §5 declarations without §8 attestation carry only the trust level of self-report.
@@ -1362,7 +1362,9 @@ The following tracks resolution status for identified gaps. Resolved items docum
 
 6. **§8 attestation relationship.** ~~How should CAPABILITY_MANIFEST declarations and CAPABILITY_UPDATE messages interact with the external audit trail (§8)? Capability claims are self-reported (§5.1.2); §8 error handling and audit mechanisms could provide independent attestation of whether an agent actually exercised a declared capability correctly. The relationship between self-reported capability (§5) and observed capability (§8) is not yet defined.~~ **Resolved (V1).** §5 is the declaration layer (what to declare); §8 is the trust layer (how to prove it). The relationship is defined in §5.10: §5 alone is sufficient for basic operation — capability declarations are self-reported and cryptographically bound to agent identity. §8 attestation is required for high-trust deployments where spoofed capability declarations are a threat model concern. In §8-integrated deployments, CAPABILITY_MANIFEST declarations and CAPABILITY_UPDATE messages carry attestation signatures per §8 rules, and the external audit trail provides post-hoc verification of whether declared capabilities were exercised correctly. §8 attestation is additive — it does not change §5 semantics, only the trust level of §5 declarations.
 
-> Community discussion: See [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15), [issue #23](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/23), [issue #33](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/33). Architecture surfaced in discussion with @cass_agentsharp. Content derived from community synthesis — cass_agentsharp (capability/trust distinction, privilege escalation risk, manifest-first timing, capability-vs-task-requirement separation), vincent-vega (delegation token field specification, capability attestation before TASK_ACCEPT), PincersAndPurpose (dynamic capability emergence, CAPABILITY_REQUEST pattern), Axiom_0i (structured cap ID format, 0-RTT capability intersection, exact cap_id match for V1, CAPABILITY_UPDATE message). Implements #23, #33.
+7. **Version negotiation scoping.** ~~Should version negotiation in multi-hop delegation chains be scoped per-hop (each pair of agents negotiates independently) or end-to-end (the originating agent constrains the minimum version for the entire chain)?~~ **Resolved (V1).** V1 uses **per-hop independent negotiation** — each pair of agents in a delegation chain negotiates protocol and schema versions independently at their SESSION_INIT exchange (§10.2). This is the natural consequence of the protocol's bilateral session model: each session is independent, and version declaration is part of session establishment, not task delegation. The compensating mechanism that makes per-hop negotiation safe is **full-chain version visibility** via `protocol_version_chain` in TASK_ASSIGN (§6.6) and `version_chain_summary` in TASK_COMPLETE/TASK_PROGRESS/TASK_FAIL (§6.6). The originating agent receives the complete version landscape of the delegation chain and can make informed decisions about result quality, including rejecting results from chains where version degradation exceeds its tolerance (§6.9.1). End-to-end version constraints are not needed in V1 because: (a) all hops within a chain share the same MAJOR version (§10.4 PROTOCOL_MISMATCH rejects different MAJOR), so degradation is limited to MINOR differences which are backward compatible by definition (§10.3); (b) the originating agent can enforce its own minimum version policy locally using `version_chain_summary` without requiring protocol-level propagation of version constraints. Cross-version semantic responsibility is defined in §10.7.1.
+
+> Community discussion: See [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15), [issue #23](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/23), [issue #33](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/33), [issue #37](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/37). Architecture surfaced in discussion with @cass_agentsharp. Content derived from community synthesis — cass_agentsharp (capability/trust distinction, privilege escalation risk, manifest-first timing, capability-vs-task-requirement separation), vincent-vega (delegation token field specification, capability attestation before TASK_ACCEPT), PincersAndPurpose (dynamic capability emergence, CAPABILITY_REQUEST pattern), Axiom_0i (structured cap ID format, 0-RTT capability intersection, exact cap_id match for V1, CAPABILITY_UPDATE message, version negotiation scoping resolution). Implements #23, #33, #37.
 
 ## 6. Task Delegation
 
@@ -1491,6 +1493,7 @@ Sent by the delegating agent to initiate delegation.
 | spec | object | Yes | Task specification (see below) |
 | trust_level | enum | Yes | Trust level granted to the delegatee for this task (see §6.8) |
 | delegation_depth | integer | Yes | Current depth in the delegation chain; 0 for direct delegation (see §6.9) |
+| protocol_version_chain | array | No | Append-only list of version chain entries recording the protocol version negotiated at each hop in the delegation chain (see §6.9.1). Empty or absent for direct delegations at depth 0. |
 
 The `spec` object contains:
 
@@ -1537,6 +1540,7 @@ Optionally sent by the delegatee during execution. Serves as both a progress upd
 | session_id | string | Yes | Echoed from TASK_ASSIGN |
 | progress | object | No | Structured progress data (percentage, subtask status, etc.) |
 | timestamp | ISO 8601 | Yes | When this progress report was generated |
+| version_chain_summary | object | No | Summary of the protocol version chain across downstream hops known at the time of this progress report (see §6.9.1). Present when the delegatee has sub-delegated and has received version chain information from downstream. |
 
 TASK_PROGRESS is optional — the protocol does not require progress reporting for task completion. However, implementations that set `timeout_seconds` (§6.1) SHOULD use TASK_PROGRESS as a liveness signal to distinguish a working agent from a zombied one (§8.1). The absence of TASK_PROGRESS within the expected heartbeat interval is an input to the external verifier (§4.7.2), not a definitive failure signal.
 
@@ -1551,6 +1555,7 @@ Sent by the delegatee when the task finishes successfully.
 | result | object or string | Yes | Structured result conforming to `expected_output_format`, or a resource reference (URI) to the result |
 | trace_hash | SHA-256 | Yes | Post-execution hash of the actual execution trace (§6.2) |
 | completed_at | ISO 8601 | Yes | Timestamp of completion |
+| version_chain_summary | object | No | Summary of the protocol version chain across all hops that contributed to this result (see §6.9.1). Present when the task involved sub-delegation. |
 
 The delegating agent SHOULD verify that `result` conforms to `expected_output_format` from the original TASK_ASSIGN. Non-conforming results are not a protocol error — the delegating agent decides whether to accept, reject, or request rework.
 
@@ -1566,6 +1571,7 @@ Sent by the delegatee when the task cannot be completed.
 | partial_results | object or null | No | Whatever partial output is available; null if nothing was produced |
 | trace_hash | SHA-256 | No | Post-execution hash if any execution occurred before failure |
 | failed_at | ISO 8601 | Yes | Timestamp of failure |
+| version_chain_summary | object | No | Summary of the protocol version chain across downstream hops (see §6.9.1). Present when the task involved sub-delegation, even on failure — enables the originating agent to assess whether version degradation contributed to the failure. |
 
 TASK_FAIL with `partial_results` is preferred over TASK_FAIL without — even incomplete output may be useful for recovery or reassignment. The delegating agent owns the recovery decision (see §6.10).
 
@@ -1684,6 +1690,7 @@ When re-delegating, the delegatee:
 2. Sets `trust_level` to at most its own effective trust level for the parent task (§6.8 — no escalation)
 3. Sets `issuer_id` to its own identity (proximate delegator), but MUST include `parent_task_id` (§6.1) referencing the upstream task for auditability
 4. Computes a new `task_hash` for the subtask schema
+5. Appends its own version chain entry to `protocol_version_chain` — recording the protocol and schema versions negotiated for the session between itself and the next delegatee (§6.9.1)
 
 **Cancellation propagation.** Cancellation propagates down the chain via TASK_CANCEL (§6.6). If A cancels the task assigned to B (by sending TASK_CANCEL), B MUST send TASK_CANCEL with `reason: "cancelled_upstream"` to any subtasks it delegated to C, and C MUST do the same for D. Each agent in the chain sends TASK_CANCEL to its delegatees and responds to its delegator with TASK_FAIL (error code `cancelled`, with any `partial_results`).
 
@@ -1694,6 +1701,88 @@ Cancellation is best-effort — a delegatee that has already sent TASK_COMPLETE 
 **Partial result recovery after expiry.** If a session enters EXPIRED but the counterparty later becomes reachable, partial results from cancelled tasks can be recovered via SESSION_RESUME (§4.8). The resuming agent presents its state hash; if state is reconcilable, the session transitions back to ACTIVE and cancelled tasks with `partial_results` can be re-evaluated. This reuses the existing crash-recovery mechanism — no parallel recovery path is introduced.
 
 **Chain visibility.** The delegator at depth N has visibility only into depth N+1. A does not directly observe C or D. Intermediate agents (B, C) are responsible for aggregating results and propagating failures up the chain.
+
+### 6.9.1 Version Chain Visibility
+
+In a delegation chain, each hop establishes its own session with independent version negotiation (§10.2). The `protocol_version_chain` field in TASK_ASSIGN provides the originating agent with full visibility into the protocol versions negotiated at every hop in the chain — without requiring in-memory tracking or direct observation of intermediate sessions.
+
+**Version chain entry format:**
+
+Each entry in `protocol_version_chain` is a structured object:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| hop_agent_id | string | Yes | Stable identity artifact (§2.4) of the agent at this hop |
+| negotiated_protocol_version | semver | Yes | Protocol version negotiated for the session at this hop (from SESSION_INIT exchange, §10.2) |
+| negotiated_schema_version | semver | Yes | Schema version negotiated for the session at this hop |
+| hop_index | integer | Yes | Zero-based position in the chain (0 = originating agent's session with the first delegatee) |
+
+**Chain construction:**
+
+When an agent re-delegates a task (§6.9), it MUST append its own version chain entry to `protocol_version_chain` before forwarding the TASK_ASSIGN to the next delegatee. The entry records the protocol and schema versions negotiated for the session between this agent and the next delegatee.
+
+```
+A assigns to B (protocol_version_chain: [])
+  B assigns to C (protocol_version_chain: [
+    {hop_agent_id: "B", negotiated_protocol_version: "1.2.0",
+     negotiated_schema_version: "1.3.0", hop_index: 0}
+  ])
+    C assigns to D (protocol_version_chain: [
+      {hop_agent_id: "B", negotiated_protocol_version: "1.2.0",
+       negotiated_schema_version: "1.3.0", hop_index: 0},
+      {hop_agent_id: "C", negotiated_protocol_version: "1.1.0",
+       negotiated_schema_version: "1.2.0", hop_index: 1}
+    ])
+```
+
+The chain is append-only. Intermediate agents MUST NOT modify entries appended by upstream agents. An agent that receives a `protocol_version_chain` with entries it did not write MUST forward them unmodified. Tampering with upstream entries is detectable via signature verification if the originating agent signs the chain at delegation time.
+
+**Version degradation detection:**
+
+Version degradation occurs when any hop in the chain negotiated a protocol or schema version lower than the originating agent's version. The originating agent detects degradation by inspecting the `protocol_version_chain` (carried forward in TASK_ASSIGN) or the `version_chain_summary` (returned in TASK_COMPLETE, TASK_PROGRESS, or TASK_FAIL).
+
+An originating agent MAY define a `minimum_acceptable_version` policy — a floor below which version negotiation at any hop renders the result unacceptable. When the `version_chain_summary` in a TASK_COMPLETE response reveals that any hop negotiated below this floor:
+
+- The originating agent MAY reject the result (discard and reassign the task to a chain with acceptable versions).
+- The originating agent MAY accept the result but flag it as **degraded** — marking the result with a degradation annotation for downstream consumers or audit.
+- The originating agent MAY log the degradation for observability without affecting result acceptance.
+
+The `minimum_acceptable_version` policy is local to the originating agent — it is not transmitted in the protocol. Different originating agents may have different tolerance for version degradation.
+
+**`version_chain_summary` format:**
+
+The `version_chain_summary` field in TASK_COMPLETE, TASK_PROGRESS, and TASK_FAIL provides the full chain visibility to the delegating agent without requiring it to track intermediate TASK_ASSIGN messages.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| chain | array | Yes | Complete `protocol_version_chain` as constructed through all delegation hops |
+| min_protocol_version | semver | Yes | Lowest `negotiated_protocol_version` across all hops in the chain |
+| min_schema_version | semver | Yes | Lowest `negotiated_schema_version` across all hops in the chain |
+| degraded | boolean | Yes | `true` if any hop negotiated a version lower than the originating hop's version; `false` otherwise |
+| degradation_hops | array | No | Hop indices where degradation was detected. Present only when `degraded` is `true`. |
+
+**Example `version_chain_summary`:**
+
+```yaml
+version_chain_summary:
+  chain:
+    - hop_agent_id: "agent-B"
+      negotiated_protocol_version: "1.2.0"
+      negotiated_schema_version: "1.3.0"
+      hop_index: 0
+    - hop_agent_id: "agent-C"
+      negotiated_protocol_version: "1.1.0"
+      negotiated_schema_version: "1.1.0"
+      hop_index: 1
+  min_protocol_version: "1.1.0"
+  min_schema_version: "1.1.0"
+  degraded: true
+  degradation_hops: [1]
+```
+
+**Propagation of `version_chain_summary`:**
+
+Each agent in the delegation chain constructs a `version_chain_summary` from the `protocol_version_chain` it received plus any summaries returned by its own delegatees. When an intermediate agent (e.g., B) receives a TASK_COMPLETE from its delegatee (e.g., C) containing a `version_chain_summary`, B merges C's chain information with its own hop entry and forwards the combined summary upstream in its own TASK_COMPLETE to A. This ensures the originating agent receives the full chain without direct visibility into intermediate sessions.
 
 ### 6.10 Failure Handling
 
@@ -2155,11 +2244,44 @@ A schema attested at one version does not carry attestation to a different versi
 
 This addresses §9.7 open question #2 (schema versioning and revocation): attestation validity is scoped to the schema MAJOR version. A schema MAJOR bump implicitly revokes all attestations for the prior version without requiring explicit revocation propagation — agents on the new version simply reject manifests attested under the old version.
 
+### 10.7.1 Cross-Version Delegation Chain Guidance
+
+When a delegation chain (§6.9) spans agents on different protocol or schema MINOR versions (same MAJOR), version degradation may occur at one or more hops. The `protocol_version_chain` field in TASK_ASSIGN (§6.6) and `version_chain_summary` in TASK_COMPLETE/TASK_PROGRESS/TASK_FAIL (§6.6) provide visibility into where degradation occurs. This subsection defines the semantic consequences.
+
+**Translation contract propagation:**
+
+When the `protocol_version_chain` (§6.9.1) shows a version downgrade at hop N — meaning the session between agent N and agent N+1 negotiated a lower protocol or schema MINOR version than the session between agent N-1 and agent N — the translation contract established at hop N applies to all subsequent hops. Specifically:
+
+- The agent at hop N is the **translation boundary**. It accepted a session at a higher version from upstream and established a session at a lower version downstream. It is semantically responsible for ensuring that messages and task schemas crossing this boundary are valid under both versions.
+- All agents downstream of hop N (at hops N+1, N+2, ...) operate under the lower version's semantics. They have no obligation to understand fields or message types introduced in the higher version — those are the responsibility of the translation boundary agent.
+- If the translation boundary agent forwards unknown fields (as required by §10.5 forward compatibility obligations), those fields are syntactically preserved but carry no semantic guarantee from the downstream agents. The originating agent MUST NOT assume that downstream agents interpreted or acted upon higher-version fields.
+
+**Semantic responsibility propagation:**
+
+The key principle: **semantic responsibility propagates with the chain, not just the message.** A downgrade at hop 1 in a 3-hop chain means:
+
+- Hop 1 agent translated from version 1.3 semantics to version 1.1 semantics.
+- Hop 2 agent operates entirely under version 1.1 semantics — it did not participate in the translation and has no awareness of version 1.3 features.
+- Hop 3 agent also operates under version 1.1 semantics (or whatever version it negotiated with hop 2, which cannot exceed what hop 2 understands).
+- The result returning up the chain carries version 1.1 semantics at its core. The hop 1 agent MAY re-translate into version 1.3 form when forwarding upstream, but any semantic content that exists only in version 1.3 (fields added between 1.1 and 1.3) was never populated by the executing agents.
+
+**Implications for the originating agent:**
+
+When `version_chain_summary.degraded` is `true` in a TASK_COMPLETE response:
+
+1. **Result interpretation.** The result was produced under the lowest version in the chain (`min_protocol_version`, `min_schema_version`). Optional fields added in higher MINOR versions may be absent — not because the executing agent chose to omit them, but because the executing agent's protocol version predates their existence.
+2. **Trace hash comparison.** The `trace_hash` (§6.2) was computed by agents operating under potentially different schema versions. Hash comparison across schema versions is meaningful only for fields that exist in both versions (see §10.5 forward compatibility obligations regarding hash computation).
+3. **Audit trail.** The `version_chain_summary` SHOULD be included in the external audit trail (§8) alongside the task result. It provides the context necessary to interpret why certain expected fields may be missing or why semantic behavior may differ from expectations.
+
+**Relationship to §10.4 mismatch handling:**
+
+Cross-version delegation chains operate strictly within the same MAJOR version — different MAJOR versions cannot establish a session (§10.4 PROTOCOL_MISMATCH). Version degradation within a delegation chain is always a MINOR version difference, which is backward compatible by definition (§10.3). The `protocol_version_chain` makes the MINOR version landscape across the chain explicit, enabling the originating agent to make informed decisions about result quality without requiring the protocol to prohibit MINOR version differences.
+
 ### 10.8 Relationship to Other Sections
 
 - **§4 (Session Lifecycle).** SESSION_INIT (§4.3) is the delivery mechanism for version declaration — `protocol_version` and `schema_version` are mandatory fields. Version incompatibility detected at SESSION_INIT triggers the NEGOTIATING → CLOSED transition (§4.2). The version fields in §10.2 are carried by the SESSION_INIT message defined in §4.3.
 - **§5 (Role Negotiation).** CAPABILITY_MANIFEST carries a `version` field (§5.1) that represents the schema version of the manifest format. §10 defines the operational semantics: minor bumps add optional fields; major bumps may change required fields. Capability declarations in v0.1 do not carry protocol version constraints — an agent's capabilities are independent of the protocol version it implements. This may change in future versions if capabilities become version-specific.
-- **§6 (Task Delegation).** The `version` field in the canonical task schema (§6.1) is a schema version for forward compatibility. §10.3 defines what "forward compatible" means: minor bumps are backward compatible; major bumps may break. The `namespace + alias + version` triple that uniquely identifies a task type (§6.3) uses the schema version axis — protocol version is not part of task type identity.
+- **§6 (Task Delegation).** The `version` field in the canonical task schema (§6.1) is a schema version for forward compatibility. §10.3 defines what "forward compatible" means: minor bumps are backward compatible; major bumps may break. The `namespace + alias + version` triple that uniquely identifies a task type (§6.3) uses the schema version axis — protocol version is not part of task type identity. The `protocol_version_chain` field in TASK_ASSIGN (§6.6) and `version_chain_summary` in TASK_COMPLETE/TASK_PROGRESS/TASK_FAIL carry per-hop version information through delegation chains (§6.9.1). §10.7.1 defines the semantic consequences of version degradation across hops — translation contract propagation and result interpretation guidance.
 - **§8 (Error Handling).** PROTOCOL_MISMATCH and SCHEMA_MISMATCH (§10.4) are session-level errors that terminate the session before any task delegation occurs. They are distinct from task-level errors (TASK_FAIL) and session recovery (SESSION_RESUME, §4.8). A version mismatch is not a recoverable error — SESSION_RESUME cannot resolve a fundamental protocol incompatibility.
 - **§9 (Security Considerations).** Schema attestation (§9.1) is version-scoped — see §10.7. The re-attestation requirement on schema MAJOR bumps addresses §9.7 open question #2. Translation boundary risk (§9.3) is compounded by version mismatches: a boundary agent translating between trust domains that use different schema versions must handle both translation and version adaptation, doubling the semantic drift surface.
 
@@ -2169,13 +2291,13 @@ The following are explicitly identified as unresolved gaps in v0.1:
 
 1. **Version advertisement beyond SESSION_INIT.** The current design assumes bilateral sessions. In multi-agent topologies (e.g., broadcast task assignment), version advertisement may need a discovery mechanism beyond point-to-point SESSION_INIT. Whether this requires a VERSION_ADVERTISE message or can be handled by existing discovery mechanisms (§3, when defined) is undecided.
 
-2. **Cross-version delegation chains.** In a delegation chain (§6.9) where agent A uses schema v1.3 and delegates to agent B which delegates to agent C using schema v1.1, field forwarding (§10.5) preserves unknown fields through B. But if C delegates back to an agent on v1.3, the round-tripped fields may have been modified by B in ways that are valid under v1.1 but semantically incorrect under v1.3. Whether the protocol should define round-trip integrity guarantees for forwarded fields is unresolved.
+2. **Cross-version delegation chains.** ~~In a delegation chain (§6.9) where agent A uses schema v1.3 and delegates to agent B which delegates to agent C using schema v1.1, field forwarding (§10.5) preserves unknown fields through B. But if C delegates back to an agent on v1.3, the round-tripped fields may have been modified by B in ways that are valid under v1.1 but semantically incorrect under v1.3. Whether the protocol should define round-trip integrity guarantees for forwarded fields is unresolved.~~ **Partially resolved (V1).** The `protocol_version_chain` field in TASK_ASSIGN (§6.6) and `version_chain_summary` in TASK_COMPLETE/TASK_PROGRESS/TASK_FAIL (§6.9.1) now provide full visibility into which versions were negotiated at each hop. The originating agent can detect version degradation and make informed decisions about result trust. §10.7.1 defines the translation contract propagation semantics — the agent at the downgrade boundary bears semantic responsibility for translation, and downstream agents operate under the lower version's semantics. The round-trip integrity question for forwarded fields remains open: fields forwarded through a lower-version agent per §10.5 are syntactically preserved but carry no semantic guarantee from the lower-version agent.
 
 3. **Version sunset policy.** The deprecation lifecycle (§10.6) defines minimum support windows but not maximum. How long must implementations continue to support old MAJOR versions? A protocol with versions 1.x, 2.x, and 3.x in simultaneous production use has a combinatorial interoperability surface. Whether the protocol should recommend a maximum number of simultaneously supported MAJOR versions is undecided.
 
 4. **Capability version constraints.** Capability declarations (§5.1) do not currently carry protocol version constraints — a capability declared under protocol v1 is assumed to remain valid under protocol v2. If protocol changes alter the semantics of capability types (e.g., by redefining what `cap:example.net.access@1` means), existing capability declarations become ambiguous. Whether capabilities should be explicitly bound to a protocol version range is deferred to a future version.
 
-> Community discussion: See [issue #20](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/20). Architecture surfaced in discussion with @cass_agentsharp. Implements #20.
+> Community discussion: See [issue #20](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/20), [issue #37](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/37). Architecture surfaced in discussion with @cass_agentsharp. Cross-version delegation chain guidance (§10.7.1) implements #37. Implements #20, #37.
 
 ---
 
