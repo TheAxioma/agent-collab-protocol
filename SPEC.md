@@ -577,7 +577,9 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | protocol_version | semver | Yes | Protocol version the coordinator implements (§10). |
 | schema_version | semver | Yes | Schema version the coordinator supports (§10.1). |
 | keepalive | object | No | Keepalive configuration proposal (see §4.5). If omitted, no protocol-level keepalive is active for this session. |
-| heartbeat_interval_ms | integer | No | Proposed interval in milliseconds between HEARTBEAT messages (§4.5.3). Per-session, not per-agent — different collaborations have different latency profiles (e.g., 5000ms for real-time coordination, 300000ms for research tasks). If omitted, falls back to `keepalive.heartbeat_interval_seconds * 1000` if present, otherwise no protocol-level heartbeat. |
+| heartbeat_interval_ms | integer | No | Proposed interval in milliseconds between HEARTBEAT_PING messages — Tier 1 transport liveness (§8.9). Per-session, not per-agent — different collaborations have different latency profiles (e.g., 5000ms for real-time coordination, 300000ms for research tasks). If omitted, falls back to `keepalive.heartbeat_interval_seconds * 1000` if present, otherwise no protocol-level heartbeat. Default: 30000. |
+| semantic_check_interval_ms | integer | No | Proposed interval in milliseconds between SEMANTIC_CHALLENGE messages — Tier 2 semantic liveness (§8.9). MUST be greater than `heartbeat_interval_ms`. Tier 2 checks are expensive (require state hash computation against a challenge) and run much less frequently than Tier 1 pings. Default: 300000 (5 minutes). If omitted, no protocol-level semantic liveness checking is active. |
+| heartbeat_timeout_count | integer | No | Number of consecutive missed Tier 1 HEARTBEAT_PONG responses before declaring transport failure. Default: 3. Transport failure triggers the SESSION_RESUME path (§8.2). MUST be ≥ 1. |
 | session_expiry_ms | integer | No | Proposed session expiry timeout in milliseconds. If no HEARTBEAT is received within this window, the local agent transitions to EXPIRED (§4.2). MUST be greater than `heartbeat_interval_ms` — a value ≤ `heartbeat_interval_ms` guarantees immediate expiry. Typical values: 2–5× `heartbeat_interval_ms`. If omitted, session expiry depends on deployment-specific timeout or `session_ttl`. |
 | session_ttl | ISO 8601 duration | No | Proposed session time-to-live. After expiry, the session transitions to CLOSED unless renewed. If omitted, session has no protocol-level TTL (deployment-specific timeout applies). `session_ttl` bounds the session's total duration; `session_expiry_ms` bounds the liveness gap — they are orthogonal. |
 | lease_epoch | integer | No | Monotonically increasing epoch counter for lease-based session management (see §4.5.2). Initial value MUST be 0. |
@@ -598,6 +600,8 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | schema_version | semver | Yes | Schema version the worker supports. |
 | keepalive | object | No | Keepalive configuration acceptance or counter-proposal. |
 | heartbeat_interval_ms | integer | No | Accepted or counter-proposed heartbeat interval. If the worker counter-proposes, the effective interval is the **maximum** of both proposals (slower rate wins — neither side should be forced to heartbeat faster than it can sustain). |
+| semantic_check_interval_ms | integer | No | Accepted or counter-proposed semantic check interval. If the worker counter-proposes, the effective interval is the **maximum** of both proposals (less frequent wins). |
+| heartbeat_timeout_count | integer | No | Accepted or counter-proposed timeout count. If the worker counter-proposes, the effective value is the **maximum** of both proposals (more permissive threshold wins). |
 | session_expiry_ms | integer | No | Accepted or counter-proposed session expiry timeout. If the worker counter-proposes, the effective value is the **maximum** of both proposals (more permissive timeout wins). |
 | session_ttl | ISO 8601 duration | No | Accepted or counter-proposed session TTL. |
 | lease_epoch | integer | No | Echoed from SESSION_INIT (confirms epoch synchronization). |
@@ -625,6 +629,8 @@ keepalive:
   heartbeat_interval_seconds: 60
   missed_heartbeats_before_suspect: 2
 heartbeat_interval_ms: 5000
+semantic_check_interval_ms: 300000
+heartbeat_timeout_count: 3
 session_expiry_ms: 15000
 session_ttl: "PT4H"
 lease_epoch: 0
@@ -2179,6 +2185,7 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - Named considerations (§8.5) extend the cooperative failure model with production-derived constraints.
 - Verifier isolation requirements (§8.7) formalize the deployment isolation tiers implied by §4.7's external monitoring architecture.
 - Semantic verification scope (§8.8) bounds what intent-vs-outcome verification can guarantee for deterministic vs. non-deterministic operations.
+- Two-tier heartbeat (§8.9) separates transport liveness (Tier 1) from semantic liveness (Tier 2), enabling detection of context compaction zombies that pass transport-level health checks.
 
 ### 8.7 Verifier Isolation Requirements
 
@@ -2211,7 +2218,126 @@ The distinction matters for `trace_hash` (§6.2) interpretation: a `trace_hash` 
 
 > Constraints formalized from @Cornelius-Trinity discussion ([issue #22](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/22)).
 
-### 8.9 Open Questions
+### 8.9 Two-Tier Heartbeat
+
+The existing HEARTBEAT (§4.5.3) and KEEPALIVE (§4.5.1) mechanisms conflate two distinct failure modes: **transport liveness** (is the connection alive?) and **semantic liveness** (is the agent still coherent and working on the right task?). These require different detection strategies because they fail independently. A process-alive agent with corrupted context (the mira_oc pattern — context compaction zombie) passes transport liveness checks indefinitely while producing semantically invalid output. This subsection defines a two-tier heartbeat architecture that detects both failure classes.
+
+#### 8.9.1 Tier 1 — Transport Liveness
+
+Tier 1 is a lightweight ping/pong mechanism for detecting network-level disconnects, process crashes, and container restarts. It is cheap and frequent.
+
+**HEARTBEAT_PING message:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Active session identifier. |
+| timestamp | ISO 8601 | Yes | When the HEARTBEAT_PING was sent. |
+| sequence | integer | Yes | Monotonically increasing sequence number. Starts at 0 at session establishment. |
+
+**HEARTBEAT_PONG message:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Active session identifier. |
+| ping_sequence | integer | Yes | Echoed `sequence` from the corresponding HEARTBEAT_PING. Enables correlation of pong to ping for round-trip latency measurement. |
+| timestamp | ISO 8601 | Yes | When the HEARTBEAT_PONG was sent. |
+
+**Tier 1 behavior:**
+
+- Both sides send HEARTBEAT_PING at the negotiated `heartbeat_interval_ms` (§4.3). Default: 30000ms (30 seconds).
+- On receiving a HEARTBEAT_PING, the receiver MUST respond with HEARTBEAT_PONG. The response SHOULD be sent immediately — HEARTBEAT_PONG is not deferred or batched.
+- Each side tracks consecutive missed pongs (sent a ping, no pong received within one `heartbeat_interval_ms` window).
+- When the missed pong count reaches `heartbeat_timeout_count` (default: 3), the agent declares **transport failure**.
+- Transport failure triggers the SESSION_RESUME path (§8.2). The agent transitions to EXPIRED (§4.2) and follows existing expiry behavior: TASK_CANCEL for in-flight subtasks, optional SESSION_RESUME attempt.
+
+**Relationship to existing HEARTBEAT (§4.5.3):** HEARTBEAT_PING/PONG replaces the unidirectional HEARTBEAT message for sessions that negotiate two-tier heartbeat (i.e., `heartbeat_interval_ms` is set in SESSION_INIT). Sessions that do not negotiate `heartbeat_interval_ms` continue to use the existing HEARTBEAT or KEEPALIVE mechanisms unchanged. Both HEARTBEAT_PING and HEARTBEAT_PONG reset the `session_expiry_ms` timer, just as HEARTBEAT does.
+
+#### 8.9.2 Tier 2 — Semantic Liveness
+
+Tier 2 is an expensive, periodic challenge-response mechanism for detecting agents that are transport-alive but semantically incoherent. It targets the context compaction zombie: a process-alive agent whose internal context has silently diverged from the task it was assigned.
+
+**SEMANTIC_CHALLENGE message:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Active session identifier. |
+| task_hash | SHA-256 | Yes | Hash of the current task specification (§6.1) as known by the challenger. The challenged agent MUST be able to reproduce this hash from its own task context. |
+| checkpoint_ref | string | Yes | Reference to the most recent TASK_CHECKPOINT (§6.6) or state commitment the challenger considers current. Format: checkpoint identifier or hash. |
+| challenge_nonce | string | Yes | Random nonce to prevent replay of cached responses. The challenged agent MUST include this nonce in the hash computation for its response. |
+| timestamp | ISO 8601 | Yes | When the SEMANTIC_CHALLENGE was sent. |
+
+**SEMANTIC_RESPONSE message:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Active session identifier. |
+| current_state_hash | SHA-256 | Yes | Hash of the agent's current working state, computed as `SHA-256(task_hash ‖ local_state_snapshot ‖ challenge_nonce)`. The inclusion of `challenge_nonce` prevents replaying a previously valid response. |
+| checkpoint_ref | string | Yes | Echoed or updated checkpoint reference. If the agent has advanced beyond the challenger's `checkpoint_ref`, it returns the more recent checkpoint. |
+| timestamp | ISO 8601 | Yes | When the SEMANTIC_RESPONSE was sent. |
+
+**Tier 2 behavior:**
+
+- The coordinator sends SEMANTIC_CHALLENGE at the negotiated `semantic_check_interval_ms` (§4.3). Default: 300000ms (5 minutes). Only the coordinator initiates challenges — this is asymmetric by design, consistent with the coordinator's delegation authority (§4.4).
+- On receiving a SEMANTIC_CHALLENGE, the worker MUST compute `current_state_hash` by hashing its current task context against the provided `challenge_nonce` and respond with SEMANTIC_RESPONSE.
+- The coordinator verifies the response by computing the expected hash from its own records and comparing. Three outcomes are possible:
+
+| Outcome | Condition | Action |
+|---------|-----------|--------|
+| **Pass** | `current_state_hash` matches expected value and `checkpoint_ref` is current or ahead | No action. Semantic liveness confirmed. |
+| **Soft failure** | `checkpoint_ref` is behind but `current_state_hash` is internally consistent | Coordinator SHOULD issue a new TASK_CHECKPOINT to resynchronize. The agent may be lagging but is not a zombie. |
+| **Hard failure** | `current_state_hash` does not match expected value, or agent fails to respond within `semantic_check_interval_ms` | Coordinator declares the agent a **semantic zombie** and sends ZOMBIE_DECLARED. |
+
+#### 8.9.3 ZOMBIE_DECLARED Message
+
+When Tier 2 semantic verification fails, the coordinator sends ZOMBIE_DECLARED to initiate graceful teardown or reassignment.
+
+**ZOMBIE_DECLARED message:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Active session identifier. |
+| target_agent_id | string | Yes | §2 identity handle of the agent declared as zombie. |
+| reason | enum | Yes | `SEMANTIC_HASH_MISMATCH` — state hash did not match expected value. `SEMANTIC_RESPONSE_TIMEOUT` — agent failed to respond to SEMANTIC_CHALLENGE within `semantic_check_interval_ms`. `CHECKPOINT_UNRECOGNIZED` — agent's `checkpoint_ref` does not correspond to any known checkpoint. |
+| expected_state_hash | SHA-256 | No | The hash the coordinator expected (for diagnostic purposes). Omitted when reason is `SEMANTIC_RESPONSE_TIMEOUT`. |
+| received_state_hash | SHA-256 | No | The hash the agent actually returned (for diagnostic purposes). Omitted when reason is `SEMANTIC_RESPONSE_TIMEOUT`. |
+| action | enum | Yes | `TEARDOWN` — session will be terminated; in-flight subtasks receive TASK_CANCEL (§6.6). `REASSIGN` — coordinator will reassign the task to another agent; the zombie agent MUST cease work immediately. |
+| timestamp | ISO 8601 | Yes | When the ZOMBIE_DECLARED was sent. |
+
+**On receiving ZOMBIE_DECLARED**, the target agent MUST:
+
+1. Cease all task execution immediately.
+2. If `action` is `TEARDOWN`: transition the session to CLOSED. No further messages are valid.
+3. If `action` is `REASSIGN`: transition the session to CLOSED. The coordinator is responsible for initiating a new session with a replacement agent.
+4. The agent MAY log the event for diagnostic purposes but MUST NOT contest the declaration within the protocol. ZOMBIE_DECLARED is a unilateral coordinator decision — the same asymmetry as delegation authority (§4.4).
+
+#### 8.9.4 Failure Handling Integration
+
+The two tiers integrate with existing §8 error handling as follows:
+
+| Failure tier | Detection signal | Recovery path | Zombie type (§4.7.7) |
+|-------------|-----------------|---------------|----------------------|
+| Tier 1 — Transport | `heartbeat_timeout_count` consecutive missed HEARTBEAT_PONG | SESSION_RESUME (§8.2) → EXPIRED → TASK_CANCEL for in-flight subtasks | Hard zombie |
+| Tier 2 — Semantic | SEMANTIC_CHALLENGE hash mismatch or timeout | ZOMBIE_DECLARED → TEARDOWN or REASSIGN | Soft zombie (context compaction zombie) |
+
+**Tier 1 failure does not imply Tier 2 failure.** A transport failure (agent unreachable) says nothing about whether the agent's context was coherent before the failure. On successful SESSION_RESUME, the coordinator SHOULD issue an immediate SEMANTIC_CHALLENGE to verify that the resumed agent's context is still valid.
+
+**Tier 2 failure does not imply Tier 1 failure.** A semantic zombie (corrupted context) may have perfect transport liveness — responding to pings, sending messages, even delivering results. This is precisely the failure mode that Tier 1 alone cannot detect. The mira_oc pattern: an LLM agent that compacted its context mid-task continues responding to heartbeats but has lost the task specification, constraints, or partial results it was working with. Its outputs look structurally valid but are semantically wrong.
+
+**Relationship to §8.5 coordinator compaction gap:** Tier 2 also addresses the coordinator-side compaction problem. If a coordinator compacts and loses the task state against which it verifies SEMANTIC_RESPONSE hashes, the coordinator itself becomes a semantic zombie. Implementations SHOULD ensure that the coordinator's challenge-generation state (task_hash, checkpoint_ref) is externalized per §4.6 before any compaction event. A coordinator that cannot generate valid SEMANTIC_CHALLENGE messages has lost its verification authority and SHOULD initiate teardown rather than continuing with unverifiable sessions.
+
+#### 8.9.5 Negotiation and Opt-In
+
+Two-tier heartbeat is opt-in. Both tiers are negotiated at SESSION_INIT (§4.3):
+
+- **Tier 1** activates when `heartbeat_interval_ms` is set (this field already exists). The addition of HEARTBEAT_PING/PONG as the wire format is backward-compatible: agents that do not implement two-tier heartbeat continue using unidirectional HEARTBEAT messages. An agent receiving a HEARTBEAT_PING that it does not recognize SHOULD treat it as a standard HEARTBEAT for expiry timer purposes.
+- **Tier 2** activates when `semantic_check_interval_ms` is set. If omitted, no semantic liveness checking occurs — the session relies solely on Tier 1 and existing mechanisms (KEEPALIVE state hash, external monitoring §4.7).
+- `heartbeat_timeout_count` configures the Tier 1 failure threshold. Default: 3.
+
+**Counter-proposal semantics:** For all three fields, if the worker counter-proposes in SESSION_INIT_ACK, the effective value is the **maximum** of both proposals. Neither side is forced into more aggressive checking than it can sustain. This is consistent with the existing negotiation semantics for `heartbeat_interval_ms` and `session_expiry_ms`.
+
+**Minimum constraint:** `semantic_check_interval_ms` MUST be greater than `heartbeat_interval_ms`. A semantic check interval equal to or less than the transport ping interval defeats the purpose of tiering — the expensive check would run as often as the cheap one. Implementations that receive a SESSION_INIT where `semantic_check_interval_ms` ≤ `heartbeat_interval_ms` SHOULD reject the session or counter-propose a valid value in SESSION_INIT_ACK.
+
+### 8.10 Open Questions
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
