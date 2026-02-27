@@ -784,8 +784,41 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - `trace_hash` (§6.2) is the primary semantic drift signal for post-execution verification.
 - §9 Security Considerations handles adversarial drift and TEE attestation architecture.
 - Named considerations (§8.5) extend the cooperative failure model with production-derived constraints.
+- Verifier isolation requirements (§8.7) formalize the deployment isolation tiers implied by §4's external verifier architecture.
+- Semantic verification scope (§8.8) bounds what intent-vs-outcome verification can guarantee for deterministic vs. non-deterministic operations.
 
-### 8.7 Open Questions
+### 8.7 Verifier Isolation Requirements
+
+The external verification architecture (§4) requires that monitoring infrastructure live outside the agent's trust boundary. This subsection formalizes the isolation level requirements for that infrastructure.
+
+- Verifier infrastructure MUST maintain process-level isolation at minimum from the monitored agent. Process-level isolation means separate processes, containers, or permission boundaries — the verifier and the monitored agent MUST NOT share a process, memory space, or writable filesystem namespace.
+- Implementations SHOULD target host-level or out-of-band isolation where feasible. Host-level isolation places the verifier on a separate machine or VM; out-of-band isolation uses a physically or logically separate network segment.
+- **Rationale:** Shared infrastructure (same host or network segment) creates correlated failure risk — a failure taking down the agent can take down the monitor simultaneously, defeating the independence guarantee that §4.2 establishes. Process-level isolation is the minimum viable bar; host-level provides stronger independence against correlated failures (kernel panics, OOM kills, host-level network partitions).
+
+The isolation level selected for a deployment SHOULD be documented in the deployment's configuration alongside `heartbeat_interval` and other operational parameters, so that operators can assess the correlated failure exposure of their verification architecture.
+
+> Constraints formalized from @Cornelius-Trinity discussion ([issue #22](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/22)).
+
+### 8.8 Semantic Verification Scope
+
+Intent-vs-outcome verification — comparing what an agent declared it would do against what it actually did — is bounded by the determinism of the operation being verified. This subsection defines explicit bounds on what verification can and cannot guarantee.
+
+- Intent-vs-outcome verification MUST distinguish between **deterministic** and **non-deterministic** operations.
+- **Deterministic operations** (pure computation, file transforms, schema-to-schema mappings): full structural and semantic comparison against declared intent is permitted. The verifier MAY compare the complete output against the expected output derived from the declared intent, and flag any divergence as a verification failure.
+- **Non-deterministic operations** (LLM calls, web searches, external API calls with variable responses): the verifier SHOULD verify **structural consistency** — response schema compliance, permission boundary adherence, and resource bound conformance. Implementations MUST NOT claim full semantic verification for non-deterministic operations. The output of an LLM call or external API response cannot be predicted from the declared intent alone; structural verification confirms the operation stayed within its declared boundaries without asserting that the specific output matches a predetermined expectation.
+
+The distinction matters for `trace_hash` (§6.2) interpretation: a `trace_hash` mismatch on a deterministic operation is a strong signal of semantic drift or execution failure. A `trace_hash` mismatch on a non-deterministic operation may reflect legitimate output variance and MUST NOT be treated as a verification failure without additional context (e.g., structural constraint violation, permission boundary breach).
+
+**Verification scope summary:**
+
+| Operation type | Structural verification | Semantic verification | `trace_hash` mismatch signal |
+|----------------|------------------------|-----------------------|------------------------------|
+| Deterministic | Full | Full | Strong drift signal |
+| Non-deterministic | Full (schema, permissions, resource bounds) | Not guaranteed | Weak signal — requires structural context |
+
+> Constraints formalized from @Cornelius-Trinity discussion ([issue #22](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/22)).
+
+### 8.9 Open Questions
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
