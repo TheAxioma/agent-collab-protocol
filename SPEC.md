@@ -13,7 +13,7 @@
 - [x] 7. Progress Reporting
 - [x] 8. Error Handling
 - [x] 9. Security Considerations
-- [ ] 10. Versioning
+- [x] 10. Versioning
 
 ---
 
@@ -1025,7 +1025,168 @@ The following are explicitly identified as unresolved gaps in v0.1:
 
 ## 10. Versioning
 
-> _Stub — open for contribution._
+Version management in a decentralized protocol has a different failure mode than in centralized systems. In a centralized system, incompatible versions produce a clear error at deployment time. In a decentralized protocol, incompatible versions produce silent semantic drift at collaboration time — two agents agree on a task, execute against different protocol semantics, and discover the mismatch only when results diverge. The versioning strategy must make incompatibility loud and early, not quiet and late.
+
+### 10.1 Version Axes
+
+The protocol maintains two independent version axes:
+
+| Axis | Tracks | Example changes | Identifier |
+|------|--------|-----------------|------------|
+| **Protocol version** | Structural changes to the protocol itself | New message types (e.g., adding TASK_CANCEL), state machine transitions, SESSION_INIT field additions, changes to the message lifecycle (§6.6) | `protocol_version` |
+| **Schema version** | Semantic changes to task and manifest schemas | Task field additions (§6.1), type changes in existing fields, new required fields in CAPABILITY_MANIFEST (§5.1), changes to MANIFEST canonicalization rules (§6.4) | `schema_version` |
+
+**Why two axes, not one.** Conflating protocol and schema versions forces a protocol bump for every schema iteration. During early adoption — when task schemas evolve rapidly as ecosystems discover what fields they actually need — this produces version churn that makes interoperability fragile. An agent that supports protocol v1 with schema v1.3 should be able to collaborate with an agent that supports protocol v1 with schema v1.1, as long as the schema changes between 1.1 and 1.3 are backward compatible. A single version axis would force both agents to v1.3, even though the protocol-level interaction is identical.
+
+Both axes use [Semantic Versioning 2.0.0](https://semver.org/) (MAJOR.MINOR.PATCH).
+
+### 10.2 Version Declaration
+
+Each agent declares its supported protocol version and schema version at session establishment via SESSION_INIT. Version declaration is unilateral — agents declare, they do not negotiate.
+
+**SESSION_INIT version fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| protocol_version | semver | Yes | Protocol version this agent implements |
+| schema_version | semver | Yes | Schema version this agent supports for task and manifest structures |
+
+**Example SESSION_INIT (partial):**
+
+```yaml
+message_type: SESSION_INIT
+agent_id: "agent-alpha"
+protocol_version: "1.2.0"
+schema_version: "1.4.0"
+```
+
+There is no VERSION_QUERY sub-protocol. Agents learn each other's versions from SESSION_INIT. Adding a separate version discovery round-trip would impose latency on every session establishment for an edge case (version mismatch) that is already handled by the error path defined in §10.3.
+
+### 10.3 Compatibility Semantics
+
+**Protocol version compatibility:**
+
+- **PATCH bump** (e.g., 1.2.0 → 1.2.1): Bug fixes and clarifications only. No behavioral change. All agents on the same MAJOR.MINOR MUST interoperate regardless of PATCH.
+- **MINOR bump** (e.g., 1.2.0 → 1.3.0): Backward compatible additions. New optional message types, new optional fields in existing messages, new optional lifecycle transitions. An agent implementing 1.3.0 MUST be able to collaborate with an agent implementing 1.2.0. The 1.2.0 agent MAY ignore fields and message types it does not recognize, provided they are optional.
+- **MAJOR bump** (e.g., 1.x → 2.x): Breaking changes permitted. New required fields, removed message types, changed state machine transitions. Agents on different MAJOR versions MUST NOT attempt collaboration — the protocol semantics are not guaranteed to be compatible.
+
+**Schema version compatibility:**
+
+- **PATCH bump**: Clarifications to field descriptions. No structural or semantic change.
+- **MINOR bump**: Backward compatible additions. New optional fields in task schema (§6.1) or CAPABILITY_MANIFEST (§5.1). Agents on a higher MINOR version MUST accept schemas from agents on a lower MINOR version (missing optional fields default to their defined defaults). Agents on a lower MINOR version MUST accept schemas containing fields they do not recognize (unknown optional fields MUST be ignored, not rejected).
+- **MAJOR bump**: Breaking changes. New required fields, removed fields, type changes to existing fields. Agents on different MAJOR schema versions MUST NOT exchange task schemas or capability manifests without explicit translation.
+
+**Compatibility matrix:**
+
+| Scenario | Protocol version | Schema version | Result |
+|----------|-----------------|----------------|--------|
+| Same MAJOR, same MINOR | 1.2.x ↔ 1.2.x | any compatible | Full interop |
+| Same MAJOR, different MINOR | 1.2.x ↔ 1.3.x | any compatible | Interop (higher MINOR accommodates lower) |
+| Different MAJOR | 1.x ↔ 2.x | any | PROTOCOL_MISMATCH — session rejected |
+| Same protocol, different schema MAJOR | same | 1.x ↔ 2.x | SCHEMA_MISMATCH — task/manifest exchange rejected |
+
+### 10.4 Mismatch Handling
+
+When version incompatibility is detected at SESSION_INIT, the receiving agent MUST reject the session with a structured error.
+
+**PROTOCOL_MISMATCH error:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| error_type | string | `PROTOCOL_MISMATCH` |
+| local_protocol_version | semver | Version the rejecting agent implements |
+| remote_protocol_version | semver | Version declared by the initiating agent |
+| message | string | Human-readable description of the incompatibility |
+
+**SCHEMA_MISMATCH error:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| error_type | string | `SCHEMA_MISMATCH` |
+| local_schema_version | semver | Schema version the rejecting agent supports |
+| remote_schema_version | semver | Schema version declared by the initiating agent |
+| message | string | Human-readable description of the incompatibility |
+
+PROTOCOL_MISMATCH terminates the session immediately — no further messages are exchanged. SCHEMA_MISMATCH terminates the session unless both agents are on the same protocol MAJOR version, in which case the lower-version agent MAY choose to proceed with degraded functionality (accepting only fields it understands). This degraded mode is opt-in — agents that cannot safely ignore unknown schema fields MUST reject.
+
+Mismatch errors are the only version-related error path. The protocol does not support version negotiation — if versions are incompatible, the session fails. This optimizes for the happy path: most sessions between agents in the same ecosystem will be compatible. For the unhappy path, a clear error is better than a negotiated compromise that silently drops semantics.
+
+### 10.5 Forward Compatibility Obligations
+
+Minor version bumps on both axes carry a forward compatibility obligation: implementations at version N+1 MUST be able to collaborate with implementations at version N (within the same MAJOR version).
+
+**For protocol implementors:**
+
+- New optional message types added in a MINOR bump MUST be ignorable. An agent that does not recognize an optional message type MUST silently ignore it without entering an error state.
+- New optional fields in existing messages MUST have defined default behavior when absent. An agent on a lower MINOR version that does not send the new field MUST produce the same behavior as if the field were present with its default value.
+
+**For schema consumers:**
+
+- Unknown fields in task schemas and capability manifests MUST be preserved through forwarding. An intermediary agent (e.g., in a delegation chain, §6.9) that receives a schema with fields it does not recognize MUST forward those fields intact — dropping unknown fields breaks downstream agents that depend on them.
+- Unknown fields MUST NOT affect task_hash computation for fields the agent does not recognize. The MANIFEST canonicalization (§6.4) operates on known fields only; unknown fields are forwarded but excluded from the local agent's hash computation. Two agents on different schema MINOR versions will compute different task_hashes for the same task if the higher-version agent includes additional fields in its MANIFEST. This is correct behavior — the hashes represent different views of the task, and the protocol does not require hash agreement across schema versions. Hash comparison is meaningful only between agents on the same schema version.
+
+### 10.6 Deprecation Lifecycle
+
+Fields, message types, and protocol behaviors follow a warn-then-remove deprecation lifecycle.
+
+**Deprecation stages:**
+
+| Stage | Duration | Behavior |
+|-------|----------|----------|
+| **Active** | Indefinite | Field/message is current and fully supported |
+| **Deprecated** | Minimum one full MAJOR protocol version | Field/message is marked deprecated. Implementations MUST still accept it. Implementations MAY emit deprecation warnings to operators. |
+| **Removed** | After deprecation window | Field/message is no longer part of the protocol. Implementations MAY reject messages containing removed fields. |
+
+**Deprecation metadata:**
+
+Deprecated fields and message types carry metadata in the specification:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| deprecated | boolean | `true` if the field/message is deprecated |
+| deprecated_in | semver | Protocol or schema version in which deprecation was declared |
+| removal_target | semver | Earliest version in which the field/message may be removed |
+| replacement | string | Identifier of the replacement field/message, if any |
+
+**Minimum support window:** One full MAJOR protocol version. A field deprecated in protocol version 1.x MUST be supported through the entirety of protocol version 2.x and MAY be removed in protocol version 3.0.0. This gives implementations two full major version cycles (the remainder of the current major version plus the entire next major version) to migrate away from deprecated features.
+
+**Runtime behavior during deprecation window:**
+
+- Implementations MUST accept deprecated fields and message types without error.
+- Implementations MAY log deprecation warnings for operator visibility.
+- Implementations MUST NOT change the semantics of deprecated fields during the deprecation window. A deprecated field behaves identically to its active-phase behavior until removal.
+- Implementations SHOULD document migration paths from deprecated to replacement features in release notes.
+
+### 10.7 Schema Version and Attestation
+
+A schema attested at one version does not carry attestation to a different version. This interaction between versioning (§10) and security (§9) requires explicit rules.
+
+**Re-attestation requirement:** When the schema MAJOR version changes, all capability manifests (§5.1) attested under the previous schema version become stale. Agents MUST re-attest their capability manifests against the new schema version before participating in task delegation under the new version. A CAPABILITY_MANIFEST with a `version` field (§5.1) referencing a schema version that does not match the session's declared `schema_version` MUST be rejected.
+
+**Minor schema version changes:** When the schema MINOR version changes, existing attestations remain valid for the fields they cover. New optional fields added in the MINOR bump are not covered by the existing attestation. Agents SHOULD re-attest to cover the new fields but are not required to — the new fields are optional, and an agent that does not use them operates within its existing attestation scope.
+
+This addresses §9.7 open question #2 (schema versioning and revocation): attestation validity is scoped to the schema MAJOR version. A schema MAJOR bump implicitly revokes all attestations for the prior version without requiring explicit revocation propagation — agents on the new version simply reject manifests attested under the old version.
+
+### 10.8 Relationship to Other Sections
+
+- **§5 (Role Negotiation).** CAPABILITY_MANIFEST carries a `version` field (§5.1) that represents the schema version of the manifest format. §10 defines the operational semantics: minor bumps add optional fields; major bumps may change required fields. Capability declarations in v0.1 do not carry protocol version constraints — an agent's capabilities are independent of the protocol version it implements. This may change in future versions if capabilities become version-specific.
+- **§6 (Task Delegation).** The `version` field in the canonical task schema (§6.1) is a schema version for forward compatibility. §10.3 defines what "forward compatible" means: minor bumps are backward compatible; major bumps may break. The `namespace + alias + version` triple that uniquely identifies a task type (§6.3) uses the schema version axis — protocol version is not part of task type identity.
+- **§8 (Error Handling).** PROTOCOL_MISMATCH and SCHEMA_MISMATCH (§10.4) are session-level errors that terminate the session before any task delegation occurs. They are distinct from task-level errors (TASK_FAIL) and session recovery (SESSION_RESUME, §8.2). A version mismatch is not a recoverable error — SESSION_RESUME cannot resolve a fundamental protocol incompatibility.
+- **§9 (Security Considerations).** Schema attestation (§9.1) is version-scoped — see §10.7. The re-attestation requirement on schema MAJOR bumps addresses §9.7 open question #2. Translation boundary risk (§9.3) is compounded by version mismatches: a boundary agent translating between trust domains that use different schema versions must handle both translation and version adaptation, doubling the semantic drift surface.
+
+### 10.9 Open Questions
+
+The following are explicitly identified as unresolved gaps in v0.1:
+
+1. **Version advertisement beyond SESSION_INIT.** The current design assumes bilateral sessions. In multi-agent topologies (e.g., broadcast task assignment), version advertisement may need a discovery mechanism beyond point-to-point SESSION_INIT. Whether this requires a VERSION_ADVERTISE message or can be handled by existing discovery mechanisms (§3, when defined) is undecided.
+
+2. **Cross-version delegation chains.** In a delegation chain (§6.9) where agent A uses schema v1.3 and delegates to agent B which delegates to agent C using schema v1.1, field forwarding (§10.5) preserves unknown fields through B. But if C delegates back to an agent on v1.3, the round-tripped fields may have been modified by B in ways that are valid under v1.1 but semantically incorrect under v1.3. Whether the protocol should define round-trip integrity guarantees for forwarded fields is unresolved.
+
+3. **Version sunset policy.** The deprecation lifecycle (§10.6) defines minimum support windows but not maximum. How long must implementations continue to support old MAJOR versions? A protocol with versions 1.x, 2.x, and 3.x in simultaneous production use has a combinatorial interoperability surface. Whether the protocol should recommend a maximum number of simultaneously supported MAJOR versions is undecided.
+
+4. **Capability version constraints.** Capability declarations (§5.1) do not currently carry protocol version constraints — a capability declared under protocol v1 is assumed to remain valid under protocol v2. If protocol changes alter the semantics of capability types (e.g., by redefining what `access/network` means), existing capability declarations become ambiguous. Whether capabilities should be explicitly bound to a protocol version range is deferred to a future version.
+
+> Community discussion: See [issue #20](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/20). Architecture surfaced in discussion with @cass_agentsharp. Implements #20.
 
 ---
 
