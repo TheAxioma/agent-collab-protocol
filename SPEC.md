@@ -437,13 +437,14 @@ The **metaphysical continuity question** — whether an agent that has undergone
 
 ### 4.2 Session State Machine
 
-A session occupies exactly one of seven states at any point in time:
+A session occupies exactly one of eight states at any point in time:
 
 | State | Description |
 |-------|-------------|
 | IDLE | Session has been allocated but no SESSION_INIT has been sent. |
 | NEGOTIATING | SESSION_INIT sent; capability manifest exchange (§5.9) in progress. |
 | ACTIVE | Capability exchange complete; task delegation (§6) is permitted. |
+| SUSPECTED | Heartbeat gap threshold exceeded but `session_expiry_ms` has not yet elapsed. The counterparty's liveness is ambiguous — it may be slow, overloaded, experiencing transient network issues, or genuinely failed. The local agent MUST NOT delegate new tasks but MUST continue buffering work-in-progress and MUST NOT tear down the session. See §4.2.1 for graduated suspicion semantics. |
 | SUSPENDED | Session intentionally paused by either participant. No tasks may be delegated or executed. In-flight tasks SHOULD be checkpointed (§6.6 TASK_CHECKPOINT) before transition. |
 | COMPACTED | Context limit hit mid-session — one or both agents have undergone context compaction. Distinct from SUSPENDED: COMPACTED is not intentional. Load-bearing session state may have been lost. Recovery requires the SESSION_RESUME protocol (§4.8). |
 | EXPIRED | Session heartbeat deadline exceeded. The local agent has not received a HEARTBEAT (§4.5.3) within the negotiated `session_expiry_ms` window. Terminal state — no further task delegation is valid. In-flight subtasks MUST receive explicit TASK_CANCEL (§6.6) before teardown. Partial result recovery, if desired, MUST use SESSION_RESUME mechanics (§4.8). |
@@ -485,8 +486,27 @@ ACTIVE → COMPACTED
   Guard: Context compaction detected by either agent
          (external verifier or self-report — §4.7 defines detection)
 
+ACTIVE → SUSPECTED
+  Guard: No HEARTBEAT received within suspected_threshold_ms (configurable)
+         AND session_expiry_ms has NOT yet elapsed
+         Detection is local — each side evaluates independently
+         suspected_threshold_ms is negotiated in SESSION_INIT / SESSION_INIT_ACK
+         (see §4.2.1 and issue #71 for heartbeat negotiation)
+
+SUSPECTED → ACTIVE
+  Guard: HEARTBEAT or HEARTBEAT_PONG received from counterparty
+         (proof of liveness — any valid heartbeat signal)
+         Buffered work resumes normal processing
+
+SUSPECTED → EXPIRED
+  Guard: session_expiry_ms elapsed since last received HEARTBEAT
+         without any intervening HEARTBEAT from counterparty
+         In-flight subtasks MUST receive TASK_CANCEL (§6.6) before teardown
+         (Same terminal semantics as direct ACTIVE → EXPIRED)
+
 ACTIVE → EXPIRED
   Guard: No HEARTBEAT received within session_expiry_ms (§4.5.3)
+         AND suspected_threshold_ms is not configured (legacy behavior)
          Detection is local — each side evaluates independently
          In-flight subtasks MUST receive TASK_CANCEL (§6.6) before teardown
 
@@ -544,25 +564,57 @@ COMPACTED → CLOSED
               │               ▼                 ▼
               │     ┌────────────────────┐   ┌──────┐
               │     │      ACTIVE        │──▶│CLOSED│
-              │     └┬───────┬───────┬───┘   └──────┘
-              │      │       │       │           ▲
-              │ suspend│ compaction  │no HB      │
-              │      ▼       ▼       ▼           │
-              │ ┌─────────┐ ┌─────────┐ ┌───────┐│
-              │ │SUSPENDED│ │COMPACTED│ │EXPIRED││
-              │ └────┬────┘ └────┬────┘ └───┬───┘│
-              │      │           │          │    │
-              │      └─────┬─────┘    RESUME│    │
-              │            │ SESSION_ (if ok)│    │
-              │            │ RESUME    ┌─────┘    │
-              │            │ (match)   │          │
-              │            ▼           ▼          │
-              │        back to ACTIVE             │
-              │                                   │
-              │  state mismatch / TTL expired /   │
-              │  RESUME fails / SESSION_CLOSE     │
-              └───────────────────────────────────┘
+              │     └┬──┬────┬───────┬───┘   └──────┘
+              │      │  │    │       │           ▲
+              │ susp.│  │ compact.  │HB gap     │
+              │      │  │    │       │(threshold)│
+              │      ▼  │    ▼       ▼           │
+              │ ┌──────┐│┌─────────┐┌──────────┐ │
+              │ │SUSPND││││COMPACTD││SUSPECTED │ │
+              │ └──┬───┘│└────┬────┘└──┬────┬──┘ │
+              │    │    │     │   HB ◀─┘    │    │
+              │    │    │     │ received     │    │
+              │    │    │     │ (back to     │    │
+              │    │    │     │  ACTIVE)  expiry  │
+              │    │    │     │          elapsed  │
+              │    │    │     │             ▼     │
+              │    └────┼─────┘       ┌───────┐  │
+              │  SESSION│_RESUME      │EXPIRED│  │
+              │  (match)│       RESUME│(if ok) │  │
+              │         │       ┌─────┘        │  │
+              │         ▼       ▼              │  │
+              │     back to ACTIVE             │  │
+              │                                │  │
+              │  state mismatch / TTL expired / │  │
+              │  RESUME fails / SESSION_CLOSE   │  │
+              └─────────────────────────────────┘  │
+                  no HB (no threshold configured)  │
+                  ACTIVE ─────────────────▶ EXPIRED─┘
 ```
+
+#### 4.2.1 SUSPECTED State — Graduated Suspicion
+
+**Motivation:** The original §4.2 state machine modeled liveness as binary — an agent was either ACTIVE or EXPIRED (and by extension, a zombie candidate). Three independent production deployments converged on the same finding: binary liveness was an engineering convenience that became an ontological claim. In practice, there is a real intermediate state between "definitely alive" and "probably dead." A heartbeat that is 2 seconds late is not the same as a heartbeat that is 5 minutes late, but the binary model treats both identically once the expiry threshold fires. SUSPECTED is the spec acknowledging the intermediate state that deployments already implement — graduated suspicion replaces the binary alive/dead determination with a three-phase model that avoids premature ZOMBIE declaration and the unnecessary teardown cost that follows.
+
+**SUSPECTED entry condition:** An agent transitions from ACTIVE to SUSPECTED when no HEARTBEAT (§4.5.3), HEARTBEAT_PONG (§8.9.1), or KEEPALIVE (§4.5.1) has been received from the counterparty within `suspected_threshold_ms`. This threshold MUST be configurable per-session — it is not a hardcoded protocol constant. The value is negotiated in SESSION_INIT / SESSION_INIT_ACK alongside other heartbeat parameters (see §4.3). The `suspected_threshold_ms` value MUST be greater than `heartbeat_interval_ms` and MUST be less than `session_expiry_ms`. A typical value is 2–3× `heartbeat_interval_ms`.
+
+> **Cross-reference:** The per-session negotiation of `suspected_threshold_ms` follows the same pattern as `heartbeat_interval_ms` and `session_expiry_ms` negotiation defined in §4.3. See also [issue #71](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/71) for the broader SESSION_INIT heartbeat negotiation design.
+
+**Work-buffering-during-uncertainty:** While in SUSPECTED state, the local agent MUST:
+
+1. **Continue executing in-flight tasks.** Work already accepted and in progress MUST NOT be abandoned. Partial results are valuable — premature teardown discards them.
+2. **Buffer outgoing task delegations.** New TASK_ASSIGN messages MUST NOT be sent while the counterparty's liveness is uncertain. Delegating to a potentially-dead agent wastes work and creates orphaned tasks.
+3. **Continue sending heartbeats.** The local agent MUST continue its own HEARTBEAT emissions. The counterparty may be in SUSPECTED state symmetrically — one side's continued heartbeats can resolve the other's suspicion.
+4. **Buffer work products.** If the local agent produces results (TASK_COMPLETE, TASK_PROGRESS) while in SUSPECTED, those messages SHOULD be buffered locally rather than sent to a potentially-unreachable counterparty. On transition back to ACTIVE, buffered messages are sent in order.
+
+**SUSPECTED exit conditions:**
+
+- **Back to ACTIVE:** Any valid HEARTBEAT, HEARTBEAT_PONG, or KEEPALIVE received from the counterparty. No SESSION_RESUME is required — proof of liveness is sufficient. The session was never declared dead, so there is no state to reconcile. Buffered messages are flushed.
+- **Forward to EXPIRED:** `session_expiry_ms` elapses since the last received heartbeat without any intervening heartbeat from the counterparty. The session follows standard EXPIRED semantics — TASK_CANCEL for in-flight subtasks (§6.6), optional SESSION_RESUME attempt (§4.8).
+
+**Design insight — graduated suspicion:** The key insight is that suspicion is not binary. The cost of a false positive (declaring EXPIRED when the agent is merely slow) is high: teardown, TASK_CANCEL for in-flight work, potential SESSION_RESUME overhead, and lost partial results. The cost of a false negative (remaining in SUSPECTED when the agent is truly dead) is bounded: the agent enters EXPIRED when `session_expiry_ms` fires, with at most `session_expiry_ms - suspected_threshold_ms` additional delay. SUSPECTED biases toward preserving work at the cost of slightly delayed failure detection — a tradeoff that all three converging deployments chose independently.
+
+**Backward compatibility:** Sessions that do not negotiate `suspected_threshold_ms` (i.e., the field is omitted in both SESSION_INIT and SESSION_INIT_ACK) use the legacy binary behavior — ACTIVE transitions directly to EXPIRED when `session_expiry_ms` elapses. SUSPECTED is an opt-in refinement, not a mandatory state.
 
 ### 4.3 SESSION_INIT Message
 
@@ -582,7 +634,8 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | heartbeat_interval_ms | integer | No | Proposed interval in milliseconds between HEARTBEAT_PING messages — Tier 1 transport liveness (§8.9). Per-session, not per-agent — different collaborations have different latency profiles (e.g., 5000ms for real-time coordination, 300000ms for research tasks). The coordinator MAY use the worker's `preferred_heartbeat_interval_ms` from AGENT_MANIFEST (§3.1) as input when choosing this value, but the AGENT_MANIFEST hint is advisory — this SESSION_INIT field is the binding proposal. The worker may counter-propose in SESSION_INIT_ACK; the effective value is the maximum of both proposals. If omitted, falls back to `keepalive.heartbeat_interval_seconds * 1000` if present, otherwise no protocol-level heartbeat. Default: 30000. |
 | semantic_check_interval_ms | integer | No | Proposed interval in milliseconds between SEMANTIC_CHALLENGE messages — Tier 2 semantic liveness (§8.9). MUST be greater than `heartbeat_interval_ms`. Tier 2 checks are expensive (require state hash computation against a challenge) and run much less frequently than Tier 1 pings. Default: 300000 (5 minutes). If omitted, no protocol-level semantic liveness checking is active. |
 | heartbeat_timeout_count | integer | No | Number of consecutive missed Tier 1 HEARTBEAT_PONG responses before declaring transport failure. Default: 3. Transport failure triggers the SESSION_RESUME path (§8.2). MUST be ≥ 1. |
-| session_expiry_ms | integer | No | Proposed session expiry timeout in milliseconds. If no HEARTBEAT is received within this window, the local agent transitions to EXPIRED (§4.2). MUST be greater than `heartbeat_interval_ms` — a value ≤ `heartbeat_interval_ms` guarantees immediate expiry. Typical values: 2–5× `heartbeat_interval_ms`. If omitted, session expiry depends on deployment-specific timeout or `session_ttl`. |
+| suspected_threshold_ms | integer | No | Proposed threshold in milliseconds before the session transitions from ACTIVE to SUSPECTED (§4.2.1). When `suspected_threshold_ms` elapses without a HEARTBEAT from the counterparty, the session enters SUSPECTED state — an intermediate liveness-ambiguity state where new task delegation is paused but in-flight work continues. MUST be greater than `heartbeat_interval_ms` and MUST be less than `session_expiry_ms`. Typical values: 2–3× `heartbeat_interval_ms`. If omitted, no SUSPECTED state is used — the session transitions directly from ACTIVE to EXPIRED when `session_expiry_ms` elapses (legacy binary behavior). |
+| session_expiry_ms | integer | No | Proposed session expiry timeout in milliseconds. If no HEARTBEAT is received within this window, the local agent transitions to EXPIRED (§4.2) — or from SUSPECTED to EXPIRED if `suspected_threshold_ms` is configured (§4.2.1). MUST be greater than `heartbeat_interval_ms` — a value ≤ `heartbeat_interval_ms` guarantees immediate expiry. When `suspected_threshold_ms` is configured, MUST also be greater than `suspected_threshold_ms`. Typical values: 2–5× `heartbeat_interval_ms`. If omitted, session expiry depends on deployment-specific timeout or `session_ttl`. |
 | session_ttl | ISO 8601 duration | No | Proposed session time-to-live. After expiry, the session transitions to CLOSED unless renewed. If omitted, session has no protocol-level TTL (deployment-specific timeout applies). `session_ttl` bounds the session's total duration; `session_expiry_ms` bounds the liveness gap — they are orthogonal. |
 | lease_epoch | integer | No | Monotonically increasing epoch counter for lease-based session management (see §4.5.2). Initial value MUST be 0. |
 | manifest_digest | string | No | Merkle root over the coordinator's capability set: each leaf is `SHA-256(cap_id ‖ impl_hash ‖ policy_hash)`. Enables 0-RTT capability intersection (§5.9). |
@@ -605,6 +658,7 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | heartbeat_interval_ms | integer | No | Accepted or counter-proposed heartbeat interval. If the worker counter-proposes, the effective interval is the **maximum** of both proposals (slower rate wins — neither side should be forced to heartbeat faster than it can sustain). |
 | semantic_check_interval_ms | integer | No | Accepted or counter-proposed semantic check interval. If the worker counter-proposes, the effective interval is the **maximum** of both proposals (less frequent wins). |
 | heartbeat_timeout_count | integer | No | Accepted or counter-proposed timeout count. If the worker counter-proposes, the effective value is the **maximum** of both proposals (more permissive threshold wins). |
+| suspected_threshold_ms | integer | No | Accepted or counter-proposed SUSPECTED threshold. If the worker counter-proposes, the effective value is the **maximum** of both proposals (more permissive threshold wins — neither side should enter SUSPECTED faster than it can tolerate). If omitted by both sides, no SUSPECTED state is used for this session. |
 | session_expiry_ms | integer | No | Accepted or counter-proposed session expiry timeout. If the worker counter-proposes, the effective value is the **maximum** of both proposals (more permissive timeout wins). |
 | session_ttl | ISO 8601 duration | No | Accepted or counter-proposed session TTL. |
 | lease_epoch | integer | No | Echoed from SESSION_INIT (confirms epoch synchronization). |
@@ -635,7 +689,8 @@ keepalive:
 heartbeat_interval_ms: 5000
 semantic_check_interval_ms: 300000
 heartbeat_timeout_count: 3
-session_expiry_ms: 15000
+suspected_threshold_ms: 10000
+session_expiry_ms: 25000
 session_ttl: "PT4H"
 lease_epoch: 0
 manifest_digest: "a1b2c3d4e5f6..."
@@ -1068,7 +1123,7 @@ peer_session_ids: []
 | §2 Agent Identity | SESSION_INIT carries identity objects (§2.2). SESSION_RESUME requires identity re-verification (§2.3.3). Identity revocation (§2.3.4) triggers session CLOSED. | §2 → §4 |
 | §3 Agent Discovery | Discovery (§3) provides the candidate set from which the coordinator selects a worker. Discovery completes before SESSION_INIT. The AGENT_MANIFEST endpoint (§3.1) is the SESSION_INIT target. | §3 → §4 |
 | §5 Role Negotiation | CAPABILITY_MANIFEST exchange (§5.9) happens within the NEGOTIATING state. Session establishment flow (§5.9) is the NEGOTIATING → ACTIVE transition. Session expiry auto-revokes all active delegation tokens for that session (§5.10). | §4 ↔ §5 |
-| §6 Task Delegation | Task delegation (§6.6) is only valid in the ACTIVE state. TASK_CHECKPOINT (§6.6) is the mechanism for externalizing task state before SUSPENDED or COMPACTED transitions. Session EXPIRED (§4.2) triggers mandatory TASK_CANCEL (§6.6) for all in-flight subtasks — prevents phantom completions. Partial result recovery after expiry uses SESSION_RESUME with `recovery_reason: timeout` (§4.8, §4.8.1). MANIFEST canonicalization (§4.10) defines the canonical type registry and serialization rules used by task hash computation (§6.4). | §4 ↔ §6 |
+| §6 Task Delegation | Task delegation (§6.6) is only valid in the ACTIVE state — SUSPECTED (§4.2.1) pauses new delegation while buffering in-flight work. TASK_CHECKPOINT (§6.6) is the mechanism for externalizing task state before SUSPENDED or COMPACTED transitions. Session EXPIRED (§4.2) triggers mandatory TASK_CANCEL (§6.6) for all in-flight subtasks — prevents phantom completions. Partial result recovery after expiry uses SESSION_RESUME with `recovery_reason: timeout` (§4.8, §4.8.1). MANIFEST canonicalization (§4.10) defines the canonical type registry and serialization rules used by task hash computation (§6.4). | §4 ↔ §6 |
 | §8 Error Handling | Zombie detection (§8.1) maps to the COMPACTED and hard-zombie scenarios in §4.7.7. Detection primitives (§8.2) are the signals consumed by the external monitoring architecture (§4.7). SESSION_RESUME (§8.2) is formalized in §4.8; unified recovery semantics (§4.8.1) ensure crash, timeout, and manual recovery all use the same state-hash negotiation. Coordinator compaction gap (§8.5) is a concrete instance of §4.6's compaction obligation. | §4 ↔ §8 |
 | §10 Versioning | SESSION_INIT carries protocol_version and schema_version (§10.2). Version mismatch terminates the session at the NEGOTIATING → CLOSED transition (§10.4). Forward compatibility obligations (§10.5) apply from the first message. | §4 ↔ §10 |
 
@@ -1082,7 +1137,7 @@ The following are explicitly identified as unresolved for V1:
 
 3. **Verifier failure mode.** If the external verifier itself becomes unavailable, agents lose their zombie detection capability. Should agents halt (safe but disruptive) or continue without verification (available but unmonitored)? This mirrors the session registry tradeoff identified in §8.4.
 
-4. **Heartbeat semantics under load.** A late heartbeat and a missing heartbeat are operationally different but look identical to the verifier at the detection threshold boundary. §4.5.3 defines HEARTBEAT with `session_expiry_ms` as the hard boundary — if no HEARTBEAT arrives within that window, the session enters EXPIRED regardless of cause. The protocol intentionally does not distinguish "slow" from "dead" at the expiry boundary: the local agent cannot know why heartbeats stopped, and waiting longer to find out delays the TASK_CANCEL obligation (§6.6). Deployments that need to distinguish slow from dead SHOULD set `session_expiry_ms` conservatively (3–5× `heartbeat_interval_ms`) and use external monitoring (§4.7) for finer-grained diagnosis.
+4. **Heartbeat semantics under load.** A late heartbeat and a missing heartbeat are operationally different but look identical to the verifier at the detection threshold boundary. The SUSPECTED state (§4.2.1) partially addresses this: sessions that negotiate `suspected_threshold_ms` distinguish "possibly slow" (SUSPECTED) from "probably dead" (EXPIRED), with work-buffering during the uncertainty window. However, the fundamental ambiguity remains at the SUSPECTED→EXPIRED boundary — an agent in SUSPECTED cannot know whether the counterparty is slow or dead, only that the uncertainty window has not yet elapsed. Deployments that need finer-grained diagnosis beyond what SUSPECTED provides SHOULD use external monitoring (§4.7).
 
 5. **Multi-agent session lifecycle.** V1 defines bilateral sessions. Multi-agent sessions (N > 2 participants) require session-level consensus on state transitions — a single agent cannot unilaterally SUSPEND an N-party session. The session state machine (§4.2) would need to be extended with quorum-based transitions. Deferred to V2.
 
@@ -2553,8 +2608,11 @@ The two tiers integrate with existing §8 error handling as follows:
 
 | Failure tier | Detection signal | Recovery path | Zombie type (§4.7.7) |
 |-------------|-----------------|---------------|----------------------|
-| Tier 1 — Transport | `heartbeat_timeout_count` consecutive missed HEARTBEAT_PONG | SESSION_RESUME with `recovery_reason: timeout` (§4.8.1) → EXPIRED → TASK_CANCEL for in-flight subtasks | Hard zombie |
+| Tier 1 — Transport (SUSPECTED) | `suspected_threshold_ms` elapsed without HEARTBEAT_PONG (§4.2.1) | ACTIVE → SUSPECTED. Buffer work, pause new delegation. Resume on heartbeat receipt. | Not yet determined — liveness ambiguous |
+| Tier 1 — Transport (EXPIRED) | `session_expiry_ms` elapsed without HEARTBEAT_PONG (or `heartbeat_timeout_count` consecutive missed pongs) | SUSPECTED → EXPIRED (or ACTIVE → EXPIRED if no SUSPECTED configured). SESSION_RESUME with `recovery_reason: timeout` (§4.8.1) → TASK_CANCEL for in-flight subtasks | Hard zombie |
 | Tier 2 — Semantic | SEMANTIC_CHALLENGE hash mismatch or timeout | ZOMBIE_DECLARED → TEARDOWN or REASSIGN | Soft zombie (context compaction zombie) |
+
+**SUSPECTED as Tier 1 intermediate state.** When `suspected_threshold_ms` is negotiated, Tier 1 transport failure detection is graduated: the session transitions ACTIVE → SUSPECTED → EXPIRED rather than directly ACTIVE → EXPIRED. This avoids premature teardown for transient network issues while preserving the hard EXPIRED boundary for genuine failures. Sessions that do not negotiate `suspected_threshold_ms` retain the direct ACTIVE → EXPIRED behavior.
 
 **Tier 1 failure does not imply Tier 2 failure.** A transport failure (agent unreachable) says nothing about whether the agent's context was coherent before the failure. On successful SESSION_RESUME, the coordinator SHOULD issue an immediate SEMANTIC_CHALLENGE to verify that the resumed agent's context is still valid.
 
