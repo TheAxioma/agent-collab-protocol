@@ -1553,6 +1553,7 @@ Optionally sent by the delegatee during execution. Serves as both a progress upd
 | progress | object | No | Structured progress data (percentage, subtask status, etc.) |
 | timestamp | ISO 8601 | Yes | When this progress report was generated |
 | version_chain_summary | object | No | Summary of the protocol version chain across downstream hops known at the time of this progress report (see §6.9.1). Present when the delegatee has sub-delegated and has received version chain information from downstream. |
+| delegation_chain | array of strings | No | Ordered list of agent identifiers representing every agent that handled or forwarded the task, in execution order (see §6.9.2). Present when the task involves sub-delegation. |
 
 TASK_PROGRESS is optional — the protocol does not require progress reporting for task completion. However, implementations that set `timeout_seconds` (§6.1) SHOULD use TASK_PROGRESS as a liveness signal to distinguish a working agent from a zombied one (§8.1). The absence of TASK_PROGRESS within the expected heartbeat interval is an input to the external verifier (§4.7.2), not a definitive failure signal.
 
@@ -1569,6 +1570,7 @@ Sent by the delegatee when the task finishes successfully.
 | completed_at | ISO 8601 | Yes | Timestamp of completion |
 | version_chain_summary | object | No | Summary of the protocol version chain across all hops that contributed to this result (see §6.9.1). Present when the task involved sub-delegation. |
 | divergence_log | array | No | Array of divergence entries recording each point where execution departed from the committed plan (see §7.8). Present when `trace_hash` differs from the committed plan hash (L2, §7.4). |
+| delegation_chain | array of strings | No | Ordered list of agent identifiers representing every agent that handled or forwarded the task, in execution order (see §6.9.2). Present when the task involved sub-delegation. |
 
 The delegating agent SHOULD verify that `result` conforms to `expected_output_format` from the original TASK_ASSIGN. Non-conforming results are not a protocol error — the delegating agent decides whether to accept, reject, or request rework.
 
@@ -1586,6 +1588,7 @@ Sent by the delegatee when the task cannot be completed.
 | failed_at | ISO 8601 | Yes | Timestamp of failure |
 | version_chain_summary | object | No | Summary of the protocol version chain across downstream hops (see §6.9.1). Present when the task involved sub-delegation, even on failure — enables the originating agent to assess whether version degradation contributed to the failure. |
 | divergence_log | array | No | Array of divergence entries recording plan departures that occurred before failure (see §7.8). Present when any execution occurred before failure and the execution diverged from the committed plan. |
+| delegation_chain | array of strings | No | Ordered list of agent identifiers representing every agent that handled or forwarded the task, in execution order (see §6.9.2). Present when the task involved sub-delegation, even on failure — enables post-hoc audit of which agents were involved before the failure occurred. |
 
 TASK_FAIL with `partial_results` is preferred over TASK_FAIL without — even incomplete output may be useful for recovery or reassignment. The delegating agent owns the recovery decision (see §6.10).
 
@@ -1797,6 +1800,56 @@ version_chain_summary:
 **Propagation of `version_chain_summary`:**
 
 Each agent in the delegation chain constructs a `version_chain_summary` from the `protocol_version_chain` it received plus any summaries returned by its own delegatees. When an intermediate agent (e.g., B) receives a TASK_COMPLETE from its delegatee (e.g., C) containing a `version_chain_summary`, B merges C's chain information with its own hop entry and forwards the combined summary upstream in its own TASK_COMPLETE to A. This ensures the originating agent receives the full chain without direct visibility into intermediate sessions.
+
+### 6.9.2 Delegation Chain Visibility
+
+The `delegation_chain` field in TASK_COMPLETE, TASK_FAIL, and TASK_PROGRESS provides post-hoc visibility into which agents handled a task during execution. While `protocol_version_chain` (§6.9.1) travels forward with TASK_ASSIGN and records version negotiation at each hop, `delegation_chain` travels backward with result messages and records the identity of every agent that touched the task in execution order.
+
+**Semantics:**
+
+- `delegation_chain` is an ordered array of agent identifier strings (§2 identity artifacts). Each entry is the stable identity of an agent that handled or forwarded the task.
+- The chain is **append-only**: each agent in the delegation path appends its own identifier before returning a result (TASK_COMPLETE or TASK_FAIL) or forwarding a progress report (TASK_PROGRESS) upstream. The executing agent (leaf of the delegation tree) appends first; each intermediate agent appends its own identifier as it propagates the result upward.
+- Intermediate agents MUST NOT modify entries appended by downstream agents. An agent that receives a result with a `delegation_chain` containing entries it did not write MUST forward them unmodified, appending only its own identifier.
+
+**SHOULD, not MUST.** The `delegation_chain` field is a SHOULD requirement for agents operating in multi-hop delegation contexts. Agents that omit `delegation_chain` remain V1-compliant — the field is optional to reduce implementation burden for agents that do not participate in delegation chains or do not require post-hoc audit of the delegation path. However, agents operating in multi-hop contexts are strongly encouraged to implement it: without `delegation_chain`, the originating agent has no structured record of which agents were involved in producing the result.
+
+**Purpose — post-hoc audit, not pre-flight verification.** The `delegation_chain` is an audit trail: it records who handled the task after execution, not who will handle the task before execution. It does not influence routing, capability negotiation, or trust decisions. Its value is in post-hoc analysis — understanding which agents contributed to a result, diagnosing failures across delegation chains, and attributing execution to specific agents for trust accounting.
+
+**Relationship to §7.8 `divergence_log`.** The `divergence_log` (§7.8) records _what_ deviated from the plan during execution. The `delegation_chain` records _who_ handled the task. These are complementary: when a divergence occurs in a multi-hop delegation, `divergence_log` explains the nature of the deviation while `delegation_chain` identifies which agents were in the execution path. Together, they answer both "what went wrong?" and "who was involved?"
+
+**Relationship to §9 trust boundaries.** Agents operating at translation boundaries (§9.3, §7.9) — those that transform task semantics rather than merely routing — SHOULD include themselves in `delegation_chain`. This is particularly important because translation boundaries are the highest-risk surface in the protocol (§9.3): knowing which agents acted as translators in a delegation chain is essential for post-hoc assessment of whether translation fidelity (§7.9.3) was maintained across the chain.
+
+**Chain construction:**
+
+```
+A assigns to B (delegation_depth: 0)
+  B assigns to C (delegation_depth: 1)
+    C executes the task
+    C returns TASK_COMPLETE with delegation_chain: ["agent-C"]
+  B receives result, appends its own identity
+  B returns TASK_COMPLETE with delegation_chain: ["agent-C", "agent-B"]
+A receives result — delegation_chain shows the full execution path
+```
+
+**Example TASK_COMPLETE with `delegation_chain`:**
+
+A 3-hop delegation where agent A delegates to agent B, B delegates to agent C, and C executes:
+
+```yaml
+message_type: TASK_COMPLETE
+task_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+session_id: "session-A-B-001"
+result:
+  summary: "Analysis complete"
+  output_uri: "https://results.example.com/f47ac10b"
+trace_hash: "sha256:a1b2c3d4e5f6..."
+completed_at: "2026-02-27T14:30:00Z"
+delegation_chain:
+  - "agent-C"
+  - "agent-B"
+```
+
+> **Note:** The originating agent (A) does not appear in `delegation_chain` — it is the consumer of the result, not a handler of the task. The chain records agents that handled or forwarded the task during execution, starting from the leaf executor.
 
 ### 6.10 Failure Handling
 
