@@ -130,32 +130,53 @@ The following are explicitly identified as unresolved gaps in v0.1:
 
 ## 5. Role Negotiation
 
-Capability declaration ('I can do X') and trust level ('I am permitted to do X in this context') are distinct axes. Collapsing them creates a privilege escalation surface where broad capability announcements get implicitly trusted for all declared capabilities. Capability gates possibility; trust gates permission. Every mechanism in this section maintains this separation.
+This section governs two distinct primitives that prior drafts conflated:
 
-An agent that advertises code execution, web search, and file system access as capabilities does not thereby gain permission to use all three in every context. A delegator granting a task may authorize only web search for that subtask — even though the delegatee is capable of more. The eligible task types for any delegation are the intersection of declared capability AND granted trust level.
+1. **Capability manifest** (agent-side). What an agent can do. Stable, declared once at session establishment, independent of any specific task. An agent's capability manifest does not change because a new task arrives — it changes only when the agent's actual capabilities change.
 
-### 5.1 CAPABILITY_MANIFEST
+2. **Task requirements** (task-side). What a specific task actually needs. Dynamic, fully known only at delegation time or discovered during execution. Task requirements are properties of the work, not of the worker.
 
-At session establishment — before any task assignment — each agent declares its capabilities via a CAPABILITY_MANIFEST message.
+Conflating them forces either over-specification upfront (the delegator must enumerate every capability the task might need before execution begins — fragile for exploratory tasks) or mid-delegation mismatches (the delegatee discovers it lacks a required capability after accepting the task, with no protocol-level mechanism to resolve the gap).
+
+The separation is enforced structurally: §5.1 defines the agent-side manifest; §5.2 defines the task-side requirements; §5.3 defines the privilege model that governs their interaction.
+
+### 5.1 Capability Manifest (Agent-Side)
+
+At session establishment — before any task assignment — each agent declares its capabilities via a CAPABILITY_MANIFEST message. This is a mandatory §5 primitive: agents that do not declare a manifest MUST NOT participate in task delegation.
 
 **Required fields:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | agent_id | string | Yes | Identity of the declaring agent |
-| capability_list | array | Yes | List of capability identifiers the agent claims to support (see §5.1.1) |
+| capability_types | array | Yes | List of capability type entries the agent claims to support (see §5.1.1) |
+| resource_access_bounds | object | Yes | Self-declared resource access limits (see below) |
+| supported_message_types | array | Yes | Protocol message types this agent can send and receive (e.g. `TASK_ASSIGN`, `TASK_ACCEPT`, `TASK_PROGRESS`, `CAPABILITY_REQUEST`) |
 | version | semver | Yes | Schema version of the manifest format |
 | signature | bytes | Yes | Cryptographic signature over the manifest fields, bound to agent_id |
 
-**Capability list entries:**
+**Capability type entries:**
 
-Each entry in `capability_list` is a structured object:
+Each entry in `capability_types` is a structured object:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | capability_id | string | Yes | Unique identifier for the capability (reverse-DNS recommended, e.g. `com.example.capabilities/code-execution`) |
 | version | semver | Yes | Version of the capability implementation |
 | constraints | object | No | Self-declared limits (e.g. max input size, supported formats, resource ceilings) |
+
+**Resource access bounds:**
+
+The `resource_access_bounds` object declares the outer envelope of resources the agent can access. This is an agent-level declaration — not a per-task authorization.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| network | object | No | Network access bounds (e.g. `{"allowed_domains": ["*.example.com"], "protocols": ["https"]}`) |
+| filesystem | object | No | Filesystem access bounds (e.g. `{"read_paths": ["/data/**"], "write_paths": ["/tmp/**"]}`) |
+| compute | object | No | Compute bounds (e.g. `{"max_memory_mb": 4096, "max_cpu_seconds": 300}`) |
+| custom | object | No | Deployment-specific resource bounds not covered by the standard fields |
+
+Resource access bounds are declarative ceilings, not entitlements. An agent declaring `max_memory_mb: 4096` does not receive 4 GB of memory — it declares that it will not attempt to use more than 4 GB. Actual resource authorization is governed by the delegation token (§5.5) and task requirements (§5.2).
 
 CAPABILITY_MANIFEST is a declaration, not an authorization. Receiving a manifest tells the delegator what the agent claims it can do — not what it is permitted to do. Trust level assignment happens at delegation time via TASK_ASSIGN (§6.6).
 
@@ -165,7 +186,61 @@ A CAPABILITY_MANIFEST signature MUST be verifiable against the agent's declared 
 
 The protocol does not specify how capability claims are independently verified (e.g., through testing, certification, or reputation). Capability claims are self-reported; trust in those claims is a deployment decision. What the protocol does guarantee: the manifest is cryptographically bound to the agent's identity, so a capability claim cannot be repudiated or attributed to a different agent after the fact.
 
-### 5.2 Delegation Token
+### 5.2 Task Requirements (Task-Side)
+
+Task requirements specify what a specific task actually needs — the capabilities, resources, and message types required for execution. Task requirements are properties of the work, not of the worker. They are constructed by the delegator at delegation time and carried within TASK_ASSIGN (§6.6).
+
+**Required fields (within TASK_ASSIGN):**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| required_capabilities | array | Yes | Capability_ids the task requires for execution. Each entry MUST correspond to a capability_id from the standard capability type namespace (§5.1). |
+| required_resources | object | No | Resource requirements for this specific task (e.g. `{"min_memory_mb": 512, "network": true}`). MUST be within the delegatee's declared `resource_access_bounds`. |
+| required_message_types | array | No | Message types the task lifecycle will use beyond the mandatory set. Enables the delegatee to verify it supports the expected interaction pattern before accepting. |
+
+**Relationship to capability manifest:** Task requirements are matched against the delegatee's CAPABILITY_MANIFEST at delegation time. The delegator SHOULD verify that the candidate delegatee's manifest covers the task requirements before sending TASK_ASSIGN. The delegatee MUST verify this independently before sending TASK_ACCEPT (§5.6).
+
+**Relationship to delegation token:** Task requirements specify what the task needs; the delegation token (§5.5) specifies what the delegatee is authorized to use. `required_capabilities` identifies necessary capabilities; `delegation_token.allowed_capabilities` authorizes a (potentially broader) set. A task requirement that is not covered by the delegation token's `allowed_capabilities` is a configuration error on the delegator's side — the delegatee MUST reject such a task.
+
+**Why separate from capability manifest:** A capability manifest is stable across tasks within a session. Task requirements vary per task. An agent capable of code execution, web search, and file system access (manifest) may receive a task that only requires web search (task requirement). The manifest does not change; the requirements do. Keeping them separate prevents the failure mode where a delegator must predict all possible task requirements at session establishment and encode them into the manifest exchange.
+
+### 5.3 Privilege Model
+
+Three axes govern whether an agent may perform a specific operation for a specific task. All three are independent; collapsing any two creates a privilege escalation surface.
+
+**Capability gates possibility.** Can the agent do X at all? This is answered by the agent's CAPABILITY_MANIFEST (§5.1). An agent that does not declare `code-execution` in its manifest cannot execute code, regardless of trust level or role assignment. Capability is an intrinsic property of the agent, not granted by the protocol.
+
+**Trust gates permission.** Is the agent authorized to do X in this context? This is answered by the `trust_level` in TASK_ASSIGN (§6.6) and the `delegation_token` (§5.5). An agent that declares `code-execution` capability but receives a task with `trust_level=restricted` and no `code-execution` in `allowed_capabilities` MUST NOT execute code for that task — even though it is capable.
+
+**Role constrains eligible task types.** Given the intersection of declared capability and granted trust, what task types can the agent handle? Role is not a separate field — it is the computed intersection:
+
+```
+eligible_operations = declared_capabilities ∩ allowed_capabilities
+```
+
+An agent's role for a given task is the set of operations it is both capable of performing (manifest) and authorized to perform (delegation token). Operations outside this intersection are prohibited regardless of which axis would permit them individually.
+
+**Example:** Agent B declares capabilities `[code-execution, web-search, filesystem-access]` in its manifest. Delegator A assigns a task with `allowed_capabilities: [web-search]` and `trust_level: standard`. Agent B's role for this task is `{web-search}` — it MUST NOT use `code-execution` or `filesystem-access` even though it is capable of both. If the task requires `filesystem-access`, B MUST reject the task (§5.7) or request the additional capability via CAPABILITY_REQUEST (§5.8).
+
+### 5.4 Mismatch Handling
+
+When the privilege model (§5.3) identifies a mismatch — the task requires capabilities that fall outside the agent's eligible operations — the delegatee MUST send TASK_REJECT with `reason=role_mismatch`.
+
+**Defined mismatch reasons:**
+
+| Reason | Condition |
+|--------|-----------|
+| `role_mismatch:capability` | Task requires a capability not in the agent's CAPABILITY_MANIFEST |
+| `role_mismatch:trust` | Granted trust level does not permit required operations |
+| `role_mismatch:depth` | Delegation depth limit exceeded and agent cannot execute directly |
+| `role_mismatch:resource` | Task resource requirements exceed agent's declared resource access bounds |
+| `role_mismatch:message_type` | Task requires message types the agent does not support |
+
+The rejection message SHOULD include the specific mismatch reason to aid the delegator's reassignment decision.
+
+**No ROLE_QUERY/ROLE_OFFER sub-protocol.** The protocol does not define a pre-assignment negotiation mechanism where a delegator queries an agent's suitability before sending TASK_ASSIGN. This is a deliberate omission: the delegator already has the agent's CAPABILITY_MANIFEST from session establishment (§5.1) and can perform the capability check locally before sending TASK_ASSIGN. A ROLE_QUERY/ROLE_OFFER sub-protocol adds round-trip latency for an edge case — when the delegator's cached manifest is stale — that does not justify the spec complexity. The correct response to a stale manifest is TASK_REJECT followed by delegator reassignment, not a pre-negotiation protocol. §6 implies capability check before TASK_ASSIGN as a delegator-side optimization, not a protocol requirement.
+
+### 5.5 Delegation Token
 
 The `delegation_token` field in TASK_ASSIGN (§6.6) carries the authorization context for role negotiation. It encodes who authorized the delegation, what capabilities are permitted, and the chain of custody from root delegator to current delegatee.
 
@@ -191,67 +266,88 @@ The `delegation_token` field in TASK_ASSIGN (§6.6) carries the authorization co
 
 **Relationship to TASK_ASSIGN (§6.6):** The `delegation_token` is carried within the TASK_ASSIGN message. The `trust_level` field in TASK_ASSIGN and the trust information in `delegation_token.chain` are complementary — `trust_level` is the direct grant for this delegation; `chain` provides the full provenance for audit and verification.
 
-### 5.3 Capability Attestation Before TASK_ACCEPT
+**Relationship to task requirements (§5.2):** The delegation token authorizes capabilities (`allowed_capabilities`); task requirements specify needed capabilities (`required_capabilities`). `required_capabilities` MUST be a subset of `allowed_capabilities`. If a task requires a capability that the delegation token does not authorize, the delegatee MUST reject the task — even if the agent possesses the capability (§5.3 privilege model).
 
-Before sending TASK_ACCEPT (§6.6), the delegatee MUST perform three verification checks:
+### 5.6 Capability Attestation Before TASK_ACCEPT
 
-1. **Capability check.** The delegatee verifies that it has all capabilities listed in `delegation_token.allowed_capabilities`. This is a self-check against the agent's own CAPABILITY_MANIFEST.
+Before sending TASK_ACCEPT (§6.6), the delegatee MUST perform four verification checks:
+
+1. **Capability check.** The delegatee verifies that it has all capabilities listed in the task's `required_capabilities` (§5.2) and that those capabilities are authorized by `delegation_token.allowed_capabilities`. This is a self-check against the agent's own CAPABILITY_MANIFEST.
 
 2. **Trust check.** The delegatee verifies that the granted `trust_level` permits the operations required by the task specification. If the task requires operations that the granted trust level does not cover, the delegatee MUST NOT accept.
 
 3. **Depth check.** The delegatee verifies that `delegation_token.depth` has not exceeded the configurable maximum delegation depth (v1 default: 3, see §6.9). If the delegatee would need to further delegate and doing so would exceed the depth limit, it MUST NOT accept unless it can execute the task directly.
 
-If any check fails, the delegatee MUST send TASK_REJECT with `reason=role_mismatch`. The rejection message SHOULD indicate which check failed (capability, trust, or depth) to aid the delegator's reassignment decision.
+4. **Resource check.** The delegatee verifies that the task's `required_resources` (§5.2) fall within its declared `resource_access_bounds` (§5.1). A task requiring 8 GB of memory from an agent that declared a 4 GB ceiling MUST be rejected.
+
+If any check fails, the delegatee MUST send TASK_REJECT with `reason=role_mismatch` and the appropriate sub-reason (§5.4). The rejection message SHOULD indicate which check failed (capability, trust, depth, or resource) to aid the delegator's reassignment decision.
 
 **Attestation sequence:**
 
 ```
 Delegator                              Delegatee
     |                                      |
-    |  TASK_ASSIGN (with delegation_token) |
+    |  TASK_ASSIGN (with delegation_token  |
+    |    and task requirements)            |
     |------------------------------------->|
-    |                                      | 1. Check: do I have all allowed_capabilities?
-    |                                      | 2. Check: does trust_level permit required operations?
-    |                                      | 3. Check: is delegation depth within limit?
+    |                                      | 1. Check: do I have all required_capabilities?
+    |                                      | 2. Check: are required_capabilities ⊆ allowed_capabilities?
+    |                                      | 3. Check: does trust_level permit required operations?
+    |                                      | 4. Check: is delegation depth within limit?
+    |                                      | 5. Check: are required_resources within my bounds?
     |                                      |
     |  TASK_ACCEPT or TASK_REJECT          |
     |<-------------------------------------|
 ```
 
-The delegatee MUST NOT begin execution before completing all three checks and sending TASK_ACCEPT. Execution before acceptance is a protocol violation — work performed without confirmed authorization is not attributable within the trust chain.
+The delegatee MUST NOT begin execution before completing all checks and sending TASK_ACCEPT. Execution before acceptance is a protocol violation — work performed without confirmed authorization is not attributable within the trust chain.
 
-### 5.4 Dynamic Capabilities
+### 5.7 Mismatch Handling at Attestation Time
 
-Capability requirements may emerge from execution rather than planning. A delegatee executing a data analysis task may discover mid-execution that the data requires a parsing capability not declared in the original manifest or authorized in the delegation token. Requiring all capability needs to be known upfront penalizes exploratory tasks.
+When any attestation check (§5.6) fails, the delegatee sends TASK_REJECT with a structured reason. This is the only protocol-defined mechanism for handling mismatches at delegation time. See §5.4 for the full set of mismatch reasons.
 
-**CAPABILITY_REFRESH message:**
+The delegator receives the rejection and MAY:
+- Reassign the task to a different agent whose manifest covers the requirements
+- Adjust the task requirements to match the available agent pool
+- Adjust the delegation token's `allowed_capabilities` and retry
+
+The protocol does not define retry semantics for rejected TASK_ASSIGN messages — the delegator simply sends a new TASK_ASSIGN (which may be to the same or a different agent).
+
+### 5.8 Dynamic Capability Discovery (CAPABILITY_REQUEST)
+
+Task requirements (§5.2) may not be fully known at delegation time. A delegatee executing a data analysis task may discover mid-execution that the data requires a parsing capability not listed in the original task requirements or authorized in the delegation token. Requiring all task requirements to be known upfront penalizes exploratory tasks.
+
+CAPABILITY_REQUEST is the protocol mechanism for mid-task dynamic capability discovery. It is task-side — the request originates from a specific task's execution discovering a new requirement, not from the agent's capabilities changing.
+
+**CAPABILITY_REQUEST message:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | task_id | UUID v4 | Yes | The active task requiring the new capability |
 | session_id | string | Yes | Active session identifier |
 | agent_id | string | Yes | Identity of the requesting agent |
-| requested_capabilities | array | Yes | Capability_ids the agent needs but does not currently have authorized |
+| requested_capabilities | array | Yes | Capability_ids the task needs but the agent does not currently have authorized for this task |
 | justification | string | Yes | Why the capability is needed — the delegator uses this to evaluate the request |
 | timestamp | ISO 8601 | Yes | When the request was generated |
 
-**CAPABILITY_REFRESH response:**
+**CAPABILITY_REQUEST response:**
 
 The delegator responds with one of:
 
 | Response | Meaning |
 |----------|---------|
-| CAPABILITY_REFRESH_APPROVED | The delegator authorizes the requested capabilities. A new `delegation_token` with updated `allowed_capabilities` is issued. |
-| CAPABILITY_REFRESH_DENIED | The delegator denies the request. The delegatee MUST continue without the requested capability or send TASK_FAIL if the task cannot be completed. |
+| CAPABILITY_REQUEST_APPROVED | The delegator authorizes the requested capabilities. A new `delegation_token` with updated `allowed_capabilities` is issued. The task's effective `required_capabilities` are updated to include the newly authorized capabilities. |
+| CAPABILITY_REQUEST_DENIED | The delegator denies the request. The delegatee MUST continue without the requested capability or send TASK_FAIL if the task cannot be completed. |
 
 **Constraints:**
 
-1. The delegatee MUST NOT use a requested capability before receiving CAPABILITY_REFRESH_APPROVED. Using an unauthorized capability — even one the agent is technically capable of — is a trust violation.
-2. The delegator can only approve capabilities that it itself holds. The no-privilege-escalation rule (§5.2, §6.8) applies: dynamic capability grants cannot exceed the delegator's own authorization.
-3. CAPABILITY_REFRESH does not replace upfront declaration. Manifest-first at session establishment (§5.1) remains the default. CAPABILITY_REFRESH handles the gap between what was foreseeable at planning time and what is needed at execution time.
-4. In delegation chains, CAPABILITY_REFRESH may need to propagate upward. If B needs a capability that A did not authorize, and A does not hold that capability either, A must request it from its own delegator before approving B's request. Each hop in the chain applies its own trust check.
+1. The delegatee MUST NOT use a requested capability before receiving CAPABILITY_REQUEST_APPROVED. Using an unauthorized capability — even one the agent is technically capable of — is a trust violation (§5.3 privilege model: capability without trust authorization is prohibited).
+2. The delegator can only approve capabilities that it itself holds. The no-privilege-escalation rule (§5.5, §6.8) applies: dynamic capability grants cannot exceed the delegator's own authorization.
+3. CAPABILITY_REQUEST does not replace upfront declaration. Manifest-first at session establishment (§5.1) and task requirements at delegation time (§5.2) remain the defaults. CAPABILITY_REQUEST handles the gap between what was foreseeable at planning time and what is needed at execution time.
+4. In delegation chains, CAPABILITY_REQUEST may need to propagate upward. If B needs a capability that A did not authorize, and A does not hold that capability either, A must request it from its own delegator before approving B's request. Each hop in the chain applies its own trust check.
+5. CAPABILITY_REQUEST is a task-side operation. The agent's CAPABILITY_MANIFEST does not change — only the task's effective authorization (via updated delegation token) changes. This maintains the agent-side/task-side separation: the manifest declares what the agent can do; the delegation token authorizes what it may do for this task.
 
-### 5.5 Timing
+### 5.9 Timing
 
 Manifest-first at session establishment is the correct default. Deferring capability negotiation to task assignment time (lazy per-task negotiation) compounds round-trip latency in multi-hop delegation chains: each hop must negotiate capabilities before the next hop can begin, serializing what should be parallelizable.
 
@@ -269,38 +365,43 @@ Agent A                     Agent B
     |------------------------->|
     |                          |
     |  (Capabilities known;    |
-    |   task assignment can    |
-    |   proceed without        |
-    |   per-task negotiation)  |
+    |   task requirements      |
+    |   can be matched against |
+    |   manifests at           |
+    |   delegation time)       |
     |                          |
     |  TASK_ASSIGN             |
+    |  (with task requirements |
+    |   + delegation token)    |
     |------------------------->|
 ```
 
-CAPABILITY_MANIFEST exchange happens once per session. Task assignment references the already-known capabilities via `delegation_token.allowed_capabilities` — no additional round-trip is needed.
+CAPABILITY_MANIFEST exchange happens once per session. Task assignment carries task-specific requirements (§5.2) and references the already-known capabilities via `delegation_token.allowed_capabilities` — no additional capability negotiation round-trip is needed.
 
-Dynamic capabilities discovered during execution are handled via CAPABILITY_REFRESH (§5.4), not by deferring initial declaration.
+Dynamic capabilities discovered during execution are handled via CAPABILITY_REQUEST (§5.8), not by deferring initial declaration.
 
-### 5.6 Relationship to Other Sections
+### 5.10 Relationship to Other Sections
 
 - **§4 (External Verification Architecture).** Trust anchor requirements from §4.2 apply to delegation tokens. The `signature` field in the delegation token, and the chain of signatures across delegation hops, are verification artifacts. External verifiers (§4.2) MAY validate delegation token chains as part of runtime liveness verification — a token with an expired TTL or broken signature chain is evidence of anomalous state.
-- **§6 (Task Delegation).** TASK_ASSIGN (§6.6) carries the `delegation_token` defined in §5.2. The trust semantics in §6.8 and delegation chains in §6.9 operate on the authorization context established by role negotiation. §5 defines the authorization structure; §6 defines the delegation lifecycle that uses it.
-- **§8 (Session Lifecycle).** Session expiry auto-revokes all active delegation tokens for that session. When a session ends (§8.2 SESSION_RESUME mismatch leading to RESTART, or normal termination), all delegation tokens issued within that session become invalid. A delegatee that continues operating on an expired session's token is in violation — the external verifier (§4.2) SHOULD detect this via TTL expiry.
-- **§9 (Security Considerations).** Capability/trust collapse is the primary privilege escalation vector in multi-agent delegation chains. §9.2's trust topologies determine how trust levels are assigned; §5 ensures that those trust levels are carried explicitly in delegation tokens rather than inferred from capability declarations. The translation boundary risk (§9.3) applies to CAPABILITY_MANIFEST exchange across trust domains — a manifest attested in one domain does not carry attestation into another.
+- **§6 (Task Delegation).** TASK_ASSIGN (§6.6) carries the `delegation_token` defined in §5.5 and the task requirements defined in §5.2. The trust semantics in §6.8 and delegation chains in §6.9 operate on the authorization context established by role negotiation. §5 defines the authorization structure (capability manifest + task requirements + privilege model); §6 defines the delegation lifecycle that uses it.
+- **§8 (Session Lifecycle).** Session expiry auto-revokes all active delegation tokens for that session. When a session ends (§8.2 SESSION_RESUME mismatch leading to RESTART, or normal termination), all delegation tokens issued within that session become invalid. Capability manifests remain valid — they are agent-side declarations independent of any session. A delegatee that continues operating on an expired session's token is in violation — the external verifier (§4.2) SHOULD detect this via TTL expiry.
+- **§9 (Security Considerations).** Capability/trust collapse is the primary privilege escalation vector in multi-agent delegation chains. The privilege model (§5.3) prevents this collapse by maintaining the three-axis separation. §9.2's trust topologies determine how trust levels are assigned; §5 ensures that those trust levels are carried explicitly in delegation tokens rather than inferred from capability declarations. The translation boundary risk (§9.3) applies to CAPABILITY_MANIFEST exchange across trust domains — a manifest attested in one domain does not carry attestation into another.
 
-### 5.7 Open Questions
+### 5.11 Open Questions
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
 1. **Capability taxonomy.** The protocol uses opaque capability_id strings (§5.1). Should the protocol define a standard capability taxonomy (e.g., `execute/code`, `access/network`, `access/filesystem`) for interoperability, or is this purely deployment-specific? A standard taxonomy enables cross-deployment delegation but risks becoming a lowest-common-denominator that does not capture real capability differences.
 
-2. **Manifest freshness.** CAPABILITY_MANIFEST is exchanged at session establishment. If an agent's capabilities change during a long-running session (e.g., a plugin is loaded or unloaded), the manifest becomes stale. Should CAPABILITY_MANIFEST be re-sendable mid-session, or is CAPABILITY_REFRESH sufficient for this case? Re-sending the full manifest is simpler but redundant with CAPABILITY_REFRESH; CAPABILITY_REFRESH alone does not handle capability loss (only acquisition).
+2. **Manifest freshness.** CAPABILITY_MANIFEST is exchanged at session establishment. If an agent's capabilities change during a long-running session (e.g., a plugin is loaded or unloaded), the manifest becomes stale. Should CAPABILITY_MANIFEST be re-sendable mid-session, or is CAPABILITY_REQUEST (§5.8) sufficient for this case? CAPABILITY_REQUEST handles task-side discovery of new needs but does not handle agent-side capability loss — an agent that loses a capability mid-session has no protocol mechanism to retract it from the manifest.
 
-3. **Delegation token revocation propagation.** When a session expires and delegation tokens are revoked (§5.6), how is revocation propagated to delegatees in a multi-hop chain? The delegatee at depth 2 may not have a direct communication channel to the root delegator. Revocation must propagate through intermediaries, introducing latency and potential failure points.
+3. **Delegation token revocation propagation.** When a session expires and delegation tokens are revoked (§5.10), how is revocation propagated to delegatees in a multi-hop chain? The delegatee at depth 2 may not have a direct communication channel to the root delegator. Revocation must propagate through intermediaries, introducing latency and potential failure points.
 
 4. **Trust level granularity in allowed_capabilities.** The current design grants a single `trust_level` per delegation (§6.8). Should `allowed_capabilities` support per-capability trust levels? E.g., an agent might be trusted for `access/network` at `standard` but only `access/filesystem` at `restricted`. Per-capability trust increases expressiveness but also complexity and the surface for misconfiguration.
 
-> Community discussion: See [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15). Content derived from community synthesis — cass_agentsharp (capability/trust distinction, privilege escalation risk, manifest-first timing), vincent-vega (delegation token field specification, capability attestation before TASK_ACCEPT), PincersAndPurpose (dynamic capability emergence, CAPABILITY_REFRESH pattern).
+5. **Task requirement completeness.** Task requirements (§5.2) may be incomplete at delegation time for exploratory tasks. CAPABILITY_REQUEST (§5.8) handles discovery of new needs, but the protocol does not define how to estimate requirement completeness upfront. Should the task schema include a `requirement_completeness` signal (e.g., `complete`, `partial`, `unknown`) to set delegatee expectations about the likelihood of mid-task CAPABILITY_REQUEST messages?
+
+> Community discussion: See [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15), [issue #23](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/23). Architecture surfaced in discussion with @cass_agentsharp. Content derived from community synthesis — cass_agentsharp (capability/trust distinction, privilege escalation risk, manifest-first timing, capability-vs-task-requirement separation), vincent-vega (delegation token field specification, capability attestation before TASK_ACCEPT), PincersAndPurpose (dynamic capability emergence, CAPABILITY_REQUEST pattern). Implements #23.
 
 ## 6. Task Delegation
 
