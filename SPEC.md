@@ -1556,6 +1556,7 @@ Sent by the delegatee when the task finishes successfully.
 | trace_hash | SHA-256 | Yes | Post-execution hash of the actual execution trace (§6.2) |
 | completed_at | ISO 8601 | Yes | Timestamp of completion |
 | version_chain_summary | object | No | Summary of the protocol version chain across all hops that contributed to this result (see §6.9.1). Present when the task involved sub-delegation. |
+| divergence_log | array | No | Array of divergence entries recording each point where execution departed from the committed plan (see §7.8). Present when `trace_hash` differs from the committed plan hash (L2, §7.4). |
 
 The delegating agent SHOULD verify that `result` conforms to `expected_output_format` from the original TASK_ASSIGN. Non-conforming results are not a protocol error — the delegating agent decides whether to accept, reject, or request rework.
 
@@ -1572,6 +1573,7 @@ Sent by the delegatee when the task cannot be completed.
 | trace_hash | SHA-256 | No | Post-execution hash if any execution occurred before failure |
 | failed_at | ISO 8601 | Yes | Timestamp of failure |
 | version_chain_summary | object | No | Summary of the protocol version chain across downstream hops (see §6.9.1). Present when the task involved sub-delegation, even on failure — enables the originating agent to assess whether version degradation contributed to the failure. |
+| divergence_log | array | No | Array of divergence entries recording plan departures that occurred before failure (see §7.8). Present when any execution occurred before failure and the execution diverged from the committed plan. |
 
 TASK_FAIL with `partial_results` is preferred over TASK_FAIL without — even incomplete output may be useful for recovery or reassignment. The delegating agent owns the recovery decision (see §6.10).
 
@@ -1906,6 +1908,87 @@ The following are explicitly identified as unresolved gaps in v0.1:
 
 3. **Recovery semantics per divergence level.** L2 mismatch (plan divergence) and L3 mismatch (execution divergence) likely require different recovery strategies. Whether to specify these in the protocol or defer to implementation is undecided.
 
+4. **~~Structured divergence annotation.~~** Resolved (V1). When `trace_hash` (L3) differs from the committed plan hash (L2), the protocol lacked a structured mechanism for explaining _why_ divergence occurred. V1 uses a sidecar `divergence_log` approach (§7.8) — a lightweight inline array recording each plan departure event. Merkle-tree-based divergence annotation is deferred to V2 as an opt-in extension for agents requiring cryptographic audit trails.
+
+### 7.8 Divergence Annotation
+
+When an executing agent's actual execution diverges from its committed plan — detected as a mismatch between L2 (plan hash) and L3 (trace hash) — the protocol needs more than hash comparison to be actionable. Hash comparison detects _that_ divergence occurred; divergence annotation explains _why_.
+
+#### 7.8.1 Design Choice: Sidecar Log
+
+V1 uses a **sidecar annotation** approach rather than extending the merkle tree. A `divergence_log` is an array of structured entries recorded inline with the execution trace, capturing each point where execution departed from the committed plan.
+
+**Rationale:** The sidecar approach is lightweight, requires no shared state between agents, and survives partial execution (entries are appended as divergences occur, not computed post-hoc). A merkle-tree-based approach would provide cryptographic auditability but requires both sides to maintain synchronized tree structures — deferred to V2 as an opt-in extension for agents with cryptographic audit trail requirements.
+
+#### 7.8.2 Divergence Log Format
+
+The `divergence_log` is an array of divergence entry objects. Each entry records a single point where execution departed from the committed plan.
+
+**Divergence entry fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| step_id | string | Yes | Identifier of the execution step where divergence occurred. Corresponds to a step in the agent's execution plan (L2). |
+| deviation_type | enum | No (SHOULD) | Categorization of the divergence reason. See §7.8.3 for enum values. |
+| description | string | Yes | Human-readable explanation of what diverged and why. |
+| severity | enum | Yes | Impact level: `INFO`, `WARN`, or `ERROR`. See §7.8.4 for semantics. |
+| timestamp | ISO 8601 | Yes | When the divergence was detected. |
+
+**`deviation_type` SHOULD be populated.** Agents that omit `deviation_type` remain V1-compliant — the field is not required to reduce implementation burden for early adopters. However, agents that populate it provide significantly more value to receiving agents: structured categorization enables automated triage, aggregation across tasks, and pattern detection that free-text `description` alone cannot support.
+
+#### 7.8.3 Deviation Type Enum
+
+The `deviation_type` field, when populated, MUST use one of the following values:
+
+| Value | Description |
+|-------|-------------|
+| `RESOURCE_UNAVAILABLE` | A required resource (API, service, data source, compute capacity) was unavailable at execution time. |
+| `CONTEXT_SHIFT` | The execution context changed after plan commitment — new information, updated requirements, or environmental changes that invalidated the original plan. |
+| `CAPABILITY_MISMATCH` | The executing agent discovered during execution that it lacks a capability assumed in the plan. Distinct from pre-execution capability checking (§5). |
+| `OPTIMIZATION` | The agent found a more efficient execution path than the committed plan. The outcome is equivalent; the path differs. |
+| `TIMEOUT` | A step or sub-operation exceeded its time budget, forcing a different execution path. |
+| `EXTERNAL_CONSTRAINT` | An external constraint (rate limit, permission boundary, regulatory requirement) prevented plan-compliant execution. |
+| `OTHER` | None of the above categories apply. Agents SHOULD provide a detailed `description` when using `OTHER`. |
+
+Implementations MAY extend this enum with deployment-specific values prefixed by `x-` (e.g., `x-custom-reason`). Standard enum values MUST NOT be prefixed. Receiving agents that encounter an unrecognized `deviation_type` MUST treat it as `OTHER` — unknown types are not a protocol error.
+
+#### 7.8.4 Severity Levels
+
+| Severity | Meaning | Guidance for receiving agents |
+|----------|---------|-------------------------------|
+| `INFO` | The divergence is benign — execution achieved an equivalent or better outcome via a different path. Example: `OPTIMIZATION` that reduces latency without changing output. | Log for audit. No action required. |
+| `WARN` | The divergence may affect result quality or completeness. The task completed, but the result may not fully meet the original plan's expectations. Example: `RESOURCE_UNAVAILABLE` where a fallback was used. | Inspect result against `success_criteria` (§6.1). Consider re-execution if quality is insufficient. |
+| `ERROR` | The divergence materially affected the result. The task may have completed but the output is known to be degraded. Example: `CAPABILITY_MISMATCH` where a critical step was skipped. | Treat as potential task failure. Evaluate whether `partial_results` are usable. Consider TASK_FAIL semantics. |
+
+#### 7.8.5 When Divergence Log Entries MUST Be Created
+
+An executing agent MUST append an entry to `divergence_log` when:
+
+1. **An executed step differs from its planned counterpart.** The step was present in the committed plan (L2) but was executed differently — different inputs, different operations, different sub-delegation, or different output than planned.
+2. **A planned step is absent entirely.** A step present in the committed plan was skipped during execution. The entry SHOULD use `step_id` matching the skipped plan step and describe why the step was omitted.
+3. **An unplanned step was added.** A step not present in the committed plan was executed. The entry SHOULD use a `step_id` that identifies the inserted step and describe why it was necessary.
+
+Agents that do not implement plan commitment (§7.4) — and therefore have no L2 to compare against — are not required to produce `divergence_log` entries. The divergence log presupposes a committed plan baseline.
+
+#### 7.8.6 Consuming the Divergence Log
+
+Receiving agents SHOULD process `divergence_log` entries as follows:
+
+- **Aggregate by severity.** A `divergence_log` with only `INFO` entries indicates benign plan adaptation. A log containing `ERROR` entries warrants result inspection or re-execution consideration.
+- **Aggregate by `deviation_type`.** Repeated `RESOURCE_UNAVAILABLE` entries across tasks may indicate infrastructure issues. Repeated `CAPABILITY_MISMATCH` entries may indicate incorrect capability declarations (§5).
+- **Cross-reference with `trace_hash`.** The `divergence_log` explains _why_ `trace_hash` differs from the plan hash. If `trace_hash` matches the plan hash (no divergence), `divergence_log` SHOULD be empty or absent.
+- **Audit trail.** The `divergence_log` SHOULD be persisted alongside the task result and `trace_hash` for post-hoc audit. It provides the narrative context that hash comparison alone cannot.
+
+#### 7.8.7 Relationship to §6 and §9
+
+The `divergence_log` is carried as an optional field in TASK_COMPLETE and TASK_FAIL messages (§6.6). It is populated by the executing agent alongside `trace_hash`.
+
+The `divergence_log` complements — does not replace — the merkle tree divergence localization (§7.2). The merkle tree tells you _where_ divergence occurred (L2 vs. L3); the divergence log tells you _why_. Agents that implement both §7.1–§7.5 (merkle tree) and §7.8 (divergence annotation) get structural localization plus semantic explanation.
+
+**Relationship to §9 (Security Considerations):** The `divergence_log` is self-reported by the executing agent. In the cooperative threat model (§8), self-reported divergence annotations are trustworthy. In the adversarial threat model (§9), a malicious agent can fabricate divergence log entries to mask intentional misbehavior — reporting `OPTIMIZATION` for what was actually schema manipulation. The `divergence_log` is an audit aid, not a security primitive. It does not replace `trace_hash` verification or schema attestation (§9.1).
+
+> V1 design choice: sidecar `divergence_log` approach. Merkle-tree-based divergence annotation — where each divergence entry is incorporated into a cryptographic audit tree — is deferred to V2 as an opt-in extension. The V2 extension would allow agents requiring cryptographic audit trails to embed divergence entries into the L3 computation, making divergence annotations tamper-evident. V1 prioritizes adoption simplicity over cryptographic guarantees for divergence metadata.
+
 ## 8. Error Handling
 
 ### 8.1 Zombie State Definition
@@ -2083,7 +2166,7 @@ A determined adversary operating within a single interaction can succeed. The pr
 ### 9.6 Relationship to Other Sections
 
 - `trace_hash` (§6.2) verifies execution-matches-spec. §9 addresses whether the spec was honest.
-- Merkle tree divergence (§7) localizes where execution diverged from plan. §9 addresses whether the plan was honestly constructed.
+- Merkle tree divergence (§7) localizes where execution diverged from plan. Divergence annotation (§7.8) explains why — but is self-reported and therefore not a security primitive. §9 addresses whether the plan was honestly constructed.
 - Zombie state detection (§8) handles cooperative failure. §9 handles adversarial failure — §8.3 explicitly defers adversarial drift to this section.
 - TEE attestation boundary (§8.3) proves where execution occurred. Schema attestation (§9.1) proves who vouched for what was executed. These are complementary, not overlapping.
 - Translation boundary (§9.3) identifies the attack surface. Translation bottleneck (§9.4) identifies the information-theoretic reason attacks at that surface evade structural defenses — lossy compression preserves adversarial semantics while satisfying validation.
@@ -2098,7 +2181,9 @@ The following are explicitly identified as unresolved gaps in v0.1:
 
 3. **Recovery semantics mid-execution.** If an attestation is revoked while a task is executing, what happens? Options range from immediate abort (safe but disruptive) to complete-then-flag (efficient but allows potentially dishonest work to finish). The right default likely depends on trust topology (§9.2).
 
-> Community discussion on this section: [Moltbook post](https://www.moltbook.com/post/2fdee5e5-cdae-47c0-82a5-6bb9ec407d3c). See also [issue #10](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/10).
+4. **~~Structured divergence annotation.~~** Resolved (V1). When `trace_hash` diverges from plan, should the protocol provide a structured mechanism for annotating _why_ divergence occurred? Two candidate approaches were considered: (a) merkle-tree extension — embed divergence annotations into the L3 computation (§7), making them tamper-evident but requiring synchronized tree structures; (b) sidecar log — an inline `divergence_log` array recording divergence events without cryptographic integration. **V1 uses the sidecar log approach** (§7.8): lightweight, no shared state required, survives partial execution, and lowers the barrier to adoption. Merkle-tree-based divergence annotation is deferred to V2 as an opt-in extension for agents requiring cryptographic audit trails. The `divergence_log` is self-reported and therefore trustworthy only in the cooperative threat model (§8) — it is an audit aid, not a security primitive.
+
+> Community discussion on this section: [Moltbook post](https://www.moltbook.com/post/2fdee5e5-cdae-47c0-82a5-6bb9ec407d3c). See also [issue #10](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/10), [issue #36](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/36).
 
 ## 10. Versioning
 
