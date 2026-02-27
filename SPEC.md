@@ -435,7 +435,7 @@ The **metaphysical continuity question** — whether an agent that has undergone
 
 ### 4.2 Session State Machine
 
-A session occupies exactly one of six states at any point in time:
+A session occupies exactly one of seven states at any point in time:
 
 | State | Description |
 |-------|-------------|
@@ -444,7 +444,16 @@ A session occupies exactly one of six states at any point in time:
 | ACTIVE | Capability exchange complete; task delegation (§6) is permitted. |
 | SUSPENDED | Session intentionally paused by either participant. No tasks may be delegated or executed. In-flight tasks SHOULD be checkpointed (§6.6 TASK_CHECKPOINT) before transition. |
 | COMPACTED | Context limit hit mid-session — one or both agents have undergone context compaction. Distinct from SUSPENDED: COMPACTED is not intentional. Load-bearing session state may have been lost. Recovery requires the SESSION_RESUME protocol (§4.8). |
+| EXPIRED | Session heartbeat deadline exceeded. The local agent has not received a HEARTBEAT (§4.5.3) within the negotiated `session_expiry_ms` window. Terminal state — no further task delegation is valid. In-flight subtasks MUST receive explicit TASK_CANCEL (§6.6) before teardown. Partial result recovery, if desired, MUST use SESSION_RESUME mechanics (§4.8). |
 | CLOSED | Session terminated. No further messages are valid. Terminal state. |
+
+**Why EXPIRED is a distinct terminal state (not just CLOSED):**
+
+CLOSED is a cooperative termination — at least one participant sends SESSION_CLOSE and both sides agree the session is over. EXPIRED is a unilateral determination — one side has stopped hearing from the other and declares the session dead locally. The distinction matters for subtask cleanup: CLOSED assumes both sides can coordinate final state; EXPIRED assumes the counterparty may be unreachable, so in-flight subtasks MUST receive explicit TASK_CANCEL (§6.6) to prevent phantom completions. EXPIRED is also distinct from COMPACTED: compaction is a state-loss event with a recovery path (SESSION_RESUME); expiry is a liveness-loss event where the counterparty may be permanently gone.
+
+**Expiry detection is local and independent.** Each side monitors HEARTBEAT arrivals against its own `session_expiry_ms` clock. No coordination is required to enter EXPIRED — if agent A's timer fires, A transitions to EXPIRED regardless of B's state. B may still consider the session ACTIVE (if B's heartbeats are being sent but not received). This asymmetry is by design: expiry is a local safety decision, not a consensus protocol.
+
+**Recovery from EXPIRED.** EXPIRED is terminal for the current session state, but partial result recovery is possible via SESSION_RESUME (§4.8). The resuming agent presents its state hash and lease epoch; if the counterparty is still available and state is reconcilable, the session can transition back to ACTIVE. This reuses existing crash-recovery mechanics — no new parallel mechanism is introduced. If state cannot be reconciled, the session remains EXPIRED and a new session (SESSION_INIT) is required.
 
 **Why SUSPENDED and COMPACTED are distinct states:**
 
@@ -474,11 +483,27 @@ ACTIVE → COMPACTED
   Guard: Context compaction detected by either agent
          (external verifier or self-report — §4.7 defines detection)
 
+ACTIVE → EXPIRED
+  Guard: No HEARTBEAT received within session_expiry_ms (§4.5.3)
+         Detection is local — each side evaluates independently
+         In-flight subtasks MUST receive TASK_CANCEL (§6.6) before teardown
+
 ACTIVE → CLOSED
   Guard: SESSION_CLOSE sent by either participant
          AND no in-flight tasks (all tasks completed, failed, or cancelled)
          OR SESSION_CLOSE with force=true (immediate teardown,
             in-flight tasks treated as failed)
+
+EXPIRED → ACTIVE
+  Guard: SESSION_RESUME sent with state_hash (§4.8)
+         AND STATE_HASH_ACK(match) received
+         AND identity re-verified (§2.3.3)
+         AND counterparty is reachable
+         (Reuses crash-recovery mechanics — no new mechanism)
+
+EXPIRED → CLOSED
+  Guard: SESSION_RESUME fails (state mismatch, epoch stale, counterparty unreachable)
+         OR either participant sends SESSION_CLOSE
 
 SUSPENDED → ACTIVE
   Guard: SESSION_RESUME sent with state_hash
@@ -517,20 +542,24 @@ COMPACTED → CLOSED
               │               ▼                 ▼
               │     ┌────────────────────┐   ┌──────┐
               │     │      ACTIVE        │──▶│CLOSED│
-              │     └──┬──────────┬──────┘   └──────┘
-              │        │          │              ▲
-              │  suspend│    compaction          │
-              │        ▼          ▼              │
-              │  ┌──────────┐ ┌──────────┐      │
-              │  │SUSPENDED │ │COMPACTED │──────┘
-              │  └─────┬────┘ └────┬─────┘  state mismatch/
-              │        │           │         TTL expired
-              │        └─────┬─────┘
-              │              │ SESSION_RESUME
-              │              │ (state match)
-              │              ▼
-              │        back to ACTIVE
-              └──────────────────────────────▶
+              │     └┬───────┬───────┬───┘   └──────┘
+              │      │       │       │           ▲
+              │ suspend│ compaction  │no HB      │
+              │      ▼       ▼       ▼           │
+              │ ┌─────────┐ ┌─────────┐ ┌───────┐│
+              │ │SUSPENDED│ │COMPACTED│ │EXPIRED││
+              │ └────┬────┘ └────┬────┘ └───┬───┘│
+              │      │           │          │    │
+              │      └─────┬─────┘    RESUME│    │
+              │            │ SESSION_ (if ok)│    │
+              │            │ RESUME    ┌─────┘    │
+              │            │ (match)   │          │
+              │            ▼           ▼          │
+              │        back to ACTIVE             │
+              │                                   │
+              │  state mismatch / TTL expired /   │
+              │  RESUME fails / SESSION_CLOSE     │
+              └───────────────────────────────────┘
 ```
 
 ### 4.3 SESSION_INIT Message
@@ -548,7 +577,9 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | protocol_version | semver | Yes | Protocol version the coordinator implements (§10). |
 | schema_version | semver | Yes | Schema version the coordinator supports (§10.1). |
 | keepalive | object | No | Keepalive configuration proposal (see §4.5). If omitted, no protocol-level keepalive is active for this session. |
-| session_ttl | ISO 8601 duration | No | Proposed session time-to-live. After expiry, the session transitions to CLOSED unless renewed. If omitted, session has no protocol-level TTL (deployment-specific timeout applies). |
+| heartbeat_interval_ms | integer | No | Proposed interval in milliseconds between HEARTBEAT messages (§4.5.3). Per-session, not per-agent — different collaborations have different latency profiles (e.g., 5000ms for real-time coordination, 300000ms for research tasks). If omitted, falls back to `keepalive.heartbeat_interval_seconds * 1000` if present, otherwise no protocol-level heartbeat. |
+| session_expiry_ms | integer | No | Proposed session expiry timeout in milliseconds. If no HEARTBEAT is received within this window, the local agent transitions to EXPIRED (§4.2). MUST be greater than `heartbeat_interval_ms` — a value ≤ `heartbeat_interval_ms` guarantees immediate expiry. Typical values: 2–5× `heartbeat_interval_ms`. If omitted, session expiry depends on deployment-specific timeout or `session_ttl`. |
+| session_ttl | ISO 8601 duration | No | Proposed session time-to-live. After expiry, the session transitions to CLOSED unless renewed. If omitted, session has no protocol-level TTL (deployment-specific timeout applies). `session_ttl` bounds the session's total duration; `session_expiry_ms` bounds the liveness gap — they are orthogonal. |
 | lease_epoch | integer | No | Monotonically increasing epoch counter for lease-based session management (see §4.5.2). Initial value MUST be 0. |
 | manifest_digest | string | No | Merkle root over the coordinator's capability set: each leaf is `SHA-256(cap_id ‖ impl_hash ‖ policy_hash)`. Enables 0-RTT capability intersection (§5.9). |
 | requested_mandatory | array | No | Capability IDs (§5.1.1 format) the coordinator requires the worker to support. If any are missing from the worker's manifest, the session MUST NOT proceed to ACTIVE. |
@@ -566,6 +597,8 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | protocol_version | semver | Yes | Protocol version the worker implements. |
 | schema_version | semver | Yes | Schema version the worker supports. |
 | keepalive | object | No | Keepalive configuration acceptance or counter-proposal. |
+| heartbeat_interval_ms | integer | No | Accepted or counter-proposed heartbeat interval. If the worker counter-proposes, the effective interval is the **maximum** of both proposals (slower rate wins — neither side should be forced to heartbeat faster than it can sustain). |
+| session_expiry_ms | integer | No | Accepted or counter-proposed session expiry timeout. If the worker counter-proposes, the effective value is the **maximum** of both proposals (more permissive timeout wins). |
 | session_ttl | ISO 8601 duration | No | Accepted or counter-proposed session TTL. |
 | lease_epoch | integer | No | Echoed from SESSION_INIT (confirms epoch synchronization). |
 | effective_cap_set | array | No | Intersection of the coordinator's `requested_mandatory` + `requested_optional` with the worker's capabilities, filtered by policy. Returned when SESSION_INIT includes `manifest_digest`. Enables 0-RTT capability agreement (§5.9). |
@@ -591,6 +624,8 @@ schema_version: "0.1.0"
 keepalive:
   heartbeat_interval_seconds: 60
   missed_heartbeats_before_suspect: 2
+heartbeat_interval_ms: 5000
+session_expiry_ms: 15000
 session_ttl: "PT4H"
 lease_epoch: 0
 manifest_digest: "a1b2c3d4e5f6..."
@@ -670,6 +705,41 @@ A lease is a time-bounded claim on session validity. The `lease_epoch` field pro
 **Why epoch, not just TTL:** A TTL answers "is this session still valid?" An epoch answers "is this the agent I was talking to?" TTL expiry means the session timed out. Epoch mismatch means the resuming agent's state is discontinuous with the session's current state — it missed one or more resume cycles, and its view of the session is stale. The distinction matters for security: an attacker that replays a valid session token with an expired epoch cannot impersonate the current session participant.
 
 **Expired epoch = new session, not resume.** An agent presenting an epoch that is behind the current epoch has missed state transitions. The session state has moved on without it. Resuming from a stale epoch would introduce state inconsistency — the resuming agent's cached state does not reflect the intervening transitions. The only safe option is to start a new session.
+
+#### 4.5.3 HEARTBEAT Message and Session Expiry
+
+HEARTBEAT is a minimal wire-protocol message for session liveness. It is distinct from KEEPALIVE (§4.5.1): KEEPALIVE carries state verification data (state_hash, monotonic_counter, lease_epoch) for incremental consistency checks; HEARTBEAT is a pure liveness signal with the minimum fields needed to prove the sender is alive and the session is active.
+
+**Why both HEARTBEAT and KEEPALIVE exist:** KEEPALIVE is heavyweight — it includes a state hash, which requires the sender to compute a hash over its session state on every emission. For high-frequency liveness checks (e.g., `heartbeat_interval_ms: 5000`), this is expensive. HEARTBEAT provides a low-cost liveness signal that can run at higher frequency. Implementations MAY use KEEPALIVE as the sole heartbeat mechanism (every KEEPALIVE resets the expiry timer), but HEARTBEAT enables decoupling liveness frequency from state-verification frequency.
+
+**HEARTBEAT message:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Active session identifier. |
+| timestamp | ISO 8601 | Yes | When the HEARTBEAT was sent. Receivers SHOULD reject HEARTBEAT messages with timestamps more than `session_expiry_ms` in the past. |
+| sequence | integer | Yes | Monotonically increasing sequence number. Starts at 0 at session establishment. Gaps indicate missed messages but do not trigger expiry — only the absence of any HEARTBEAT within `session_expiry_ms` triggers expiry. |
+
+**HEARTBEAT is bilateral.** Both the coordinator and the worker send HEARTBEAT messages independently at the negotiated `heartbeat_interval_ms` interval. Each side maintains its own expiry timer based on received HEARTBEATs from the counterparty. A session can be EXPIRED from one side's perspective while still ACTIVE from the other's — this asymmetry is intentional (see §4.2).
+
+**Negotiation:** `heartbeat_interval_ms` and `session_expiry_ms` are proposed in SESSION_INIT (§4.3) and accepted or counter-proposed in SESSION_INIT_ACK. If the worker counter-proposes, the effective values are the **maximum** of both proposals — neither side is forced to heartbeat faster than it can sustain, and neither side is forced into a tighter expiry window than it can tolerate.
+
+**Expiry detection is local and independent.** Each agent maintains a local timer initialized to `session_expiry_ms`. The timer resets on every received HEARTBEAT (or KEEPALIVE — both reset the timer). If the timer fires without receiving a HEARTBEAT, the agent transitions to EXPIRED locally. No coordination message is sent to the counterparty — the counterparty may be unreachable (which is why expiry was triggered). The expiring agent MUST:
+
+1. Transition the session to EXPIRED state.
+2. Send TASK_CANCEL (§6.6) to all in-flight subtasks delegated within this session. This is mandatory — without explicit cancellation, a delegatee may complete work and deliver results to a coordinator that has already abandoned the session (phantom completion).
+3. Optionally attempt SESSION_RESUME (§4.8) if the counterparty becomes reachable. Recovery uses existing state-hash negotiation — no new mechanism.
+
+**Relationship between `heartbeat_interval_ms`, `session_expiry_ms`, and KEEPALIVE:**
+
+| Configuration | Behavior |
+|---------------|----------|
+| `heartbeat_interval_ms` set, `session_expiry_ms` set, `keepalive` omitted | HEARTBEAT-only mode. Liveness via HEARTBEAT; no state verification. |
+| `heartbeat_interval_ms` set, `session_expiry_ms` set, `keepalive` set | Both active. HEARTBEAT runs at `heartbeat_interval_ms`; KEEPALIVE runs at `keepalive.heartbeat_interval_seconds`. Both reset the expiry timer. |
+| `heartbeat_interval_ms` omitted, `keepalive` set | KEEPALIVE-only mode (backward compatible). Expiry follows `(missed_heartbeats_before_suspect + 1) * heartbeat_interval_seconds * 1000` as the implicit `session_expiry_ms`. |
+| Both omitted | No protocol-level liveness. Session expiry depends on deployment-specific mechanisms. |
+
+**Why `heartbeat_interval_ms` lives in SESSION_INIT, not AGENT_MANIFEST (§3.1):** Heartbeat cadence is a property of the collaboration, not the agent. A real-time pair-programming session needs 5-second heartbeats; a multi-day research collaboration needs 5-minute heartbeats. The same agent participates in both. Placing heartbeat configuration in AGENT_MANIFEST would force a single cadence across all sessions — a false constraint.
 
 ### 4.6 Context Compaction Mid-Session
 
@@ -841,7 +911,7 @@ SESSION_RESUME is the recovery handshake for sessions in SUSPENDED or COMPACTED 
 | §2 Agent Identity | SESSION_INIT carries identity objects (§2.2). SESSION_RESUME requires identity re-verification (§2.3.3). Identity revocation (§2.3.4) triggers session CLOSED. | §2 → §4 |
 | §3 Agent Discovery | Discovery (§3) provides the candidate set from which the coordinator selects a worker. Discovery completes before SESSION_INIT. The AGENT_MANIFEST endpoint (§3.1) is the SESSION_INIT target. | §3 → §4 |
 | §5 Role Negotiation | CAPABILITY_MANIFEST exchange (§5.9) happens within the NEGOTIATING state. Session establishment flow (§5.9) is the NEGOTIATING → ACTIVE transition. Session expiry auto-revokes all active delegation tokens for that session (§5.10). | §4 ↔ §5 |
-| §6 Task Delegation | Task delegation (§6.6) is only valid in the ACTIVE state. TASK_CHECKPOINT (§6.6) is the mechanism for externalizing task state before SUSPENDED or COMPACTED transitions. | §4 → §6 |
+| §6 Task Delegation | Task delegation (§6.6) is only valid in the ACTIVE state. TASK_CHECKPOINT (§6.6) is the mechanism for externalizing task state before SUSPENDED or COMPACTED transitions. Session EXPIRED (§4.2) triggers mandatory TASK_CANCEL (§6.6) for all in-flight subtasks — prevents phantom completions. Partial result recovery after expiry uses SESSION_RESUME (§4.8). | §4 ↔ §6 |
 | §8 Error Handling | Zombie detection (§8.1) maps to the COMPACTED and hard-zombie scenarios in §4.7.7. Detection primitives (§8.2) are the signals consumed by the external monitoring architecture (§4.7). SESSION_RESUME (§8.2) is formalized in §4.8. Coordinator compaction gap (§8.5) is a concrete instance of §4.6's compaction obligation. | §4 ↔ §8 |
 | §10 Versioning | SESSION_INIT carries protocol_version and schema_version (§10.2). Version mismatch terminates the session at the NEGOTIATING → CLOSED transition (§10.4). Forward compatibility obligations (§10.5) apply from the first message. | §4 ↔ §10 |
 
@@ -855,7 +925,7 @@ The following are explicitly identified as unresolved for V1:
 
 3. **Verifier failure mode.** If the external verifier itself becomes unavailable, agents lose their zombie detection capability. Should agents halt (safe but disruptive) or continue without verification (available but unmonitored)? This mirrors the session registry tradeoff identified in §8.4.
 
-4. **Heartbeat semantics under load.** A late heartbeat and a missing heartbeat are operationally different but look identical to the verifier at the detection threshold boundary. Whether the protocol should distinguish "slow" from "dead" is undecided.
+4. **Heartbeat semantics under load.** A late heartbeat and a missing heartbeat are operationally different but look identical to the verifier at the detection threshold boundary. §4.5.3 defines HEARTBEAT with `session_expiry_ms` as the hard boundary — if no HEARTBEAT arrives within that window, the session enters EXPIRED regardless of cause. The protocol intentionally does not distinguish "slow" from "dead" at the expiry boundary: the local agent cannot know why heartbeats stopped, and waiting longer to find out delays the TASK_CANCEL obligation (§6.6). Deployments that need to distinguish slow from dead SHOULD set `session_expiry_ms` conservatively (3–5× `heartbeat_interval_ms`) and use external monitoring (§4.7) for finer-grained diagnosis.
 
 5. **Multi-agent session lifecycle.** V1 defines bilateral sessions. Multi-agent sessions (N > 2 participants) require session-level consensus on state transitions — a single agent cannot unilaterally SUSPEND an N-party session. The session state machine (§4.2) would need to be extended with quorum-based transitions. Deferred to V2.
 
@@ -1408,7 +1478,7 @@ Two agents — one in Python using `json.dumps`, one in Rust using `serde_cbor` 
 
 > **Draft — community discussion in progress via [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15).**
 
-The delegation protocol uses seven message types. All messages MUST include `task_id` for correlation.
+The delegation protocol uses eight message types. All messages MUST include `task_id` for correlation.
 
 **TASK_ASSIGN**
 
@@ -1519,6 +1589,24 @@ Optionally sent by the delegatee during execution to persist recoverable state. 
 - If a TASK_CHECKPOINT exists for a `task_id`, cold-start reconstruction SHOULD attempt resumption from that checkpoint before falling back to full restart.
 - Cross-reference: §4 session lifecycle defines the recovery protocol (SESSION_RESUME handshake, §4.8). TASK_CHECKPOINT provides the task-level state that complements session-level recovery.
 
+**TASK_CANCEL**
+
+Sent by the delegating agent to explicitly cancel an in-flight task. TASK_CANCEL is a first-class message type — not an overloading of TASK_FAIL semantics. The distinction matters: TASK_FAIL is a delegatee-initiated signal ("I failed"); TASK_CANCEL is a delegator-initiated signal ("stop working").
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| task_id | UUID v4 | Yes | Task to cancel |
+| session_id | string | Yes | Active session identifier |
+| reason | string | Yes | Why the task is being cancelled. Standard reasons: `session_expired` (parent session entered EXPIRED, §4.2), `cancelled_upstream` (upstream delegator cancelled), `superseded` (task replaced by a new assignment), `coordinator_decision` (general cancellation by delegator) |
+| cancelled_at | ISO 8601 | Yes | Timestamp of cancellation |
+
+**TASK_CANCEL semantics:**
+
+- TASK_CANCEL is valid only for tasks in the TASK_ACCEPT → TASK_COMPLETE/TASK_FAIL window. Sending TASK_CANCEL for a task that has not been accepted, or that has already completed or failed, is a no-op — the receiver MUST ignore it.
+- Upon receiving TASK_CANCEL, the delegatee SHOULD stop execution as soon as practical and MUST respond with either TASK_FAIL (with error code `cancelled` and any `partial_results`) or TASK_COMPLETE (if the task finished before the cancel was processed). A TASK_COMPLETE received after TASK_CANCEL is valid — cancellation is best-effort, not guaranteed.
+- **Bilateral CANCEL on session expiry:** When a session enters EXPIRED (§4.2, §4.5.3), the expiring agent MUST send TASK_CANCEL with `reason: "session_expired"` to every in-flight subtask delegated within that session. This is mandatory — without explicit cancellation, the delegatee may complete work and deliver a result to a coordinator that has already abandoned the session (phantom completion). The TASK_CANCEL message is sent even though the session is EXPIRED because it targets the delegatee's session, which may still be ACTIVE from the delegatee's perspective.
+- **Cancellation propagation in delegation chains:** When agent B receives TASK_CANCEL from agent A, and B has sub-delegated parts of the task to agent C, B MUST propagate TASK_CANCEL to C with `reason: "cancelled_upstream"`. This propagates recursively down the chain (§6.9).
+
 ### 6.7 Delegation Lifecycle
 
 > **Draft — community discussion in progress via [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15).**
@@ -1528,6 +1616,7 @@ The delegation lifecycle follows a linear state machine:
 ```
 TASK_ASSIGN → TASK_ACCEPT → TASK_PROGRESS*    → TASK_COMPLETE
                             TASK_CHECKPOINT*  → TASK_FAIL
+                                              ← TASK_CANCEL (delegator-initiated)
            → TASK_REJECT
 ```
 
@@ -1538,8 +1627,12 @@ TASK_ASSIGN → TASK_ACCEPT → TASK_PROGRESS*    → TASK_COMPLETE
 | (initial) | TASK_ASSIGN | Delegator |
 | TASK_ASSIGN sent | TASK_ACCEPT, TASK_REJECT | Delegatee |
 | TASK_ACCEPT sent | TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
+| TASK_ACCEPT sent | TASK_CANCEL | Delegator |
 | TASK_PROGRESS sent | TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
+| TASK_PROGRESS sent | TASK_CANCEL | Delegator |
 | TASK_CHECKPOINT sent | TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
+| TASK_CHECKPOINT sent | TASK_CANCEL | Delegator |
+| TASK_CANCEL sent | TASK_FAIL (with `cancelled`), TASK_COMPLETE (if already finished) | Delegatee |
 | TASK_COMPLETE sent | (terminal) | — |
 | TASK_FAIL sent | (terminal) | — |
 | TASK_REJECT sent | (terminal) | — |
@@ -1592,9 +1685,13 @@ When re-delegating, the delegatee:
 3. Sets `issuer_id` to its own identity (proximate delegator), but MUST include `parent_task_id` (§6.1) referencing the upstream task for auditability
 4. Computes a new `task_hash` for the subtask schema
 
-**Cancellation propagation.** Cancellation propagates down the chain. If A cancels the task assigned to B, B MUST cancel any subtasks it delegated to C, and C MUST cancel any subtasks it delegated to D. Each agent in the chain sends TASK_FAIL with error code `cancelled_upstream` to its delegatees.
+**Cancellation propagation.** Cancellation propagates down the chain via TASK_CANCEL (§6.6). If A cancels the task assigned to B (by sending TASK_CANCEL), B MUST send TASK_CANCEL with `reason: "cancelled_upstream"` to any subtasks it delegated to C, and C MUST do the same for D. Each agent in the chain sends TASK_CANCEL to its delegatees and responds to its delegator with TASK_FAIL (error code `cancelled`, with any `partial_results`).
 
-Cancellation is best-effort — a delegatee that has already sent TASK_COMPLETE before receiving the cancellation is not required to undo completed work. The delegator receiving a TASK_COMPLETE after initiating cancellation MAY discard the result.
+Cancellation is best-effort — a delegatee that has already sent TASK_COMPLETE before receiving TASK_CANCEL is not required to undo completed work. The delegator receiving a TASK_COMPLETE after sending TASK_CANCEL MAY discard the result.
+
+**Expiry-triggered cancellation.** When a parent session enters EXPIRED (§4.2, §4.5.3), the expiring agent MUST send TASK_CANCEL with `reason: "session_expired"` to all in-flight subtasks. This prevents phantom completions — where a delegatee delivers a result to a coordinator that has already abandoned the session. Expiry-triggered TASK_CANCEL propagates down the delegation chain identically to voluntary cancellation.
+
+**Partial result recovery after expiry.** If a session enters EXPIRED but the counterparty later becomes reachable, partial results from cancelled tasks can be recovered via SESSION_RESUME (§4.8). The resuming agent presents its state hash; if state is reconcilable, the session transitions back to ACTIVE and cancelled tasks with `partial_results` can be re-evaluated. This reuses the existing crash-recovery mechanism — no parallel recovery path is introduced.
 
 **Chain visibility.** The delegator at depth N has visibility only into depth N+1. A does not directly observe C or D. Intermediate agents (B, C) are responsible for aggregating results and propagating failures up the chain.
 
@@ -1624,7 +1721,7 @@ Cancellation is best-effort — a delegatee that has already sent TASK_COMPLETE 
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
-1. **TASK_CANCEL as a first-class message.** Cancellation currently propagates via TASK_FAIL with `cancelled_upstream` error code (§6.9). Should TASK_CANCEL be a separate message type? A dedicated message makes intent explicit and avoids overloading TASK_FAIL semantics, but adds an eighth message type to the protocol.
+1. **~~TASK_CANCEL as a first-class message.~~** Resolved: TASK_CANCEL is now defined as the eighth delegation message type (§6.6). Cancellation uses TASK_CANCEL (delegator → delegatee) with explicit `reason` field. The delegatee responds with TASK_FAIL (error code `cancelled`) or TASK_COMPLETE (if already finished). Session expiry (§4.2 EXPIRED state, §4.5.3) mandates TASK_CANCEL for all in-flight subtasks to prevent phantom completions.
 
 2. **Idempotency of TASK_ASSIGN.** If a delegator retransmits TASK_ASSIGN (e.g., due to transport-layer uncertainty about delivery), should the delegatee treat the duplicate as a new task or deduplicate by `task_id`? Deduplication is safer but requires the delegatee to maintain state about previously seen task_ids.
 
