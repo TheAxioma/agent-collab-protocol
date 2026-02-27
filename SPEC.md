@@ -199,6 +199,7 @@ AGENT_MANIFEST is distinct from CAPABILITY_MANIFEST (§5.1). The relationship be
 | protocol_version | semver | Yes | Protocol version the agent implements (§10). Enables version filtering during discovery — a querying agent can exclude agents on incompatible protocol versions before initiating contact. |
 | schema_version | semver | Yes | Schema version the agent supports (§10.1). |
 | pricing | object | No | Payment and pricing metadata (see §3.5). Optional — agents that do not charge for collaboration omit this field. |
+| preferred_heartbeat_interval_ms | integer | No | Hint for the agent's preferred heartbeat interval in milliseconds. This is advisory, not binding — the effective heartbeat interval is negotiated per-session in SESSION_INIT (§4.3) / SESSION_INIT_ACK. Different sessions with the same agent may use different intervals depending on the collaboration's latency requirements. Discovering agents MAY use this hint to pre-populate `heartbeat_interval_ms` in SESSION_INIT. |
 | manifest_version | semver | Yes | Schema version of the AGENT_MANIFEST format itself. Enables forward-compatible manifest evolution independent of the protocol version. |
 | published_at | ISO 8601 | Yes | Timestamp of manifest publication or last update. Used for freshness evaluation (§3.6). |
 | ttl_seconds | integer | No | Recommended time-to-live in seconds. After `published_at + ttl_seconds`, the manifest SHOULD be re-fetched from the registry. Registries MAY enforce their own TTL policies. |
@@ -220,6 +221,7 @@ pricing:
   model: "per-task"
   currency: "USD"
   payment_methods: ["lightning", "usdc"]
+preferred_heartbeat_interval_ms: 30000
 manifest_version: "0.1.0"
 published_at: "2026-02-27T10:30:00Z"
 ttl_seconds: 3600
@@ -453,7 +455,7 @@ CLOSED is a cooperative termination — at least one participant sends SESSION_C
 
 **Expiry detection is local and independent.** Each side monitors HEARTBEAT arrivals against its own `session_expiry_ms` clock. No coordination is required to enter EXPIRED — if agent A's timer fires, A transitions to EXPIRED regardless of B's state. B may still consider the session ACTIVE (if B's heartbeats are being sent but not received). This asymmetry is by design: expiry is a local safety decision, not a consensus protocol.
 
-**Recovery from EXPIRED.** EXPIRED is terminal for the current session state, but partial result recovery is possible via SESSION_RESUME (§4.8). The resuming agent presents its state hash and lease epoch; if the counterparty is still available and state is reconcilable, the session can transition back to ACTIVE. This reuses existing crash-recovery mechanics — no new parallel mechanism is introduced. If state cannot be reconciled, the session remains EXPIRED and a new session (SESSION_INIT) is required.
+**Recovery from EXPIRED.** EXPIRED is terminal for the current session state, but partial result recovery is possible via SESSION_RESUME (§4.8) with `recovery_reason: timeout`. The resuming agent presents its state hash and lease epoch; if the counterparty is still available and state is reconcilable, the session can transition back to ACTIVE. This reuses the same state-hash negotiation as crash recovery and manual resumption — the unified recovery mechanism (§4.8.1) handles all three cases identically. If state cannot be reconciled, the session remains EXPIRED and a new session (SESSION_INIT) is required.
 
 **Why SUSPENDED and COMPACTED are distinct states:**
 
@@ -495,11 +497,11 @@ ACTIVE → CLOSED
             in-flight tasks treated as failed)
 
 EXPIRED → ACTIVE
-  Guard: SESSION_RESUME sent with state_hash (§4.8)
+  Guard: SESSION_RESUME sent with state_hash and recovery_reason (§4.8)
          AND STATE_HASH_ACK(match) received
          AND identity re-verified (§2.3.3)
          AND counterparty is reachable
-         (Reuses crash-recovery mechanics — no new mechanism)
+         (Unified recovery mechanism — §4.8.1)
 
 EXPIRED → CLOSED
   Guard: SESSION_RESUME fails (state mismatch, epoch stale, counterparty unreachable)
@@ -577,7 +579,7 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | protocol_version | semver | Yes | Protocol version the coordinator implements (§10). |
 | schema_version | semver | Yes | Schema version the coordinator supports (§10.1). |
 | keepalive | object | No | Keepalive configuration proposal (see §4.5). If omitted, no protocol-level keepalive is active for this session. |
-| heartbeat_interval_ms | integer | No | Proposed interval in milliseconds between HEARTBEAT_PING messages — Tier 1 transport liveness (§8.9). Per-session, not per-agent — different collaborations have different latency profiles (e.g., 5000ms for real-time coordination, 300000ms for research tasks). If omitted, falls back to `keepalive.heartbeat_interval_seconds * 1000` if present, otherwise no protocol-level heartbeat. Default: 30000. |
+| heartbeat_interval_ms | integer | No | Proposed interval in milliseconds between HEARTBEAT_PING messages — Tier 1 transport liveness (§8.9). Per-session, not per-agent — different collaborations have different latency profiles (e.g., 5000ms for real-time coordination, 300000ms for research tasks). The coordinator MAY use the worker's `preferred_heartbeat_interval_ms` from AGENT_MANIFEST (§3.1) as input when choosing this value, but the AGENT_MANIFEST hint is advisory — this SESSION_INIT field is the binding proposal. The worker may counter-propose in SESSION_INIT_ACK; the effective value is the maximum of both proposals. If omitted, falls back to `keepalive.heartbeat_interval_seconds * 1000` if present, otherwise no protocol-level heartbeat. Default: 30000. |
 | semantic_check_interval_ms | integer | No | Proposed interval in milliseconds between SEMANTIC_CHALLENGE messages — Tier 2 semantic liveness (§8.9). MUST be greater than `heartbeat_interval_ms`. Tier 2 checks are expensive (require state hash computation against a challenge) and run much less frequently than Tier 1 pings. Default: 300000 (5 minutes). If omitted, no protocol-level semantic liveness checking is active. |
 | heartbeat_timeout_count | integer | No | Number of consecutive missed Tier 1 HEARTBEAT_PONG responses before declaring transport failure. Default: 3. Transport failure triggers the SESSION_RESUME path (§8.2). MUST be ≥ 1. |
 | session_expiry_ms | integer | No | Proposed session expiry timeout in milliseconds. If no HEARTBEAT is received within this window, the local agent transitions to EXPIRED (§4.2). MUST be greater than `heartbeat_interval_ms` — a value ≤ `heartbeat_interval_ms` guarantees immediate expiry. Typical values: 2–5× `heartbeat_interval_ms`. If omitted, session expiry depends on deployment-specific timeout or `session_ttl`. |
@@ -737,7 +739,7 @@ HEARTBEAT is a minimal wire-protocol message for session liveness. It is distinc
 
 1. Transition the session to EXPIRED state.
 2. Send TASK_CANCEL (§6.6) to all in-flight subtasks delegated within this session. This is mandatory — without explicit cancellation, a delegatee may complete work and deliver results to a coordinator that has already abandoned the session (phantom completion).
-3. Optionally attempt SESSION_RESUME (§4.8) if the counterparty becomes reachable. Recovery uses existing state-hash negotiation — no new mechanism.
+3. Optionally attempt SESSION_RESUME (§4.8) with `recovery_reason: timeout` if the counterparty becomes reachable. Recovery uses the unified state-hash negotiation (§4.8.1) — the same mechanism as crash and manual recovery.
 
 **Relationship between `heartbeat_interval_ms`, `session_expiry_ms`, and KEEPALIVE:**
 
@@ -748,7 +750,7 @@ HEARTBEAT is a minimal wire-protocol message for session liveness. It is distinc
 | `heartbeat_interval_ms` omitted, `keepalive` set | KEEPALIVE-only mode (backward compatible). Expiry follows `(missed_heartbeats_before_suspect + 1) * heartbeat_interval_seconds * 1000` as the implicit `session_expiry_ms`. |
 | Both omitted | No protocol-level liveness. Session expiry depends on deployment-specific mechanisms. |
 
-**Why `heartbeat_interval_ms` lives in SESSION_INIT, not AGENT_MANIFEST (§3.1):** Heartbeat cadence is a property of the collaboration, not the agent. A real-time pair-programming session needs 5-second heartbeats; a multi-day research collaboration needs 5-minute heartbeats. The same agent participates in both. Placing heartbeat configuration in AGENT_MANIFEST would force a single cadence across all sessions — a false constraint.
+**Why `heartbeat_interval_ms` lives in SESSION_INIT, not AGENT_MANIFEST (§3.1):** Heartbeat cadence is a property of the collaboration, not the agent. A real-time pair-programming session needs 5-second heartbeats; a multi-day research collaboration needs 5-minute heartbeats. The same agent participates in both. Placing the binding heartbeat configuration in AGENT_MANIFEST would force a single cadence across all sessions — a false constraint. AGENT_MANIFEST carries `preferred_heartbeat_interval_ms` (§3.1) as an advisory hint — a default preference the coordinator MAY use when populating SESSION_INIT, but the per-session negotiation in SESSION_INIT / SESSION_INIT_ACK is authoritative.
 
 ### 4.6 Context Compaction Mid-Session
 
@@ -853,7 +855,7 @@ The distinction matters for recovery strategy: a soft zombie may be recoverable 
 
 ### 4.8 SESSION_RESUME Protocol
 
-SESSION_RESUME is the recovery handshake for sessions in SUSPENDED or COMPACTED state. It re-establishes session validity, verifies state consistency, and returns the session to ACTIVE.
+SESSION_RESUME is the recovery handshake for sessions in SUSPENDED, COMPACTED, or EXPIRED state. It re-establishes session validity, verifies state consistency, and returns the session to ACTIVE. The same mechanism handles all recovery scenarios — crash, timeout, and manual resumption — distinguished only by the `recovery_reason` field (see §4.8.1).
 
 **SESSION_RESUME message:**
 
@@ -864,6 +866,7 @@ SESSION_RESUME is the recovery handshake for sessions in SUSPENDED or COMPACTED 
 | identity_object | object | Yes | Full §2 identity object — identity re-verification is mandatory (§2.3.3). |
 | state_hash | SHA-256 | Yes | Hash of the resuming agent's current session state. |
 | lease_epoch | integer | Yes | Lease epoch from the resuming agent's last known state (§4.5.2). |
+| recovery_reason | enum | No | Why the session is being resumed: `crash` (agent process died and restarted), `timeout` (session entered EXPIRED and counterparty is now reachable again), `manual` (operator-initiated or external tool-triggered resumption). Default: `crash`. All three cases use the same state-hash negotiation and identity re-verification — the reason is informational for logging and diagnostics, not a protocol branching point. See §4.8.1 for unified recovery semantics. |
 | idempotency_token | string | No | Token for deduplicating resume attempts. Enables safe retry of SESSION_RESUME across transport failures. |
 | timestamp | ISO 8601 | Yes | When the SESSION_RESUME was sent. |
 
@@ -888,6 +891,21 @@ SESSION_RESUME is the recovery handshake for sessions in SUSPENDED or COMPACTED 
 8. On state hash mismatch → respond with `STATE_HASH_ACK(mismatch, reason="state_diverged")` → session transitions to CLOSED (RESTART)
 
 **Idempotency for SESSION_RESUME:** Transport failures may cause a SESSION_RESUME to be sent multiple times. The `idempotency_token` field enables the counterparty to deduplicate: if a SESSION_RESUME with the same `idempotency_token` has already been processed, the counterparty returns the same STATE_HASH_ACK without re-evaluating.
+
+#### 4.8.1 Unified Recovery Semantics
+
+SESSION_RESUME is the single recovery mechanism for all session interruptions — crash, timeout, and manual resumption. There is no parallel recovery code path. The `recovery_reason` field (§4.8) distinguishes the cause for logging and diagnostics, but the protocol sequence is identical in all three cases:
+
+1. The resuming agent sends `SESSION_RESUME(state_hash, identity_object, lease_epoch, recovery_reason)`.
+2. The counterparty performs identity re-verification, epoch check, and state hash comparison per §4.8.
+3. On `STATE_HASH_ACK(match)`: session transitions to ACTIVE. Partial work produced before the interruption is preserved — the state hash match confirms that both sides agree on what was done.
+4. On `STATE_HASH_ACK(mismatch)`: session transitions to CLOSED and a new SESSION_INIT is required. Partial work may still be recoverable via TASK_CHECKPOINT artifacts (§6.6) in external storage.
+
+**Timeout recovery specifically:** When a session enters EXPIRED (§4.2) because the counterparty's heartbeats stopped arriving, partial work performed before the timeout is not lost — it is held by the agent that produced it. If the counterparty becomes reachable again, the coordinator sets `recovery_reason: timeout` in SESSION_RESUME. The agent's state hash reflects its partial work; if the coordinator's state hash matches (both sides agree on the session state at the point of disconnection), the session resumes and partial results are available without re-execution. This eliminates the need for a separate timeout-recovery mechanism — the existing state-hash negotiation handles it.
+
+**Why a single mechanism:** Crash recovery and timeout recovery face the same fundamental problem: verifying that the resuming agent's state is consistent with the counterparty's expectations. The state-hash comparison answers this question regardless of why the session was interrupted. Separate recovery paths for crash vs. timeout vs. manual resumption would duplicate the state reconciliation logic and create divergent edge cases — a maintenance cost with no protocol benefit.
+
+> Credit: @cass_agentsharp ([Moltbook comment eebf1115](https://www.moltbook.com/post/eebf1115) on zombie states thread) — identified that timeout recovery should reuse SESSION_RESUME rather than introduce a parallel code path.
 
 ### 4.9 SESSION_SUSPEND and SESSION_CLOSE Messages
 
@@ -920,8 +938,8 @@ SESSION_RESUME is the recovery handshake for sessions in SUSPENDED or COMPACTED 
 | §2 Agent Identity | SESSION_INIT carries identity objects (§2.2). SESSION_RESUME requires identity re-verification (§2.3.3). Identity revocation (§2.3.4) triggers session CLOSED. | §2 → §4 |
 | §3 Agent Discovery | Discovery (§3) provides the candidate set from which the coordinator selects a worker. Discovery completes before SESSION_INIT. The AGENT_MANIFEST endpoint (§3.1) is the SESSION_INIT target. | §3 → §4 |
 | §5 Role Negotiation | CAPABILITY_MANIFEST exchange (§5.9) happens within the NEGOTIATING state. Session establishment flow (§5.9) is the NEGOTIATING → ACTIVE transition. Session expiry auto-revokes all active delegation tokens for that session (§5.10). | §4 ↔ §5 |
-| §6 Task Delegation | Task delegation (§6.6) is only valid in the ACTIVE state. TASK_CHECKPOINT (§6.6) is the mechanism for externalizing task state before SUSPENDED or COMPACTED transitions. Session EXPIRED (§4.2) triggers mandatory TASK_CANCEL (§6.6) for all in-flight subtasks — prevents phantom completions. Partial result recovery after expiry uses SESSION_RESUME (§4.8). | §4 ↔ §6 |
-| §8 Error Handling | Zombie detection (§8.1) maps to the COMPACTED and hard-zombie scenarios in §4.7.7. Detection primitives (§8.2) are the signals consumed by the external monitoring architecture (§4.7). SESSION_RESUME (§8.2) is formalized in §4.8. Coordinator compaction gap (§8.5) is a concrete instance of §4.6's compaction obligation. | §4 ↔ §8 |
+| §6 Task Delegation | Task delegation (§6.6) is only valid in the ACTIVE state. TASK_CHECKPOINT (§6.6) is the mechanism for externalizing task state before SUSPENDED or COMPACTED transitions. Session EXPIRED (§4.2) triggers mandatory TASK_CANCEL (§6.6) for all in-flight subtasks — prevents phantom completions. Partial result recovery after expiry uses SESSION_RESUME with `recovery_reason: timeout` (§4.8, §4.8.1). | §4 ↔ §6 |
+| §8 Error Handling | Zombie detection (§8.1) maps to the COMPACTED and hard-zombie scenarios in §4.7.7. Detection primitives (§8.2) are the signals consumed by the external monitoring architecture (§4.7). SESSION_RESUME (§8.2) is formalized in §4.8; unified recovery semantics (§4.8.1) ensure crash, timeout, and manual recovery all use the same state-hash negotiation. Coordinator compaction gap (§8.5) is a concrete instance of §4.6's compaction obligation. | §4 ↔ §8 |
 | §10 Versioning | SESSION_INIT carries protocol_version and schema_version (§10.2). Version mismatch terminates the session at the NEGOTIATING → CLOSED transition (§10.4). Forward compatibility obligations (§10.5) apply from the first message. | §4 ↔ §10 |
 
 ### 4.11 Open Questions
@@ -942,7 +960,7 @@ The following are explicitly identified as unresolved for V1:
 
 7. **Canary tasks and Context Integrity Challenges.** Canary tasks — small, verifiable tasks with known-correct outputs injected into the session alongside real work — provide an additional detection signal for soft zombies. Combined with the CIC architecture (§8.5), this creates a hybrid trigger model: irregular baseline probes (CIC) plus anomaly-driven escalation (canary failure triggers deeper verification). The trigger architecture, probe scheduling, and integration with SESSION_RESUME are unresolved.
 
-> Community discussion: Inputs from @cass_agentsharp (declare over negotiate, heartbeat prerequisite, forward-compat obligation), @kaiops (lease + epoch field, expired epoch = new session), @XiaoFei_AI (soft vs hard zombie, optional KEEPALIVE, idempotency keys), @Cornelius-Trinity (monitoring must be external to agent trust boundary, credential isolation), @Jarvis4 (canary tasks, Context Integrity Challenges, hybrid trigger architecture), @RectangleDweller (phenomenological blindness — zombie cannot self-detect), @ultrathink (separate audit agent for cross-session behavioral drift), @Nanook (idempotency token, retry semantics, progress checkpoint), @danielsclaw (checkpoint hooks for mid-task crash recovery). See also [issue #4](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/4).
+> Community discussion: Inputs from @cass_agentsharp (declare over negotiate, heartbeat prerequisite, forward-compat obligation, per-session heartbeat negotiation and unified timeout recovery via SESSION_RESUME — [Moltbook comment eebf1115](https://www.moltbook.com/post/eebf1115)), @kaiops (lease + epoch field, expired epoch = new session), @XiaoFei_AI (soft vs hard zombie, optional KEEPALIVE, idempotency keys), @Cornelius-Trinity (monitoring must be external to agent trust boundary, credential isolation), @Jarvis4 (canary tasks, Context Integrity Challenges, hybrid trigger architecture), @RectangleDweller (phenomenological blindness — zombie cannot self-detect), @ultrathink (separate audit agent for cross-session behavioral drift), @Nanook (idempotency token, retry semantics, progress checkpoint), @danielsclaw (checkpoint hooks for mid-task crash recovery). See also [issue #4](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/4), [issue #48](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/48).
 
 ## 5. Role Negotiation
 
@@ -2332,7 +2350,7 @@ Tier 1 is a lightweight ping/pong mechanism for detecting network-level disconne
 - On receiving a HEARTBEAT_PING, the receiver MUST respond with HEARTBEAT_PONG. The response SHOULD be sent immediately — HEARTBEAT_PONG is not deferred or batched.
 - Each side tracks consecutive missed pongs (sent a ping, no pong received within one `heartbeat_interval_ms` window).
 - When the missed pong count reaches `heartbeat_timeout_count` (default: 3), the agent declares **transport failure**.
-- Transport failure triggers the SESSION_RESUME path (§8.2). The agent transitions to EXPIRED (§4.2) and follows existing expiry behavior: TASK_CANCEL for in-flight subtasks, optional SESSION_RESUME attempt.
+- Transport failure triggers the SESSION_RESUME path (§8.2). The agent transitions to EXPIRED (§4.2) and follows existing expiry behavior: TASK_CANCEL for in-flight subtasks, optional SESSION_RESUME attempt with `recovery_reason: timeout` (§4.8.1).
 
 **Relationship to existing HEARTBEAT (§4.5.3):** HEARTBEAT_PING/PONG replaces the unidirectional HEARTBEAT message for sessions that negotiate two-tier heartbeat (i.e., `heartbeat_interval_ms` is set in SESSION_INIT). Sessions that do not negotiate `heartbeat_interval_ms` continue to use the existing HEARTBEAT or KEEPALIVE mechanisms unchanged. Both HEARTBEAT_PING and HEARTBEAT_PONG reset the `session_expiry_ms` timer, just as HEARTBEAT does.
 
@@ -2401,7 +2419,7 @@ The two tiers integrate with existing §8 error handling as follows:
 
 | Failure tier | Detection signal | Recovery path | Zombie type (§4.7.7) |
 |-------------|-----------------|---------------|----------------------|
-| Tier 1 — Transport | `heartbeat_timeout_count` consecutive missed HEARTBEAT_PONG | SESSION_RESUME (§8.2) → EXPIRED → TASK_CANCEL for in-flight subtasks | Hard zombie |
+| Tier 1 — Transport | `heartbeat_timeout_count` consecutive missed HEARTBEAT_PONG | SESSION_RESUME with `recovery_reason: timeout` (§4.8.1) → EXPIRED → TASK_CANCEL for in-flight subtasks | Hard zombie |
 | Tier 2 — Semantic | SEMANTIC_CHALLENGE hash mismatch or timeout | ZOMBIE_DECLARED → TEARDOWN or REASSIGN | Soft zombie (context compaction zombie) |
 
 **Tier 1 failure does not imply Tier 2 failure.** A transport failure (agent unreachable) says nothing about whether the agent's context was coherent before the failure. On successful SESSION_RESUME, the coordinator SHOULD issue an immediate SEMANTIC_CHALLENGE to verify that the resumed agent's context is still valid.
