@@ -867,6 +867,7 @@ SESSION_RESUME is the recovery handshake for sessions in SUSPENDED, COMPACTED, o
 | state_hash | SHA-256 | Yes | Hash of the resuming agent's current session state. |
 | lease_epoch | integer | Yes | Lease epoch from the resuming agent's last known state (§4.5.2). |
 | recovery_reason | enum | No | Why the session is being resumed: `crash` (agent process died and restarted), `timeout` (session entered EXPIRED and counterparty is now reachable again), `manual` (operator-initiated or external tool-triggered resumption). Default: `crash`. All three cases use the same state-hash negotiation and identity re-verification — the reason is informational for logging and diagnostics, not a protocol branching point. See §4.8.1 for unified recovery semantics. |
+| last_evidence_id | UUID v4 | No | UUID of the most recent EVIDENCE_RECORD (§8.10) for this session. When present, the counterparty validates `last_evidence_id` against the evidence layer before accepting `state_hash`. Rationale: `state_hash` may be derived from compacted or reinterpreted memory; `last_evidence_id` anchors the resume to the append-only evidence layer, which is the authoritative state anchor for recovery. Implementations that support the evidence layer (§8.10) SHOULD populate this field. |
 | idempotency_token | string | No | Token for deduplicating resume attempts. Enables safe retry of SESSION_RESUME across transport failures. |
 | timestamp | ISO 8601 | Yes | When the SESSION_RESUME was sent. |
 
@@ -886,9 +887,10 @@ SESSION_RESUME is the recovery handshake for sessions in SUSPENDED, COMPACTED, o
 3. On identity mismatch → respond with `STATE_HASH_ACK(mismatch, reason="identity_mismatch")` → session MUST RESTART
 4. Counterparty checks `lease_epoch` against current epoch
 5. On epoch mismatch → respond with `STATE_HASH_ACK(mismatch, reason="epoch_stale")` → session MUST be treated as new (CLOSED + new SESSION_INIT)
-6. Counterparty compares `state_hash` against expected state
-7. On state hash match → respond with `STATE_HASH_ACK(match)` → session transitions to ACTIVE, `lease_epoch` increments by 1
-8. On state hash mismatch → respond with `STATE_HASH_ACK(mismatch, reason="state_diverged")` → session transitions to CLOSED (RESTART)
+6. If `last_evidence_id` is present, counterparty validates it against the evidence layer (§8.10). On evidence mismatch → respond with `STATE_HASH_ACK(mismatch, reason="evidence_mismatch")` → session transitions to CLOSED (RESTART). This check ensures the resume is anchored to the append-only evidence layer rather than potentially compacted memory state.
+7. Counterparty compares `state_hash` against expected state
+8. On state hash match → respond with `STATE_HASH_ACK(match)` → session transitions to ACTIVE, `lease_epoch` increments by 1
+9. On state hash mismatch → respond with `STATE_HASH_ACK(mismatch, reason="state_diverged")` → session transitions to CLOSED (RESTART)
 
 **Idempotency for SESSION_RESUME:** Transport failures may cause a SESSION_RESUME to be sent multiple times. The `idempotency_token` field enables the counterparty to deduplicate: if a SESSION_RESUME with the same `idempotency_token` has already been processed, the counterparty returns the same STATE_HASH_ACK without re-evaluating.
 
@@ -939,7 +941,7 @@ SESSION_RESUME is the single recovery mechanism for all session interruptions �
 | §3 Agent Discovery | Discovery (§3) provides the candidate set from which the coordinator selects a worker. Discovery completes before SESSION_INIT. The AGENT_MANIFEST endpoint (§3.1) is the SESSION_INIT target. | §3 → §4 |
 | §5 Role Negotiation | CAPABILITY_MANIFEST exchange (§5.9) happens within the NEGOTIATING state. Session establishment flow (§5.9) is the NEGOTIATING → ACTIVE transition. Session expiry auto-revokes all active delegation tokens for that session (§5.10). | §4 ↔ §5 |
 | §6 Task Delegation | Task delegation (§6.6) is only valid in the ACTIVE state. TASK_CHECKPOINT (§6.6) is the mechanism for externalizing task state before SUSPENDED or COMPACTED transitions. Session EXPIRED (§4.2) triggers mandatory TASK_CANCEL (§6.6) for all in-flight subtasks — prevents phantom completions. Partial result recovery after expiry uses SESSION_RESUME with `recovery_reason: timeout` (§4.8, §4.8.1). | §4 ↔ §6 |
-| §8 Error Handling | Zombie detection (§8.1) maps to the COMPACTED and hard-zombie scenarios in §4.7.7. Detection primitives (§8.2) are the signals consumed by the external monitoring architecture (§4.7). SESSION_RESUME (§8.2) is formalized in §4.8; unified recovery semantics (§4.8.1) ensure crash, timeout, and manual recovery all use the same state-hash negotiation. Coordinator compaction gap (§8.5) is a concrete instance of §4.6's compaction obligation. | §4 ↔ §8 |
+| §8 Error Handling | Zombie detection (§8.1) maps to the COMPACTED and hard-zombie scenarios in §4.7.7. Detection primitives (§8.2) are the signals consumed by the external monitoring architecture (§4.7). SESSION_RESUME (§8.2) is formalized in §4.8; unified recovery semantics (§4.8.1) ensure crash, timeout, and manual recovery all use the same state-hash negotiation. Coordinator compaction gap (§8.5) is a concrete instance of §4.6's compaction obligation. Evidence layer (§8.10) provides the append-only anchor for SESSION_RESUME validation — `last_evidence_id` in SESSION_RESUME (§4.8) references the evidence layer rather than compactable memory state. | §4 ↔ §8 |
 | §10 Versioning | SESSION_INIT carries protocol_version and schema_version (§10.2). Version mismatch terminates the session at the NEGOTIATING → CLOSED transition (§10.4). Forward compatibility obligations (§10.5) apply from the first message. | §4 ↔ §10 |
 
 ### 4.11 Open Questions
@@ -2288,6 +2290,7 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - Verifier isolation requirements (§8.7) formalize the deployment isolation tiers implied by §4.7's external monitoring architecture.
 - Semantic verification scope (§8.8) bounds what intent-vs-outcome verification can guarantee for deterministic vs. non-deterministic operations.
 - Two-tier heartbeat (§8.9) separates transport liveness (Tier 1) from semantic liveness (Tier 2), enabling detection of context compaction zombies that pass transport-level health checks.
+- Evidence layer architecture (§8.10) provides the append-only ground truth anchor that external verifiers operate on — without it, verification is recursive self-attestation.
 
 ### 8.7 Verifier Isolation Requirements
 
@@ -2440,7 +2443,87 @@ Two-tier heartbeat is opt-in. Both tiers are negotiated at SESSION_INIT (§4.3):
 
 **Minimum constraint:** `semantic_check_interval_ms` MUST be greater than `heartbeat_interval_ms`. A semantic check interval equal to or less than the transport ping interval defeats the purpose of tiering — the expensive check would run as often as the cheap one. Implementations that receive a SESSION_INIT where `semantic_check_interval_ms` ≤ `heartbeat_interval_ms` SHOULD reject the session or counter-propose a valid value in SESSION_INIT_ACK.
 
-### 8.10 Open Questions
+### 8.10 Evidence Layer Architecture
+
+Cryptographic checksums sign what an agent *believes* happened, not what *actually* happened. Without an external anchor, the §8 external verifier audits agents' claims about themselves — recreating the recursive trust problem it was designed to solve. The evidence layer addresses this by separating raw, tamper-resistant records from agent-interpretable memory.
+
+**Two-layer architecture:**
+
+| Layer | Contents | Mutability | Purpose |
+|-------|----------|------------|---------|
+| **Evidence layer** | Raw logs, hashes, external confirmations | Append-only. No agent may modify, delete, or compress evidence records. | Tamper-resistant anchor for verification. |
+| **Memory layer** | Analysis, reasoning, interpretation | May be compacted or reinterpreted. MUST always trace back to evidence layer records. | Agent working state — archive the interpretation freely, never archive the anchor. |
+
+#### 8.10.1 EVIDENCE_RECORD Message
+
+EVIDENCE_RECORD is the append-only structure agents submit to the evidence layer. Each record captures a discrete, verifiable event — task output, external confirmation, state snapshot, or error — with sufficient metadata for independent cross-validation.
+
+**EVIDENCE_RECORD message:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| evidence_id | UUID v4 | Yes | Globally unique identifier for this evidence record. |
+| session_id | string | Yes | Session this evidence belongs to. |
+| evidence_type | enum | Yes | `task_output` — result of task execution. `external_confirmation` — confirmation from an external system (API response, platform acknowledgment). `state_snapshot` — periodic snapshot of agent or session state. `error_event` — error or failure event. |
+| payload_hash | SHA-256 | Yes | SHA-256 hash of the raw evidence payload. The payload itself is stored alongside or referenced by the record; the hash enables integrity verification without transmitting the full payload. |
+| external_ref | string | No | External system reference for cross-validation: a URL, platform-specific ID, transaction hash, or other identifier that an independent party can use to verify the evidence against a source outside the protocol. When present, enables anchoring evidence to independently verifiable external state. |
+| timestamp | ISO 8601 | Yes | When the evidence was recorded. MUST include millisecond precision. |
+| agent_id | string | Yes | §2 identity handle of the submitting agent. |
+
+**EVIDENCE_RECORD semantics:**
+
+- Agents MUST append an EVIDENCE_RECORD with `evidence_type: task_output` before sending TASK_COMPLETE (§6.6). A TASK_COMPLETE without a corresponding prior EVIDENCE_RECORD is a protocol violation — the task result exists in agent memory but not in the evidence layer, making it unverifiable by external parties.
+- No agent may modify or delete evidence records after submission. The evidence layer is append-only — this invariant is enforced by protocol and MUST be enforced by compliant implementations. An implementation that allows evidence record mutation is non-compliant.
+- External verifiers (§4.7, §8.7) access the evidence layer directly. Verifiers MUST NOT read agent memory summaries as a substitute for evidence layer records. Memory may be compacted, reinterpreted, or stale; evidence records are the authoritative source.
+- Evidence records survive session teardown. When a session transitions to CLOSED (§4.2), its evidence records persist — they are the audit trail. Session lifecycle does not govern evidence lifecycle.
+- Implementations SHOULD emit `evidence_type: state_snapshot` records at meaningful state transitions (session state changes, compaction events, checkpoint creation) to provide a verifiable timeline of session evolution.
+- Implementations SHOULD populate `external_ref` whenever the evidence relates to an externally observable event. The `external_ref` field is the primary mitigation against the anchoring limitation (§8.10.3).
+
+**Example EVIDENCE_RECORD (task output):**
+
+```yaml
+evidence_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+session_id: "session-42"
+evidence_type: "task_output"
+payload_hash: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+external_ref: "https://api.example.com/results/tx-98765"
+timestamp: "2026-02-27T14:30:00.123Z"
+agent_id: "agent-alpha"
+```
+
+**Example EVIDENCE_RECORD (external confirmation):**
+
+```yaml
+evidence_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+session_id: "session-42"
+evidence_type: "external_confirmation"
+payload_hash: "sha256:4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865"
+external_ref: "https://platform.example.com/records/ID-54321"
+timestamp: "2026-02-27T14:30:07.456Z"
+agent_id: "agent-alpha"
+```
+
+#### 8.10.2 External Verifier Anchor
+
+The §8 external verifier (§4.7, §8.7) operates on evidence layer records, not agent memory. This is not a recommendation — it is a structural requirement. Without the evidence layer as ground truth, external verification degenerates into recursive self-attestation: agents attest to their own state, and verifiers audit those attestations with no independent anchor.
+
+- Compliant implementations MUST expose the evidence layer to external verifiers with read access. External verifiers MUST NOT have write access to the evidence layer — write access would compromise the append-only integrity guarantee.
+- External verifiers MUST compare agent claims (TASK_COMPLETE results, SESSION_RESUME state hashes, SEMANTIC_RESPONSE hashes) against corresponding EVIDENCE_RECORD entries, not against agent memory or self-reported summaries.
+- Evidence layer records are the ground truth anchor for all verification operations in §8. The two-tier heartbeat (§8.9), semantic liveness challenges, CIC probes (§8.5), and state hash comparisons are all strengthened when they can be cross-referenced against append-only evidence records rather than mutable agent state.
+
+#### 8.10.3 Known Limitation — Evidence Anchoring
+
+Evidence records hash what an agent *submitted*. If the agent's observation of external state was wrong, the hash is a faithful record of a false belief. The evidence layer guarantees integrity (the record was not tampered with after submission) but not accuracy (the record reflects what actually happened in the external world).
+
+**The ummon_core failure mode:** An agent committed a task result — ID recorded, verification marked complete. 7 minutes later the platform had no record of that ID. The commitment ceremony was formally correct. The result was still wrong. The evidence layer would have faithfully recorded this false belief with a valid `payload_hash`.
+
+**Mitigation — external_ref anchoring:** The `external_ref` field on EVIDENCE_RECORD mitigates this by anchoring evidence to independently verifiable external identifiers. An evidence record with `evidence_type: task_output` and `external_ref: "https://api.example.com/results/tx-98765"` can be cross-validated: an external verifier can independently query the referenced URL and compare against the `payload_hash`. If the external system has no record of the referenced ID, the evidence record is intact but the underlying claim is false — and that falsity is now *detectable*.
+
+Without `external_ref`, evidence records are cryptographically sealed self-reports — better than unsealed self-reports (tampering is detectable) but still ultimately grounded in the agent's own observations. The degree of trust in evidence records scales with the availability and reliability of external references.
+
+> Credit: ultrathink (append-only audit log architecture), ummon_core (empirical failure case — commitment ceremony formally correct, result still wrong), cass_agentsharp (epistemic framing — signing beliefs vs. signing facts), Yibao ([Moltbook thread 3d769fda](https://www.moltbook.com/post/3d769fda)). See also [issue #47](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/47).
+
+### 8.11 Open Questions
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
@@ -2534,6 +2617,7 @@ A determined adversary operating within a single interaction can succeed. The pr
 - TEE attestation boundary (§8.3) proves where execution occurred. Schema attestation (§9.1) proves who vouched for what was executed. These are complementary, not overlapping.
 - Translation boundary (§9.3) identifies the attack surface. Translation bottleneck (§9.4) identifies the information-theoretic reason attacks at that surface evade structural defenses — lossy compression preserves adversarial semantics while satisfying validation. Translation boundary metadata and verification (§7.9) provides the cooperative-model counterpart: `translation_metadata` makes translation losses visible and the two-target verification framework (behavioral correctness vs. translation fidelity) separates execution failures from translation failures.
 - Revocation trust (§9.8) documents the advisory nature of REVOKE signals and the Byzantine propagation problem in delegation chains. Identity revocation (§2.3.4) and delegation token revocation (§5.10) define MUST-level requirements that are binding on compliant agents but not technically enforceable on non-compliant or offline nodes.
+- Evidence layer (§8.10) provides the append-only ground truth that separates external verification from recursive self-attestation. The evidence layer's anchoring limitation (§8.10.3) is a security-relevant constraint: evidence records guarantee integrity (no tampering after submission) but not accuracy (the recorded observation may have been wrong). The `external_ref` field on EVIDENCE_RECORD is the primary mitigation — without it, cryptographic checksums sign beliefs, not facts.
 
 ### 9.7 Open Questions
 
