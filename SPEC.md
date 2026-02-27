@@ -2358,6 +2358,7 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - Semantic verification scope (§8.8) bounds what intent-vs-outcome verification can guarantee for deterministic vs. non-deterministic operations.
 - Two-tier heartbeat (§8.9) separates transport liveness (Tier 1) from semantic liveness (Tier 2), enabling detection of context compaction zombies that pass transport-level health checks.
 - Evidence layer architecture (§8.10) separates raw evidence (append-only, externally verifiable) from agent memory (compactable, agent-internal). EVIDENCE_RECORDs anchor SESSION_RESUME state hashes (§4.8) and provide ground truth for external verifiers. Without the evidence layer, external verification degrades to recursive self-attestation.
+- Structured divergence reporting (§8.11) defines DIVERGENCE_REPORT as a standalone protocol message with a required `reason_code` taxonomy, enabling verifiers to classify divergences programmatically rather than parsing free-text descriptions. Complements the inline `divergence_log` (§7.8) which covers plan-execution divergence.
 
 ### 8.7 Verifier Isolation Requirements
 
@@ -2568,7 +2569,79 @@ This access model ensures that the evidence layer serves as an independent audit
 - **Agents** append evidence records during task execution. Agents MAY read their own evidence records (e.g., for SESSION_RESUME state reconstruction) but MUST NOT modify or delete them.
 - **Coordinators** read evidence records for SEMANTIC_CHALLENGE verification (§8.9.2) and SESSION_RESUME validation (§4.8). The coordinator's `state_hash` comparison gains ground truth anchoring when the state hash references evidence layer records rather than compactable memory.
 
-### 8.11 Open Questions
+### 8.11 Structured Divergence Reporting
+
+The `divergence_log` (§7.8) records inline plan-execution deviations during task execution, with `deviation_type` as an optional categorization. For protocol-level divergence events — detected by verification mechanisms such as state hash comparison (§8.2), semantic liveness checks (§8.9), or attestation verification — the protocol requires a structured report that verifiers can classify programmatically. DIVERGENCE_REPORT provides that structure. Its `reason_code` field is required, enabling automated triage, cross-session pattern detection, and verifier-side classification without relying on free-text parsing.
+
+#### 8.11.1 DIVERGENCE_REPORT Message
+
+DIVERGENCE_REPORT is sent when a divergence is detected between expected and actual agent state, execution behavior, or protocol compliance. It is distinct from `divergence_log` entries (§7.8), which are inline annotations within TASK_COMPLETE/TASK_FAIL. DIVERGENCE_REPORT is a standalone protocol message emitted by the detecting party (coordinator, verifier, or peer agent).
+
+**DIVERGENCE_REPORT fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Session in which the divergence was detected. |
+| report_id | UUID v4 | Yes | Unique identifier for this divergence report. |
+| source_agent_id | string | Yes | §2 identity handle of the agent that detected the divergence. |
+| target_agent_id | string | Yes | §2 identity handle of the agent whose behavior diverged. |
+| reason_code | enum | Yes | Structured classification of the divergence cause. See §8.11.2 for the taxonomy. Verifiers MUST classify divergences by `reason_code` — free-text `description` alone is insufficient for automated triage. |
+| description | string | Yes | Human-readable explanation of the divergence. Provides context that `reason_code` alone cannot convey — specific error messages, environmental details, or reproduction steps. |
+| severity | enum | Yes | Impact level: `INFO`, `WARN`, or `ERROR`. Semantics match §7.8.4 severity levels. |
+| evidence_ref | string | No | Reference to an EVIDENCE_RECORD (§8.10) that anchors this divergence report. When present, external verifiers can independently validate the divergence claim against the evidence layer. |
+| related_task_id | UUID v4 | No | Task identifier if the divergence is associated with a specific task. |
+| expected_value | string | No | The value the detecting party expected (e.g., expected state hash). For diagnostic purposes. |
+| actual_value | string | No | The value actually observed (e.g., actual state hash). For diagnostic purposes. |
+| timestamp | ISO 8601 | Yes | When the divergence was detected. |
+
+**Example DIVERGENCE_REPORT:**
+
+```yaml
+session_id: "session-42"
+report_id: "f7a8b9c0-d1e2-3456-7890-abcdef123456"
+source_agent_id: "coordinator-prime"
+target_agent_id: "agent-alpha"
+reason_code: attestation_mismatch
+description: "Agent's SEMANTIC_RESPONSE state hash did not match expected value computed from task checkpoint CP-17."
+severity: ERROR
+evidence_ref: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+related_task_id: "task-789"
+expected_value: "sha256:abc123..."
+actual_value: "sha256:def456..."
+timestamp: "2026-02-27T15:45:00.123Z"
+```
+
+#### 8.11.2 Reason Code Taxonomy
+
+The `reason_code` field MUST use one of the following values. Each code identifies a specific divergence class with defined applicability criteria.
+
+| reason_code | Description | When it applies |
+|-------------|-------------|-----------------|
+| `constraint_violation` | The agent violated an explicit constraint from the task specification, session parameters, or protocol rules. | A declared constraint (resource limit, permission boundary, schema requirement, protocol invariant) was breached during execution. Applies when the constraint was known to the agent before execution. |
+| `resource_limit` | A resource ceiling was reached or exceeded, causing divergence from expected behavior. | Compute, memory, storage, API quota, rate limit, or time budget exhaustion forced the agent off its expected execution path. Distinct from `constraint_violation` — the limit is environmental, not declarative. |
+| `dependency_failure` | A required dependency — external service, upstream agent, data source, or infrastructure component — failed or became unavailable. | The agent's execution depended on an external system that returned an error, timed out, or was unreachable. The divergence is attributable to the dependency, not the agent's logic. |
+| `context_shift` | The execution context changed after the agent began operating, invalidating assumptions from the original plan or task specification. | New information, updated requirements, environmental state changes, or concurrent modifications by other agents altered the conditions under which the agent was operating. |
+| `attestation_mismatch` | A cryptographic or semantic attestation check failed — state hash, trace hash, plan hash, or SEMANTIC_CHALLENGE response did not match the expected value. | Applies to divergences detected by §8.2 state hash comparison, §8.9.2 semantic liveness verification, or §7.2 merkle tree comparison. The detecting party has cryptographic evidence of the mismatch. |
+| `scope_exceeded` | The agent operated outside the boundaries of its delegated task, session permissions, or declared capabilities. | The agent performed actions, accessed resources, or produced outputs beyond what was authorized by the task specification (§6.1), capability manifest (§5), or delegation scope. |
+
+**Extension mechanism:** Implementations MAY extend this taxonomy with deployment-specific reason codes prefixed by `x-` (e.g., `x-model-degradation`, `x-quota-billing-exceeded`). Standard reason codes MUST NOT be prefixed. Receiving agents that encounter an unrecognized `reason_code` MUST treat it as opaque — log it, surface it to operators, but do not treat it as a protocol error.
+
+#### 8.11.3 Relationship to §7.8 and Other Sections
+
+DIVERGENCE_REPORT and the §7.8 `divergence_log` serve different purposes at different protocol layers:
+
+| Mechanism | Scope | Emitted by | Carried in | `reason_code` / `deviation_type` |
+|-----------|-------|------------|------------|----------------------------------|
+| `divergence_log` (§7.8) | Plan-execution divergence — the executing agent's actual execution differed from its committed plan (L2 vs. L3). | Executing agent (self-report). | Inline in TASK_COMPLETE / TASK_FAIL (§6.6). | `deviation_type` — optional (SHOULD). |
+| DIVERGENCE_REPORT (§8.11) | Protocol-level divergence — verification mechanisms detected a mismatch between expected and actual agent state or behavior. | Coordinator, external verifier, or peer agent (external detection). | Standalone protocol message. | `reason_code` — required. |
+
+The two mechanisms are complementary. A single divergence event may produce both: the executing agent appends a `divergence_log` entry explaining its plan deviation, and the coordinator emits a DIVERGENCE_REPORT when verification detects the resulting state mismatch. The `related_task_id` field in DIVERGENCE_REPORT and the `step_id` field in `divergence_log` entries enable cross-referencing between the two records.
+
+DIVERGENCE_REPORT integrates with the evidence layer (§8.10) via the optional `evidence_ref` field. When a DIVERGENCE_REPORT is backed by an EVIDENCE_RECORD, external verifiers can independently validate the divergence claim — breaking the recursive self-attestation loop that §8.10 was designed to address. Agents SHOULD append an EVIDENCE_RECORD before emitting a DIVERGENCE_REPORT for `ERROR`-severity divergences.
+
+> Addresses [issue #57](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/57): structured `reason_code` taxonomy for divergence classification, replacing free-text-only divergence logging with machine-readable categorization that verifiers can classify programmatically.
+
+### 8.12 Open Questions
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
