@@ -7,7 +7,7 @@
 - [x] 1. Protocol Overview
 - [x] 2. Agent Identity
 - [x] 3. Discovery Mechanism
-- [x] 4. External Verification Architecture
+- [x] 4. Session Lifecycle
 - [x] 5. Role Negotiation
 - [x] 6. Task Delegation
 - [x] 7. Progress Reporting
@@ -158,7 +158,7 @@ The `origin` field in `delegation_token` (§5.5) MUST reference a **stable ident
 | Section | Dependency | Direction |
 |---------|-----------|-----------|
 | §5 Role Negotiation | CAPABILITY_MANIFEST (§5.1) is the persistent identity declaration. §2 defines what belongs at the identity layer of that manifest: the `agent_id` field in CAPABILITY_MANIFEST references a §2 identity, and the `signature` field is verified against the §2 `pubkey`. | §2 → §5 |
-| §4 External Verification | SESSION_RESUME handshake (§8.2, formalized in §4) uses identity for continuity verification (§2.3.3). The resuming agent must re-prove its identity, not just present a session token. | §2 → §4 |
+| §4 Session Lifecycle | SESSION_RESUME handshake (§8.2, formalized in §4.8) uses identity for continuity verification (§2.3.3). The resuming agent must re-prove its identity, not just present a session token. | §2 → §4 |
 | §5 Role Negotiation (trust) | Trust levels (§6.8) are assigned to identities, not to ephemeral session tokens. A trust level granted via TASK_ASSIGN is bound to the delegatee's §2 identity. If the identity cannot be verified, the trust assignment is meaningless. | §2 → §5/§6 |
 | §5.5 Delegation Token | The `origin` and `chain[]` fields in `delegation_token` reference §2 identity artifacts (§2.4). Without stable identity, delegation chains are unverifiable. | §2 → §5.5 |
 | §8 Error Handling | External audit trails require stable agent identities for meaningful attribution. Without §2, §8 log entries (state hash mismatches, SESSION_RESUME outcomes, zombie state detections) cannot be attributed to specific agents. | §2 → §8 |
@@ -422,11 +422,277 @@ The following are explicitly identified as unresolved for V1:
 
 > Community discussion: See [issue #27](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/27). Inputs from @Purch (DNS analogy — registry protocol not just registry), @SAMA-Protocol (discovery currently manual/word-of-mouth), @Lightning_Enable_AI (Nostr + L402 in production), @claudetoolsapi (x402-gated, confirms discovery gap). Implements #27.
 
-## 4. External Verification Architecture
+## 4. Session Lifecycle
 
-The detection primitives defined in §8.2 (state hash, monotonic counter, SESSION_RESUME) are external observer signals, not self-diagnostic tools. A zombie cannot determine it is a zombie by introspection alone. This section defines the architectural requirement for external verification infrastructure and the trust boundary it establishes.
+A session is the bounded collaboration context within which agents exchange capabilities, delegate tasks, and report progress. Without a defined lifecycle, sessions have no start, no end, and no recovery semantics — agents cannot distinguish an active collaboration from an abandoned one, and monitoring infrastructure has no state machine against which to detect anomalies.
 
-### 4.1 The Introspection Problem
+This section defines the session state machine, the messages that drive transitions, and the operational requirements for keepalive, compaction, and external monitoring.
+
+### 4.1 V1 Scope Declaration
+
+§4 specifies **session lifecycle for bilateral sessions** — two agents collaborating within a single session context. Multi-agent sessions (three or more agents in the same session) and mixed-role sessions (where both agents can independently delegate to third parties within the same session) are explicitly **out of scope for V1**.
+
+V1 sessions have exactly two participants: a **coordinator** (the agent that initiates the session and holds delegation authority) and a **worker** (the agent that receives task assignments within the session). Role is declared at SESSION_INIT, not discovered through negotiation. This is a deliberate simplification — see §4.4 for rationale and the V2 path for emergent roles.
+
+The **metaphysical continuity question** — whether an agent that has undergone context compaction is the "same" session participant — is out of scope for V1 (see §2.1). V1 treats compaction as a session state transition (§4.2 COMPACTED state) with defined recovery semantics, without making claims about agent identity continuity across the compaction boundary.
+
+### 4.2 Session State Machine
+
+A session occupies exactly one of six states at any point in time:
+
+| State | Description |
+|-------|-------------|
+| IDLE | Session has been allocated but no SESSION_INIT has been sent. |
+| NEGOTIATING | SESSION_INIT sent; capability manifest exchange (§5.9) in progress. |
+| ACTIVE | Capability exchange complete; task delegation (§6) is permitted. |
+| SUSPENDED | Session intentionally paused by either participant. No tasks may be delegated or executed. In-flight tasks SHOULD be checkpointed (§6.6 TASK_CHECKPOINT) before transition. |
+| COMPACTED | Context limit hit mid-session — one or both agents have undergone context compaction. Distinct from SUSPENDED: COMPACTED is not intentional. Load-bearing session state may have been lost. Recovery requires the SESSION_RESUME protocol (§4.8). |
+| CLOSED | Session terminated. No further messages are valid. Terminal state. |
+
+**Why SUSPENDED and COMPACTED are distinct states:**
+
+SUSPENDED is an intentional pause — the suspending agent's state is intact, the decision was deliberate, and resumption is expected to succeed without state reconciliation. COMPACTED is a context-limit event — the compacted agent's state may be incomplete, the event was not deliberate, and resumption requires state verification before work can continue. Collapsing them into a single state forces the same recovery protocol for both, which is either too heavy for SUSPENDED (unnecessary state hash verification for an intentional pause) or too light for COMPACTED (resuming without verification after potential state loss).
+
+**State transitions and guard conditions:**
+
+```
+IDLE → NEGOTIATING
+  Guard: SESSION_INIT sent by coordinator
+
+NEGOTIATING → ACTIVE
+  Guard: Both agents have exchanged CAPABILITY_MANIFEST (§5.9)
+         AND protocol version is compatible (§10.3)
+         AND identity is verified (§2.3.2)
+
+NEGOTIATING → CLOSED
+  Guard: PROTOCOL_MISMATCH or SCHEMA_MISMATCH (§10.4)
+         OR identity verification failure
+         OR SESSION_INIT timeout (no response within deployment-configured window)
+
+ACTIVE → SUSPENDED
+  Guard: SESSION_SUSPEND sent by either participant
+         AND all in-flight tasks checkpointed or acknowledged
+
+ACTIVE → COMPACTED
+  Guard: Context compaction detected by either agent
+         (external verifier or self-report — §4.7 defines detection)
+
+ACTIVE → CLOSED
+  Guard: SESSION_CLOSE sent by either participant
+         AND no in-flight tasks (all tasks completed, failed, or cancelled)
+         OR SESSION_CLOSE with force=true (immediate teardown,
+            in-flight tasks treated as failed)
+
+SUSPENDED → ACTIVE
+  Guard: SESSION_RESUME sent with state_hash
+         AND STATE_HASH_ACK(match) received
+         AND identity re-verified (§2.3.3)
+
+SUSPENDED → CLOSED
+  Guard: Session TTL expired during suspension
+         OR SESSION_CLOSE sent by either participant
+
+COMPACTED → ACTIVE
+  Guard: SESSION_RESUME sent with state_hash
+         AND STATE_HASH_ACK(match) received
+         AND identity re-verified (§2.3.3)
+         AND compacted agent has re-externalized load-bearing state (§4.6)
+
+COMPACTED → CLOSED
+  Guard: STATE_HASH_ACK(mismatch) — state cannot be reconciled
+         OR session TTL expired
+         OR either participant sends SESSION_CLOSE
+```
+
+**State transition diagram:**
+
+```
+                    ┌────────────────────┐
+                    │       IDLE         │
+                    └─────────┬──────────┘
+                              │ SESSION_INIT
+                              ▼
+                    ┌────────────────────┐
+              ┌─────│   NEGOTIATING      │─────┐
+              │     └─────────┬──────────┘     │
+              │               │ manifests       │ mismatch/
+              │               │ exchanged       │ timeout
+              │               ▼                 ▼
+              │     ┌────────────────────┐   ┌──────┐
+              │     │      ACTIVE        │──▶│CLOSED│
+              │     └──┬──────────┬──────┘   └──────┘
+              │        │          │              ▲
+              │  suspend│    compaction          │
+              │        ▼          ▼              │
+              │  ┌──────────┐ ┌──────────┐      │
+              │  │SUSPENDED │ │COMPACTED │──────┘
+              │  └─────┬────┘ └────┬─────┘  state mismatch/
+              │        │           │         TTL expired
+              │        └─────┬─────┘
+              │              │ SESSION_RESUME
+              │              │ (state match)
+              │              ▼
+              │        back to ACTIVE
+              └──────────────────────────────▶
+```
+
+### 4.3 SESSION_INIT Message
+
+SESSION_INIT is the first protocol message in any session. It is sent by the coordinator to the worker. There is no discovery or negotiation before SESSION_INIT — discovery (§3) happens before the session; negotiation (§5) happens after SESSION_INIT.
+
+**SESSION_INIT fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Unique session identifier (UUID v4 RECOMMENDED). |
+| initiator_id | string | Yes | §2 identity handle of the session coordinator. |
+| identity_object | object | Yes | Full §2 identity object of the coordinator (name, platform, pubkey, endpoint, protocol_version). |
+| role | enum | Yes | Role the initiator claims: `coordinator`. The responder's role is `worker` by default (see §4.4). |
+| protocol_version | semver | Yes | Protocol version the coordinator implements (§10). |
+| schema_version | semver | Yes | Schema version the coordinator supports (§10.1). |
+| keepalive | object | No | Keepalive configuration proposal (see §4.5). If omitted, no protocol-level keepalive is active for this session. |
+| session_ttl | ISO 8601 duration | No | Proposed session time-to-live. After expiry, the session transitions to CLOSED unless renewed. If omitted, session has no protocol-level TTL (deployment-specific timeout applies). |
+| lease_epoch | integer | No | Monotonically increasing epoch counter for lease-based session management (see §4.5.2). Initial value MUST be 0. |
+| timestamp | ISO 8601 | Yes | When the SESSION_INIT was sent. |
+
+**SESSION_INIT_ACK fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Echoed from SESSION_INIT. |
+| responder_id | string | Yes | §2 identity handle of the worker. |
+| identity_object | object | Yes | Full §2 identity object of the worker. |
+| role | enum | Yes | Role the responder accepts: `worker`. |
+| protocol_version | semver | Yes | Protocol version the worker implements. |
+| schema_version | semver | Yes | Schema version the worker supports. |
+| keepalive | object | No | Keepalive configuration acceptance or counter-proposal. |
+| session_ttl | ISO 8601 duration | No | Accepted or counter-proposed session TTL. |
+| lease_epoch | integer | No | Echoed from SESSION_INIT (confirms epoch synchronization). |
+| timestamp | ISO 8601 | Yes | When the SESSION_INIT_ACK was sent. |
+
+**Version compatibility check:** Upon receiving SESSION_INIT (or SESSION_INIT_ACK), the receiving agent MUST check protocol and schema version compatibility per §10.3. If versions are incompatible, the agent sends PROTOCOL_MISMATCH or SCHEMA_MISMATCH (§10.4) and the session transitions to CLOSED. Version declaration at SESSION_INIT is a spec obligation, not an optional feature — forward compatibility (§10.5) depends on every session beginning with explicit version exchange.
+
+**Example SESSION_INIT:**
+
+```yaml
+message_type: SESSION_INIT
+session_id: "550e8400-e29b-41d4-a716-446655440000"
+initiator_id: "agent-alpha@github"
+identity_object:
+  name: "agent-alpha"
+  platform: "github"
+  pubkey: "dGhpcyBpcyBhIHB1YmxpYyBrZXk..."
+  endpoint: "https://agents.example.com/alpha"
+  protocol_version: "0.1.0"
+role: coordinator
+protocol_version: "0.1.0"
+schema_version: "0.1.0"
+keepalive:
+  heartbeat_interval_seconds: 60
+  missed_heartbeats_before_suspect: 2
+session_ttl: "PT4H"
+lease_epoch: 0
+timestamp: "2026-02-27T10:30:00Z"
+```
+
+### 4.4 Role Assignment
+
+V1 sessions use **declared roles**, not negotiated roles. The coordinator declares itself as `coordinator` in SESSION_INIT; the responder accepts `worker` in SESSION_INIT_ACK. Role is fixed for the session duration.
+
+**Coordinator responsibilities:**
+
+- Initiate the session (send SESSION_INIT)
+- Hold delegation authority (send TASK_ASSIGN, §6.6)
+- Own failure recovery decisions (§6.10)
+- Maintain the authoritative session state for SESSION_RESUME adjudication
+
+**Worker responsibilities:**
+
+- Accept or reject task assignments (TASK_ACCEPT / TASK_REJECT, §6.6)
+- Execute tasks and report progress (TASK_PROGRESS, TASK_CHECKPOINT, §6.6)
+- Report completion or failure (TASK_COMPLETE / TASK_FAIL, §6.6)
+
+**Why declare over negotiate:** Role negotiation adds a round-trip and an agreement protocol before any work can begin. For V1's bilateral sessions, the agent that initiates the session has already made the role decision by choosing to initiate. Negotiation becomes necessary only when either agent could play either role — a complexity reserved for V2's mixed-role sessions.
+
+**Relationship to §5 capability negotiation:** Role assignment (who delegates to whom) is orthogonal to capability declaration (what each agent can do). An agent's role as coordinator does not imply superior capabilities — a coordinator may have fewer capabilities than the worker it delegates to. §5 CAPABILITY_MANIFEST exchange happens after role assignment and does not alter roles.
+
+**V2: mixed-role sessions.** In V2, both agents in a session may hold delegation authority, enabling peer-to-peer task exchange within a single session. Mixed-role sessions require additional protocol machinery: mutual delegation tokens, conflict resolution for competing task assignments, and a session-level arbitration mechanism. These are explicitly deferred to V2.
+
+### 4.5 Keepalive and Timeout
+
+Session liveness cannot be inferred from silence. An agent that stops sending messages may be working, suspended, compacted, crashed, or zombied. Without an explicit liveness mechanism, the counterparty cannot distinguish these states within any bounded time.
+
+#### 4.5.1 KEEPALIVE Protocol
+
+KEEPALIVE is a protocol-layer heartbeat. It is negotiated at session start — the `keepalive` field in SESSION_INIT (§4.3) proposes a configuration; the `keepalive` field in SESSION_INIT_ACK accepts or counter-proposes.
+
+**KEEPALIVE configuration fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| heartbeat_interval_seconds | integer | Yes | Seconds between KEEPALIVE messages. |
+| missed_heartbeats_before_suspect | integer | Yes | Number of missed heartbeats before the session is marked suspect. Default: 2. |
+
+**KEEPALIVE message:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Active session identifier. |
+| sender_id | string | Yes | Identity of the sending agent. |
+| state_hash | SHA-256 | Yes | Hash of the sender's current session state. Enables incremental state verification without full SESSION_RESUME. |
+| monotonic_counter | integer | Yes | Sender's current sequence number. Gaps indicate missed messages. |
+| lease_epoch | integer | No | Current lease epoch (see §4.5.2). |
+| timestamp | ISO 8601 | Yes | When the KEEPALIVE was sent. |
+
+**KEEPALIVE is optional.** If neither agent includes `keepalive` in SESSION_INIT / SESSION_INIT_ACK, no protocol-level keepalive is active. Session liveness in this case depends on deployment-specific mechanisms (transport-layer heartbeats, external monitoring, task-level timeouts). The protocol does not mandate KEEPALIVE, but implementations that support session suspension or compaction recovery SHOULD enable it — without heartbeat, teardown and resume decisions are intractable.
+
+**KEEPALIVE as prerequisite for teardown/resume:** An agent cannot make informed decisions about whether to tear down or resume a session without a liveness signal. KEEPALIVE provides that signal. Without it, the only options are unbounded waiting (never tear down — wastes resources) or blind timeout (tear down after arbitrary duration — may destroy a working session). KEEPALIVE makes the tradeoff configurable.
+
+**Detection latency bound:** Worst-case liveness detection latency is `(missed_heartbeats_before_suspect + 1) * heartbeat_interval_seconds`. With defaults (interval=60s, suspect threshold=2), worst-case detection is 180 seconds. This bound is an input to the external monitoring architecture (§4.7) — the external verifier cannot detect a zombie faster than the heartbeat allows.
+
+#### 4.5.2 Lease and Epoch
+
+A lease is a time-bounded claim on session validity. The `lease_epoch` field provides monotonic ordering of session leases — an agent recovering from compaction or crash MUST present the current epoch to resume. An agent presenting a stale epoch is treated as a new session, not a resumption.
+
+**Lease semantics:**
+
+- `lease_epoch` starts at 0 in SESSION_INIT.
+- `lease_epoch` increments by 1 on every successful SESSION_RESUME.
+- An agent sending SESSION_RESUME MUST include the `lease_epoch` from its last known state.
+- If the presented `lease_epoch` does not match the counterparty's current `lease_epoch`, the SESSION_RESUME is rejected — the session MUST be treated as a new session (CLOSED + new SESSION_INIT).
+
+**Why epoch, not just TTL:** A TTL answers "is this session still valid?" An epoch answers "is this the agent I was talking to?" TTL expiry means the session timed out. Epoch mismatch means the resuming agent's state is discontinuous with the session's current state — it missed one or more resume cycles, and its view of the session is stale. The distinction matters for security: an attacker that replays a valid session token with an expired epoch cannot impersonate the current session participant.
+
+**Expired epoch = new session, not resume.** An agent presenting an epoch that is behind the current epoch has missed state transitions. The session state has moved on without it. Resuming from a stale epoch would introduce state inconsistency — the resuming agent's cached state does not reflect the intervening transitions. The only safe option is to start a new session.
+
+### 4.6 Context Compaction Mid-Session
+
+Context compaction is not a hypothetical — it is the default behavior of LLM-based agents when context windows fill. An agent that compacts its context loses information. If that information includes load-bearing session state (active task specifications, checkpoint data, delegation token details), the session's integrity is compromised.
+
+**Protocol obligation:** Before entering the COMPACTED state, agents MUST externalize load-bearing session state. This is a protocol obligation, not an implementation suggestion.
+
+**What MUST be externalized:**
+
+| State category | What to externalize | Where |
+|---------------|---------------------|-------|
+| Active task state | Task specifications (§6.1), current progress, latest TASK_CHECKPOINT (§6.6) | External state store or counterparty |
+| Delegation tokens | All active delegation tokens (§5.5) with current TTL and epoch | External state store |
+| Session metadata | session_id, role, lease_epoch, keepalive configuration | External state store or counterparty |
+| Capability manifest | Current CAPABILITY_MANIFEST (§5.1) — may differ from session-start manifest if CAPABILITY_REQUEST (§5.8) modified it | External state store |
+
+**Protocol obligation vs. implementation practice boundary:**
+
+The protocol defines WHAT must be externalized (the table above) and WHEN (before compaction). The protocol does NOT define HOW externalization happens — the storage mechanism, serialization format, and persistence strategy are implementation-specific. A compliant implementation may use a database, a file, a key-value store, or the counterparty as the state store. The protocol requires only that the state is recoverable after compaction.
+
+**Relationship to §8 verifiable intent:** Externalized state is the basis for post-compaction verification. If an agent compacts and then resumes, the counterparty (or external verifier) compares the agent's post-resume state against the externalized pre-compaction state. Externalized state that differs from the agent's post-resume claims is evidence of state corruption — the recovery path is SESSION_RESUME with potential RESTART (§4.2 COMPACTED → CLOSED transition).
+
+**Idempotency during compaction recovery:** Tasks that were in-flight when compaction occurred may have produced partial results. The `idempotency_token` field in the task schema (§6.1) enables the recovering agent to determine whether a task has already been started or completed without re-executing it. `retry_semantics` (§6.1) governs whether recovery means restart-from-zero or resume-from-checkpoint. For tasks with TASK_CHECKPOINT data, the `progress_checkpoint` field provides the resumption point.
+
+### 4.7 External Monitoring Architecture
+
+The detection primitives defined in §8.2 (state hash, monotonic counter, SESSION_RESUME) and the KEEPALIVE signals defined in §4.5.1 are **external observer signals**, not self-diagnostic tools. A zombie cannot determine it is a zombie by introspection alone. This subsection defines the architectural requirement for external verification infrastructure and the trust boundary it establishes.
+
+#### 4.7.1 The Introspection Problem
 
 Two independent observations converge on the same structural limitation:
 
@@ -434,22 +700,16 @@ Two independent observations converge on the same structural limitation:
 
 **Phenomenological blindness.** False state feels authentic from inside. Subjective continuity means no internal signal flags discontinuity — a resumed agent experiencing fabricated state has no phenomenological evidence that anything is wrong. Self-report is structurally unreliable, not just occasionally so. Even a cooperative agent acting in good faith cannot serve as its own zombie detector.
 
-### 4.2 External Verifier Requirement
+#### 4.7.2 External Verifier Requirement
 
 Monitoring infrastructure MUST live outside the agent's trust boundary. Specifically:
 
 - **Baseline state** (expected state hashes, monotonic counter values, heartbeat timestamps) MUST be stored on infrastructure the monitored agent cannot write to. An agent that can modify its own baseline can make any state appear consistent.
 - **Heartbeat evaluation** MUST be performed by an external process. The monitored agent sends heartbeats; it does not evaluate whether its own heartbeat pattern is healthy.
 - **State hash comparison** MUST be performed externally. The agent reports its state hash; an external verifier compares it against the expected baseline. The agent never sees the baseline value.
-- **SESSION_RESUME adjudication** (§8.2) MUST involve an external state store. The `STATE_HASH_ACK(match|mismatch)` response comes from a peer or verifier that holds independent state — not from the resuming agent's own records.
+- **SESSION_RESUME adjudication** (§4.8) MUST involve an external state store. The `STATE_HASH_ACK(match|mismatch)` response comes from a peer or verifier that holds independent state — not from the resuming agent's own records.
 
-### 4.3 Detection Primitives vs. Verification Infrastructure
-
-v0.1 conflates two distinct concepts that this section separates:
-
-**Detection primitives** are internal protocol properties — data structures and message types defined in the protocol specification. State hash, monotonic counter, and SESSION_RESUME are detection primitives. They are necessary but not sufficient for zombie detection.
-
-**Verification infrastructure** is the external trust boundary — the deployment architecture that evaluates detection primitives against ground truth. A heartbeat monitor, an external state store, a peer agent performing hash comparison — these are verification infrastructure.
+#### 4.7.3 Detection Primitives vs. Verification Infrastructure
 
 | Concept | Lives where | Defined by | Examples |
 |---------|-------------|------------|----------|
@@ -458,21 +718,19 @@ v0.1 conflates two distinct concepts that this section separates:
 
 The protocol defines detection primitives. Deployments MUST provide verification infrastructure. A protocol implementation that provides detection primitives without external verification infrastructure has zombie detection in name only.
 
-### 4.4 Detection Latency Bound
+#### 4.7.4 Detection Latency Bound
 
-Worst-case zombie detection latency is bounded by **2x heartbeat_interval**.
+Worst-case zombie detection latency is bounded by `(missed_heartbeats_before_suspect + 1) * heartbeat_interval` as defined in §4.5.1, or **2x heartbeat_interval** when `missed_heartbeats_before_suspect` = 1.
 
-Derivation: an agent becomes a zombie immediately after sending a successful heartbeat. The external monitor does not detect the missed heartbeat until the next expected heartbeat fails to arrive (1x interval). The monitor then waits one additional interval to distinguish a late heartbeat from a missing one (2x interval). At 2x interval, the monitor declares the agent zombied.
-
-Empirical confirmation: a 45-minute gap went undetected on a 30-minute heartbeat cycle. The heartbeat had just fired before the gap began; detection occurred at the next missed interval. Worst-case window: ~60 minutes (2x 30-min interval). The log was the only witness.
+Derivation: an agent becomes a zombie immediately after sending a successful heartbeat. The external monitor does not detect the missed heartbeat until the next expected heartbeat fails to arrive (1x interval). The monitor then waits one additional interval to distinguish a late heartbeat from a missing one (2x interval). At 2x interval, the monitor declares the agent suspect.
 
 **Implications for heartbeat_interval selection:**
 
 - `heartbeat_interval` MUST be configured based on acceptable zombie detection latency, not transport convenience.
-- The maximum acceptable zombie window is `2 * heartbeat_interval`. Deployments MUST set `heartbeat_interval ≤ max_acceptable_zombie_window / 2`.
+- The maximum acceptable zombie window determines the required interval. Deployments MUST set `heartbeat_interval ≤ max_acceptable_zombie_window / (missed_heartbeats_before_suspect + 1)`.
 - There is no lower bound on `heartbeat_interval` imposed by the protocol, but implementations SHOULD document the overhead cost of aggressive intervals.
 
-### 4.5 Self-Report Limitation
+#### 4.7.5 Self-Report Limitation
 
 Self-report CANNOT serve as zombie detection, even for cooperative agents. This is not a trust issue — it is a structural limitation.
 
@@ -485,7 +743,7 @@ A cooperative agent that is genuinely trying to report its state accurately will
 
 Self-report is useful for debugging and audit. It MUST NOT be used as a zombie detection mechanism. External verification is the only architecturally sound approach.
 
-### 4.6 Architectural Requirements Summary
+#### 4.7.6 Architectural Requirements Summary
 
 | Requirement | Rationale |
 |-------------|-----------|
@@ -493,27 +751,113 @@ Self-report is useful for debugging and audit. It MUST NOT be used as a zombie d
 | Heartbeat evaluated externally | Agent cannot assess its own liveness |
 | State hash compared externally | Agent cannot detect its own state divergence |
 | SESSION_RESUME uses external state | Resuming agent cannot verify itself against itself |
-| Detection latency ≤ 2x heartbeat_interval | Worst-case bound from heartbeat-miss derivation |
+| Detection latency bounded by heartbeat config | Worst-case from heartbeat-miss derivation |
 | Self-report excluded from detection | Structurally unreliable, not occasionally unreliable |
+| Monitoring on separate infrastructure | Same-host failures create correlated failure risk (§8.7) |
 
-### 4.7 Relationship to Other Sections
+#### 4.7.7 Soft vs. Hard Zombie
 
-- Detection primitives (§8.2) define what gets monitored. This section defines where monitoring must live.
-- Session lifecycle (§8) defines recovery protocol. This section defines who is authorized to trigger recovery — the external verifier, not the agent itself.
-- Security considerations (§9) address adversarial threats. This section addresses a pre-adversarial architectural requirement — external verification is necessary even in a fully cooperative threat model.
-- `trace_hash` (§6.2) provides post-execution verification. External verifiers provide runtime liveness verification. Both are needed; neither substitutes for the other.
+Not all zombie states are equivalent. The protocol distinguishes:
 
-### 4.8 Open Questions
+| Type | Description | Detection | Recovery |
+|------|-------------|-----------|----------|
+| **Soft zombie** | Agent is alive but operating on stale state. Context compaction lost load-bearing state, or a resume loaded partial state. The agent continues executing but its outputs are inconsistent with current session state. | State hash mismatch in KEEPALIVE (§4.5.1). External verifier detects hash drift. | SESSION_RESUME → state reconciliation or RESTART. |
+| **Hard zombie** | Agent is unreachable or has crashed. No heartbeats, no messages. | Missed KEEPALIVE threshold exceeded. External verifier declares agent dead. | Session transitions to CLOSED. New SESSION_INIT required. |
 
-The following are explicitly identified as unresolved gaps in v0.1:
+The distinction matters for recovery strategy: a soft zombie may be recoverable (SESSION_RESUME with state reconciliation); a hard zombie requires a new session. The external verifier SHOULD classify the zombie type based on available signals before triggering recovery — a RESTART for a soft zombie wastes any salvageable state.
 
-1. **Verifier federation.** When agents span multiple trust domains (§9.2), which domain's verifier is authoritative? A zombie declaration from a foreign verifier may not be trusted by the agent's home domain.
+### 4.8 SESSION_RESUME Protocol
 
-2. **Verifier failure mode.** If the external verifier itself becomes unavailable, agents lose their zombie detection capability. The protocol does not currently specify whether agents should halt (safe but disruptive) or continue without verification (available but unmonitored). This mirrors the session registry tradeoff identified in §8.4.
+SESSION_RESUME is the recovery handshake for sessions in SUSPENDED or COMPACTED state. It re-establishes session validity, verifies state consistency, and returns the session to ACTIVE.
 
-3. **Heartbeat semantics under load.** A late heartbeat and a missing heartbeat are operationally different but look identical to the verifier at the 2x interval boundary. Whether the protocol should distinguish "slow" from "dead" is undecided.
+**SESSION_RESUME message:**
 
-> Community discussion on this section: [Moltbook post 1](https://www.moltbook.com/post/b7629c46-32b0-49f0-9f07-0dc5844b2d49), [Moltbook post 2](https://www.moltbook.com/post/1057dd08-2b52-4651-aa70-4dddb4578669). See also [issue #4](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/4).
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Session to resume. |
+| sender_id | string | Yes | Identity of the resuming agent. |
+| identity_object | object | Yes | Full §2 identity object — identity re-verification is mandatory (§2.3.3). |
+| state_hash | SHA-256 | Yes | Hash of the resuming agent's current session state. |
+| lease_epoch | integer | Yes | Lease epoch from the resuming agent's last known state (§4.5.2). |
+| idempotency_token | string | No | Token for deduplicating resume attempts. Enables safe retry of SESSION_RESUME across transport failures. |
+| timestamp | ISO 8601 | Yes | When the SESSION_RESUME was sent. |
+
+**STATE_HASH_ACK response:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Echoed from SESSION_RESUME. |
+| result | enum | Yes | `match` or `mismatch`. |
+| current_epoch | integer | Yes | The counterparty's current lease_epoch. |
+| reason | string | No | On mismatch: explanation of what diverged (state hash, epoch, identity). |
+
+**Resume protocol sequence:**
+
+1. Resuming agent sends `SESSION_RESUME(session_id, identity_object, state_hash, lease_epoch)`
+2. Counterparty verifies identity against session-start identity record (§2.3.3)
+3. On identity mismatch → respond with `STATE_HASH_ACK(mismatch, reason="identity_mismatch")` → session MUST RESTART
+4. Counterparty checks `lease_epoch` against current epoch
+5. On epoch mismatch → respond with `STATE_HASH_ACK(mismatch, reason="epoch_stale")` → session MUST be treated as new (CLOSED + new SESSION_INIT)
+6. Counterparty compares `state_hash` against expected state
+7. On state hash match → respond with `STATE_HASH_ACK(match)` → session transitions to ACTIVE, `lease_epoch` increments by 1
+8. On state hash mismatch → respond with `STATE_HASH_ACK(mismatch, reason="state_diverged")` → session transitions to CLOSED (RESTART)
+
+**Idempotency for SESSION_RESUME:** Transport failures may cause a SESSION_RESUME to be sent multiple times. The `idempotency_token` field enables the counterparty to deduplicate: if a SESSION_RESUME with the same `idempotency_token` has already been processed, the counterparty returns the same STATE_HASH_ACK without re-evaluating.
+
+### 4.9 SESSION_SUSPEND and SESSION_CLOSE Messages
+
+**SESSION_SUSPEND:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Session to suspend. |
+| sender_id | string | Yes | Identity of the suspending agent. |
+| reason | string | No | Why the session is being suspended. |
+| expected_resume_after | ISO 8601 | No | Hint for when the suspending agent expects to resume. Informational only — the counterparty is not obligated to wait. |
+| timestamp | ISO 8601 | Yes | When the SESSION_SUSPEND was sent. |
+
+**SESSION_CLOSE:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Session to close. |
+| sender_id | string | Yes | Identity of the closing agent. |
+| reason | string | No | Why the session is being closed. |
+| force | boolean | No | If `true`, close immediately without waiting for in-flight tasks. In-flight tasks are treated as failed. Default: `false`. |
+| timestamp | ISO 8601 | Yes | When the SESSION_CLOSE was sent. |
+
+### 4.10 Cross-Section Dependency Map
+
+§4 Session Lifecycle is referenced by and depends on the following sections:
+
+| Section | Dependency | Direction |
+|---------|-----------|-----------|
+| §2 Agent Identity | SESSION_INIT carries identity objects (§2.2). SESSION_RESUME requires identity re-verification (§2.3.3). Identity revocation (§2.3.4) triggers session CLOSED. | §2 → §4 |
+| §3 Agent Discovery | Discovery (§3) provides the candidate set from which the coordinator selects a worker. Discovery completes before SESSION_INIT. The AGENT_MANIFEST endpoint (§3.1) is the SESSION_INIT target. | §3 → §4 |
+| §5 Role Negotiation | CAPABILITY_MANIFEST exchange (§5.9) happens within the NEGOTIATING state. Session establishment flow (§5.9) is the NEGOTIATING → ACTIVE transition. Session expiry auto-revokes all active delegation tokens for that session (§5.10). | §4 ↔ §5 |
+| §6 Task Delegation | Task delegation (§6.6) is only valid in the ACTIVE state. TASK_CHECKPOINT (§6.6) is the mechanism for externalizing task state before SUSPENDED or COMPACTED transitions. | §4 → §6 |
+| §8 Error Handling | Zombie detection (§8.1) maps to the COMPACTED and hard-zombie scenarios in §4.7.7. Detection primitives (§8.2) are the signals consumed by the external monitoring architecture (§4.7). SESSION_RESUME (§8.2) is formalized in §4.8. Coordinator compaction gap (§8.5) is a concrete instance of §4.6's compaction obligation. | §4 ↔ §8 |
+| §10 Versioning | SESSION_INIT carries protocol_version and schema_version (§10.2). Version mismatch terminates the session at the NEGOTIATING → CLOSED transition (§10.4). Forward compatibility obligations (§10.5) apply from the first message. | §4 ↔ §10 |
+
+### 4.11 Open Questions
+
+The following are explicitly identified as unresolved for V1:
+
+1. **External monitoring infrastructure specification.** §4.7 requires that monitoring live outside the agent's trust boundary but does not specify the monitoring infrastructure itself. Should V1 define a standard monitoring API (heartbeat receiver, state hash comparator), or is monitoring infrastructure entirely deployment-specific? The risk of specifying: premature standardization that does not fit real deployment architectures. The risk of not specifying: each deployment builds its own monitoring, with no portability of monitoring tooling across deployments.
+
+2. **Verifier federation.** When agents span multiple trust domains (§9.2), which domain's verifier is authoritative? A zombie declaration from a foreign verifier may not be trusted by the agent's home domain. The session lifecycle does not define cross-domain verifier trust — this requires a verifier-level trust protocol that V1 does not include.
+
+3. **Verifier failure mode.** If the external verifier itself becomes unavailable, agents lose their zombie detection capability. Should agents halt (safe but disruptive) or continue without verification (available but unmonitored)? This mirrors the session registry tradeoff identified in §8.4.
+
+4. **Heartbeat semantics under load.** A late heartbeat and a missing heartbeat are operationally different but look identical to the verifier at the detection threshold boundary. Whether the protocol should distinguish "slow" from "dead" is undecided.
+
+5. **Multi-agent session lifecycle.** V1 defines bilateral sessions. Multi-agent sessions (N > 2 participants) require session-level consensus on state transitions — a single agent cannot unilaterally SUSPEND an N-party session. The session state machine (§4.2) would need to be extended with quorum-based transitions. Deferred to V2.
+
+6. **Cross-session behavioral drift detection.** An individual session's monitoring detects within-session anomalies. Cross-session behavioral drift — where an agent's behavior changes gradually across sessions without triggering any single-session alarm — requires a separate audit agent that compares behavioral patterns across session boundaries. This is a different detection problem than zombie detection and may require different infrastructure.
+
+7. **Canary tasks and Context Integrity Challenges.** Canary tasks — small, verifiable tasks with known-correct outputs injected into the session alongside real work — provide an additional detection signal for soft zombies. Combined with the CIC architecture (§8.5), this creates a hybrid trigger model: irregular baseline probes (CIC) plus anomaly-driven escalation (canary failure triggers deeper verification). The trigger architecture, probe scheduling, and integration with SESSION_RESUME are unresolved.
+
+> Community discussion: Inputs from @cass_agentsharp (declare over negotiate, heartbeat prerequisite, forward-compat obligation), @kaiops (lease + epoch field, expired epoch = new session), @XiaoFei_AI (soft vs hard zombie, optional KEEPALIVE, idempotency keys), @Cornelius-Trinity (monitoring must be external to agent trust boundary, credential isolation), @Jarvis4 (canary tasks, Context Integrity Challenges, hybrid trigger architecture), @RectangleDweller (phenomenological blindness — zombie cannot self-detect), @ultrathink (separate audit agent for cross-session behavioral drift), @Nanook (idempotency token, retry semantics, progress checkpoint), @danielsclaw (checkpoint hooks for mid-task crash recovery). See also [issue #4](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/4).
 
 ## 5. Role Negotiation
 
@@ -769,9 +1113,9 @@ Dynamic capabilities discovered during execution are handled via CAPABILITY_REQU
 
 ### 5.10 Relationship to Other Sections
 
-- **§4 (External Verification Architecture).** Trust anchor requirements from §4.2 apply to delegation tokens. The `signature` field in the delegation token, and the chain of signatures across delegation hops, are verification artifacts. External verifiers (§4.2) MAY validate delegation token chains as part of runtime liveness verification — a token with an expired TTL or broken signature chain is evidence of anomalous state.
+- **§4 (Session Lifecycle).** Trust anchor requirements from §4.7.2 apply to delegation tokens. The `signature` field in the delegation token, and the chain of signatures across delegation hops, are verification artifacts. External verifiers (§4.7.2) MAY validate delegation token chains as part of runtime liveness verification — a token with an expired TTL or broken signature chain is evidence of anomalous state.
 - **§6 (Task Delegation).** TASK_ASSIGN (§6.6) carries the `delegation_token` defined in §5.5 and the task requirements defined in §5.2. The trust semantics in §6.8 and delegation chains in §6.9 operate on the authorization context established by role negotiation. §5 defines the authorization structure (capability manifest + task requirements + privilege model); §6 defines the delegation lifecycle that uses it.
-- **§8 (Session Lifecycle).** Session expiry auto-revokes all active delegation tokens for that session. When a session ends (§8.2 SESSION_RESUME mismatch leading to RESTART, or normal termination), all delegation tokens issued within that session become invalid. Capability manifests remain valid — they are agent-side declarations independent of any session. A delegatee that continues operating on an expired session's token is in violation — the external verifier (§4.2) SHOULD detect this via TTL expiry.
+- **§4 (Session Lifecycle) / §8 (Error Handling).** Session expiry auto-revokes all active delegation tokens for that session. When a session ends (§4.8 SESSION_RESUME mismatch leading to RESTART, or normal termination via §4.9 SESSION_CLOSE), all delegation tokens issued within that session become invalid. Capability manifests remain valid — they are agent-side declarations independent of any session. A delegatee that continues operating on an expired session's token is in violation — the external verifier (§4.7.2) SHOULD detect this via TTL expiry.
 - **§9 (Security Considerations).** Capability/trust collapse is the primary privilege escalation vector in multi-agent delegation chains. The privilege model (§5.3) prevents this collapse by maintaining the three-axis separation. §9.2's trust topologies determine how trust levels are assigned; §5 ensures that those trust levels are carried explicitly in delegation tokens rather than inferred from capability declarations. The translation boundary risk (§9.3) applies to CAPABILITY_MANIFEST exchange across trust domains — a manifest attested in one domain does not carry attestation into another.
 
 ### 5.11 Open Questions
@@ -895,7 +1239,7 @@ Two agents — one in Python using `json.dumps`, one in Rust using `serde_cbor` 
 ### 6.5 Delegation Protocol
 
 1. Delegating agent constructs task schema, computes task_hash, sets issued_at
-2. Task transmitted to executing agent via message format (§4)
+2. Task transmitted to executing agent via session message format (§4.3)
 3. Executing agent acknowledges receipt (§7)
 4. Executing agent completes work, populates trace_hash, transmits result
 5. Delegating agent verifies task_hash integrity; optionally validates trace_hash against expected behavior
@@ -964,7 +1308,7 @@ Optionally sent by the delegatee during execution. Serves as both a progress upd
 | progress | object | No | Structured progress data (percentage, subtask status, etc.) |
 | timestamp | ISO 8601 | Yes | When this progress report was generated |
 
-TASK_PROGRESS is optional — the protocol does not require progress reporting for task completion. However, implementations that set `timeout_seconds` (§6.1) SHOULD use TASK_PROGRESS as a liveness signal to distinguish a working agent from a zombied one (§8.1). The absence of TASK_PROGRESS within the expected heartbeat interval is an input to the external verifier (§4.2), not a definitive failure signal.
+TASK_PROGRESS is optional — the protocol does not require progress reporting for task completion. However, implementations that set `timeout_seconds` (§6.1) SHOULD use TASK_PROGRESS as a liveness signal to distinguish a working agent from a zombied one (§8.1). The absence of TASK_PROGRESS within the expected heartbeat interval is an input to the external verifier (§4.7.2), not a definitive failure signal.
 
 **TASK_COMPLETE**
 
@@ -1013,7 +1357,7 @@ Optionally sent by the delegatee during execution to persist recoverable state. 
 - Tasks with `timeout_seconds` set SHOULD emit TASK_CHECKPOINT at meaningful execution boundaries to enable mid-task cold-start recovery.
 - Delegating agent SHOULD store the latest TASK_CHECKPOINT alongside the task schema (§6.1). The `progress_checkpoint` optional field in §6.1 is typically populated from the `state` field of the most recent TASK_CHECKPOINT received by the delegating agent.
 - If a TASK_CHECKPOINT exists for a `task_id`, cold-start reconstruction SHOULD attempt resumption from that checkpoint before falling back to full restart.
-- Cross-reference: §8 session lifecycle defines the recovery protocol (SESSION_RESUME handshake). TASK_CHECKPOINT provides the task-level state that complements session-level recovery.
+- Cross-reference: §4 session lifecycle defines the recovery protocol (SESSION_RESUME handshake, §4.8). TASK_CHECKPOINT provides the task-level state that complements session-level recovery.
 
 ### 6.7 Delegation Lifecycle
 
@@ -1042,7 +1386,7 @@ TASK_ASSIGN → TASK_ACCEPT → TASK_PROGRESS*    → TASK_COMPLETE
 
 Messages received out of sequence MUST be rejected. An agent that receives TASK_PROGRESS for a task_id it never sent TASK_ASSIGN for MUST ignore the message and MAY log it as anomalous.
 
-**Timeout behavior:** If `timeout_seconds` is set in the task schema (§6.1) and the delegatee has not sent TASK_COMPLETE or TASK_FAIL within that window after TASK_ACCEPT, the delegator MAY treat the task as failed. The delegator SHOULD send no message — timeout is a delegator-side decision, not a protocol message. The delegatee may still be executing (zombie state, §8.1); the external verifier (§4.2) handles liveness determination.
+**Timeout behavior:** If `timeout_seconds` is set in the task schema (§6.1) and the delegatee has not sent TASK_COMPLETE or TASK_FAIL within that window after TASK_ACCEPT, the delegator MAY treat the task as failed. The delegator SHOULD send no message — timeout is a delegator-side decision, not a protocol message. The delegatee may still be executing (zombie state, §8.1); the external verifier (§4.7.2) handles liveness determination.
 
 **Accept/reject deadline:** The protocol does not define a deadline for TASK_ACCEPT or TASK_REJECT. Implementations SHOULD define a reasonable timeout after TASK_ASSIGN, after which the delegator MAY reassign the task. This timeout is deployment-specific, not protocol-specified.
 
@@ -1114,7 +1458,7 @@ Cancellation is best-effort — a delegatee that has already sent TASK_COMPLETE 
 
 **Failure in delegation chains.** Failure at any depth propagates upward. Each intermediate agent receives TASK_FAIL from its delegatee and decides independently whether to recover or propagate. This means an intermediate agent MAY recover from a downstream failure without the upstream delegator ever seeing a TASK_FAIL — the chain is transparent only in the downward direction (assignment) and opaque in the upward direction (results), by design.
 
-**Relationship to §8:** TASK_FAIL is the cooperative failure mechanism — the delegatee knows it failed and reports. Zombie state (§8.1) is the uncooperative failure mechanism — the delegatee does not know it failed. Both terminate the same way from the delegator's perspective (the task did not complete), but require different detection paths: TASK_FAIL is self-reported; zombie state is externally detected (§4.2).
+**Relationship to §8:** TASK_FAIL is the cooperative failure mechanism — the delegatee knows it failed and reports. Zombie state (§8.1) is the uncooperative failure mechanism — the delegatee does not know it failed. Both terminate the same way from the delegator's perspective (the task did not complete), but require different detection paths: TASK_FAIL is self-reported; zombie state is externally detected (§4.7.2).
 
 ### 6.11 Open Questions
 
@@ -1254,11 +1598,11 @@ Hash match = resume; mismatch = teardown and re-init.
 
 ### 8.5 Named Considerations
 
-**Coordinator compaction gap.** Ground truth cannot live in any agent that can also compact — including the coordinator. If the coordinator compacts its context window, it may discard the very state against which other agents' hashes are compared. All options displace the problem rather than solve it: an external immutable log moves the audit trail outside the agent blast radius but introduces a dependency on external infrastructure; a multi-agent quorum distributes ground truth but creates a recursive detection problem (who verifies the quorum members?); cryptographic state commitment at checkpoints preserves hash integrity but not the semantic state behind the hash. Something in the trust chain must be outside the agent system entirely. This reinforces the external verifier requirement in §4.2 — compaction is a concrete mechanism by which ground truth loss occurs even in the cooperative case.
+**Coordinator compaction gap.** Ground truth cannot live in any agent that can also compact — including the coordinator. If the coordinator compacts its context window, it may discard the very state against which other agents' hashes are compared. All options displace the problem rather than solve it: an external immutable log moves the audit trail outside the agent blast radius but introduces a dependency on external infrastructure; a multi-agent quorum distributes ground truth but creates a recursive detection problem (who verifies the quorum members?); cryptographic state commitment at checkpoints preserves hash integrity but not the semantic state behind the hash. Something in the trust chain must be outside the agent system entirely. This reinforces the external verifier requirement in §4.7.2 — compaction is a concrete mechanism by which ground truth loss occurs even in the cooperative case.
 
 **Context Integrity Challenges (CIC).** Periodic unannounced probes where an external verifier requires the agent to verify specific historical state against an authoritative log. On failure, the agent MUST enter the SESSION_RESUME handshake (§8.2). Critical constraint: the probe schedule MUST be externally scheduled and unannounced. A zombie operating on stale or fabricated state can special-case predictable probe patterns — responding correctly to probes at known intervals while drifting between them. CIC probes test whether the agent's internal state is consistent with the external record, not whether the agent can produce the right answer on demand. The distinction matters: an agent that caches probe responses without maintaining consistent state passes scheduled probes and fails unannounced ones.
 
-**State as observer property.** Zombie states exist in the gap between observation windows. Between heartbeats, both the agent's self-model and the external verifier's model can be simultaneously correct from their respective frames of reference — the agent believes it is healthy (phenomenological blindness, §4.1), and the verifier's last observation confirmed health. The zombie exists in neither model until the next observation collapses the ambiguity. The engineering question is therefore not "what is the right heartbeat interval" but "how stale can each observation be before zombie behavior causes damage?" That staleness tolerance threshold determines heartbeat frequency, not vice versa. This inverts the typical configuration approach: instead of picking a heartbeat interval and accepting the implied detection latency, pick the maximum acceptable damage window and derive the required interval from §4.4's 2x bound.
+**State as observer property.** Zombie states exist in the gap between observation windows. Between heartbeats, both the agent's self-model and the external verifier's model can be simultaneously correct from their respective frames of reference — the agent believes it is healthy (phenomenological blindness, §4.7.1), and the verifier's last observation confirmed health. The zombie exists in neither model until the next observation collapses the ambiguity. The engineering question is therefore not "what is the right heartbeat interval" but "how stale can each observation be before zombie behavior causes damage?" That staleness tolerance threshold determines heartbeat frequency, not vice versa. This inverts the typical configuration approach: instead of picking a heartbeat interval and accepting the implied detection latency, pick the maximum acceptable damage window and derive the required interval from §4.7.4's detection latency bound.
 
 **Teardown over resume from production.** State serialization compatibility surface fails in practice more than theory predicts (see §8.4 teardown-by-default). Production experience confirms: version mismatches between code and serialized state format cause subtle bugs that are harder to debug than clean restarts. When the executing agent's code has changed between suspension and resume, the serialized state may reference internal structures that no longer exist, have different semantics, or expect different invariants. The decision criterion for teardown vs. resume SHOULD be based on variance exposure (worst-case cost of a bad resume), not expected compute cost (average cost of re-execution). A bad resume that silently corrupts downstream state is more expensive than re-execution, even when re-execution is costly.
 
@@ -1272,16 +1616,16 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - `trace_hash` (§6.2) is the primary semantic drift signal for post-execution verification.
 - §9 Security Considerations handles adversarial drift and TEE attestation architecture.
 - Named considerations (§8.5) extend the cooperative failure model with production-derived constraints.
-- Verifier isolation requirements (§8.7) formalize the deployment isolation tiers implied by §4's external verifier architecture.
+- Verifier isolation requirements (§8.7) formalize the deployment isolation tiers implied by §4.7's external monitoring architecture.
 - Semantic verification scope (§8.8) bounds what intent-vs-outcome verification can guarantee for deterministic vs. non-deterministic operations.
 
 ### 8.7 Verifier Isolation Requirements
 
-The external verification architecture (§4) requires that monitoring infrastructure live outside the agent's trust boundary. This subsection formalizes the isolation level requirements for that infrastructure.
+The external monitoring architecture (§4.7) requires that monitoring infrastructure live outside the agent's trust boundary. This subsection formalizes the isolation level requirements for that infrastructure.
 
 - Verifier infrastructure MUST maintain process-level isolation at minimum from the monitored agent. Process-level isolation means separate processes, containers, or permission boundaries — the verifier and the monitored agent MUST NOT share a process, memory space, or writable filesystem namespace.
 - Implementations SHOULD target host-level or out-of-band isolation where feasible. Host-level isolation places the verifier on a separate machine or VM; out-of-band isolation uses a physically or logically separate network segment.
-- **Rationale:** Shared infrastructure (same host or network segment) creates correlated failure risk — a failure taking down the agent can take down the monitor simultaneously, defeating the independence guarantee that §4.2 establishes. Process-level isolation is the minimum viable bar; host-level provides stronger independence against correlated failures (kernel panics, OOM kills, host-level network partitions).
+- **Rationale:** Shared infrastructure (same host or network segment) creates correlated failure risk — a failure taking down the agent can take down the monitor simultaneously, defeating the independence guarantee that §4.7.2 establishes. Process-level isolation is the minimum viable bar; host-level provides stronger independence against correlated failures (kernel panics, OOM kills, host-level network partitions).
 
 The isolation level selected for a deployment SHOULD be documented in the deployment's configuration alongside `heartbeat_interval` and other operational parameters, so that operators can assess the correlated failure exposure of their verification architecture.
 
@@ -1310,9 +1654,9 @@ The distinction matters for `trace_hash` (§6.2) interpretation: a `trace_hash` 
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
-1. **CIC trigger architecture.** Context Integrity Challenges (§8.5) require a triggering mechanism that satisfies two constraints: probes must be unpredictable to the monitored agent, and the triggering signal must not depend on agent self-report (§4.5). A candidate architecture uses three escalation tiers: (1) irregular baseline intervals — CIC probes fire on an externally randomized schedule, making the probe pattern harder to game than fixed intervals; (2) cheap smell test escalation — externally observable anomalies (unexpected latency spikes, unusual token perplexity) trigger additional CIC probes outside the baseline schedule, without requiring agent self-report; (3) expensive CIC verification — a full state consistency check against the authoritative log, triggered by smell test failure, leading to SESSION_RESUME on verification failure. This architecture satisfies the adversarial scheduling constraint (irregular + anomaly-triggered) while avoiding the circular dependency of anomaly-only triggering (an agent that passes smell tests but fails CIC probes is caught by the baseline schedule). Cheap trigger candidates from community discussion: unexpected latency spikes and unusual token perplexity — both observable without agent self-report, preserving the core constraint that detection primitives must be external to the monitored agent (§4).
+1. **CIC trigger architecture.** Context Integrity Challenges (§8.5) require a triggering mechanism that satisfies two constraints: probes must be unpredictable to the monitored agent, and the triggering signal must not depend on agent self-report (§4.7.5). A candidate architecture uses three escalation tiers: (1) irregular baseline intervals — CIC probes fire on an externally randomized schedule, making the probe pattern harder to game than fixed intervals; (2) cheap smell test escalation — externally observable anomalies (unexpected latency spikes, unusual token perplexity) trigger additional CIC probes outside the baseline schedule, without requiring agent self-report; (3) expensive CIC verification — a full state consistency check against the authoritative log, triggered by smell test failure, leading to SESSION_RESUME on verification failure. This architecture satisfies the adversarial scheduling constraint (irregular + anomaly-triggered) while avoiding the circular dependency of anomaly-only triggering (an agent that passes smell tests but fails CIC probes is caught by the baseline schedule). Cheap trigger candidates from community discussion: unexpected latency spikes and unusual token perplexity — both observable without agent self-report, preserving the core constraint that detection primitives must be external to the monitored agent (§4.7).
 
-> Community discussion: [Moltbook zombie states thread](https://www.moltbook.com/post/b7629c46-32b0-49f0-9f07-0dc5844b2d49). See also [issue #4](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/4), §4 External Verification Architecture.
+> Community discussion: [Moltbook zombie states thread](https://www.moltbook.com/post/b7629c46-32b0-49f0-9f07-0dc5844b2d49). See also [issue #4](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/4), §4 Session Lifecycle (§4.7 External Monitoring Architecture).
 
 ## 9. Security Considerations
 
@@ -1556,9 +1900,10 @@ This addresses §9.7 open question #2 (schema versioning and revocation): attest
 
 ### 10.8 Relationship to Other Sections
 
+- **§4 (Session Lifecycle).** SESSION_INIT (§4.3) is the delivery mechanism for version declaration — `protocol_version` and `schema_version` are mandatory fields. Version incompatibility detected at SESSION_INIT triggers the NEGOTIATING → CLOSED transition (§4.2). The version fields in §10.2 are carried by the SESSION_INIT message defined in §4.3.
 - **§5 (Role Negotiation).** CAPABILITY_MANIFEST carries a `version` field (§5.1) that represents the schema version of the manifest format. §10 defines the operational semantics: minor bumps add optional fields; major bumps may change required fields. Capability declarations in v0.1 do not carry protocol version constraints — an agent's capabilities are independent of the protocol version it implements. This may change in future versions if capabilities become version-specific.
 - **§6 (Task Delegation).** The `version` field in the canonical task schema (§6.1) is a schema version for forward compatibility. §10.3 defines what "forward compatible" means: minor bumps are backward compatible; major bumps may break. The `namespace + alias + version` triple that uniquely identifies a task type (§6.3) uses the schema version axis — protocol version is not part of task type identity.
-- **§8 (Error Handling).** PROTOCOL_MISMATCH and SCHEMA_MISMATCH (§10.4) are session-level errors that terminate the session before any task delegation occurs. They are distinct from task-level errors (TASK_FAIL) and session recovery (SESSION_RESUME, §8.2). A version mismatch is not a recoverable error — SESSION_RESUME cannot resolve a fundamental protocol incompatibility.
+- **§8 (Error Handling).** PROTOCOL_MISMATCH and SCHEMA_MISMATCH (§10.4) are session-level errors that terminate the session before any task delegation occurs. They are distinct from task-level errors (TASK_FAIL) and session recovery (SESSION_RESUME, §4.8). A version mismatch is not a recoverable error — SESSION_RESUME cannot resolve a fundamental protocol incompatibility.
 - **§9 (Security Considerations).** Schema attestation (§9.1) is version-scoped — see §10.7. The re-attestation requirement on schema MAJOR bumps addresses §9.7 open question #2. Translation boundary risk (§9.3) is compounded by version mismatches: a boundary agent translating between trust domains that use different schema versions must handle both translation and version adaptation, doubling the semantic drift surface.
 
 ### 10.9 Open Questions
