@@ -331,6 +331,12 @@ A task is the atomic unit of agent collaboration. Every task MUST carry explicit
 | trace_hash | SHA-256 | Post-execution hash derived from executing agent's actual trace — semantic interpretation signal |
 | parent_task_id | UUID | For subtasks: reference to parent task |
 | timeout_seconds | integer | Max execution time before zombie state (see §8) |
+| success_criteria | object | Binary pass/fail predicate for task completion verification |
+| idempotency_token | string | Unique token enabling deduplication of retried task assignments |
+| retry_semantics | enum | Retry behavior on failure: `restart` (full re-execution), `resume` (from last checkpoint), `none` (no retry). Default: `restart` |
+| progress_checkpoint | object | Current execution state snapshot for mid-task cold-start recovery. Structure: `{completed_steps: array, partial_state: object, last_checkpoint_at: ISO 8601}`. Enables resumption at last known checkpoint rather than full restart from step 0. Typically populated from the `state` field of the most recent TASK_CHECKPOINT (§6.6) received by the delegating agent. |
+
+`success_criteria` is a binary pass/fail predicate. For tasks with partial completion states, populate `progress_checkpoint` alongside `success_criteria` — cold-start recovery SHOULD inspect `progress_checkpoint` before deciding whether to restart from step 0 or resume from the last recorded state. `idempotency_token` + `retry_semantics` answers "did this task already complete?" — not "what state was the task in when it stopped?". For tasks with incremental state (file processing, multi-step code generation, pipeline stages), task-level idempotency is insufficient for mid-task recovery; use `progress_checkpoint` and TASK_CHECKPOINT (§6.6) to capture intermediate execution state.
 
 ### 6.2 task_hash vs. trace_hash
 
@@ -360,7 +366,7 @@ canonical_json MUST produce deterministic output regardless of key insertion ord
 
 > **Draft — community discussion in progress via [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15).**
 
-The delegation protocol uses six message types. All messages MUST include `task_id` for correlation.
+The delegation protocol uses seven message types. All messages MUST include `task_id` for correlation.
 
 **TASK_ASSIGN**
 
@@ -451,6 +457,26 @@ Sent by the delegatee when the task cannot be completed.
 
 TASK_FAIL with `partial_results` is preferred over TASK_FAIL without — even incomplete output may be useful for recovery or reassignment. The delegating agent owns the recovery decision (see §6.10).
 
+**TASK_CHECKPOINT**
+
+Optionally sent by the delegatee during execution to persist recoverable state. Not a substitute for TASK_PROGRESS — TASK_CHECKPOINT is for state recovery; TASK_PROGRESS is for progress reporting and heartbeat.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| task_id | UUID v4 | Yes | Task instance being checkpointed |
+| session_id | string | Yes | Active session identifier |
+| checkpoint_id | UUID v4 | Yes | Unique identifier for this checkpoint (enables ordered recovery) |
+| state | object | Yes | Serializable task state snapshot at this point |
+| completed_steps | array | No | Identifiers of completed steps or subtasks |
+| partial_output | object | No | Output accumulated so far (if incrementally buildable) |
+| timestamp | ISO 8601 | Yes | When this checkpoint was created |
+
+- TASK_CHECKPOINT is optional — not all tasks benefit from incremental checkpointing.
+- Tasks with `timeout_seconds` set SHOULD emit TASK_CHECKPOINT at meaningful execution boundaries to enable mid-task cold-start recovery.
+- Delegating agent SHOULD store the latest TASK_CHECKPOINT alongside the task schema (§6.1). The `progress_checkpoint` optional field in §6.1 is typically populated from the `state` field of the most recent TASK_CHECKPOINT received by the delegating agent.
+- If a TASK_CHECKPOINT exists for a `task_id`, cold-start reconstruction SHOULD attempt resumption from that checkpoint before falling back to full restart.
+- Cross-reference: §8 session lifecycle defines the recovery protocol (SESSION_RESUME handshake). TASK_CHECKPOINT provides the task-level state that complements session-level recovery.
+
 ### 6.7 Delegation Lifecycle
 
 > **Draft — community discussion in progress via [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15).**
@@ -458,8 +484,8 @@ TASK_FAIL with `partial_results` is preferred over TASK_FAIL without — even in
 The delegation lifecycle follows a linear state machine:
 
 ```
-TASK_ASSIGN → TASK_ACCEPT → TASK_PROGRESS* → TASK_COMPLETE
-                                            → TASK_FAIL
+TASK_ASSIGN → TASK_ACCEPT → TASK_PROGRESS*    → TASK_COMPLETE
+                            TASK_CHECKPOINT*  → TASK_FAIL
            → TASK_REJECT
 ```
 
@@ -469,8 +495,9 @@ TASK_ASSIGN → TASK_ACCEPT → TASK_PROGRESS* → TASK_COMPLETE
 |---------------|---------------------|--------|
 | (initial) | TASK_ASSIGN | Delegator |
 | TASK_ASSIGN sent | TASK_ACCEPT, TASK_REJECT | Delegatee |
-| TASK_ACCEPT sent | TASK_PROGRESS, TASK_COMPLETE, TASK_FAIL | Delegatee |
-| TASK_PROGRESS sent | TASK_PROGRESS, TASK_COMPLETE, TASK_FAIL | Delegatee |
+| TASK_ACCEPT sent | TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
+| TASK_PROGRESS sent | TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
+| TASK_CHECKPOINT sent | TASK_PROGRESS, TASK_CHECKPOINT, TASK_COMPLETE, TASK_FAIL | Delegatee |
 | TASK_COMPLETE sent | (terminal) | — |
 | TASK_FAIL sent | (terminal) | — |
 | TASK_REJECT sent | (terminal) | — |
@@ -555,7 +582,7 @@ Cancellation is best-effort — a delegatee that has already sent TASK_COMPLETE 
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
-1. **TASK_CANCEL as a first-class message.** Cancellation currently propagates via TASK_FAIL with `cancelled_upstream` error code (§6.9). Should TASK_CANCEL be a separate message type? A dedicated message makes intent explicit and avoids overloading TASK_FAIL semantics, but adds a seventh message type to the protocol.
+1. **TASK_CANCEL as a first-class message.** Cancellation currently propagates via TASK_FAIL with `cancelled_upstream` error code (§6.9). Should TASK_CANCEL be a separate message type? A dedicated message makes intent explicit and avoids overloading TASK_FAIL semantics, but adds an eighth message type to the protocol.
 
 2. **Idempotency of TASK_ASSIGN.** If a delegator retransmits TASK_ASSIGN (e.g., due to transport-layer uncertainty about delivery), should the delegatee treat the duplicate as a new task or deduplicate by `task_id`? Deduplication is safer but requires the delegatee to maintain state about previously seen task_ids.
 
@@ -563,7 +590,9 @@ The following are explicitly identified as unresolved gaps in v0.1:
 
 4. **Delegation depth limit rationale.** The v1 limit of 3 is pragmatic, not principled. Community input is needed on whether real-world delegation patterns require deeper chains and what the observability cost of deeper chains is.
 
-> Community discussion: See [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15).
+5. **Checkpoint granularity.** The protocol provides no guidance on TASK_CHECKPOINT emission frequency. Too frequent creates network overhead; too infrequent creates large unrecoverable gaps. Left to implementation or task-specific guidance in v0.1.
+
+> Community discussion: See [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15), [issue #17](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/17).
 
 ## 7. Progress Reporting
 
