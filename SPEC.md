@@ -932,7 +932,71 @@ SESSION_RESUME is the single recovery mechanism for all session interruptions �
 | force | boolean | No | If `true`, close immediately without waiting for in-flight tasks. In-flight tasks are treated as failed. Default: `false`. |
 | timestamp | ISO 8601 | Yes | When the SESSION_CLOSE was sent. |
 
-### 4.10 Cross-Section Dependency Map
+### 4.10 MANIFEST Canonicalization
+
+MANIFEST tuples — the `(key, type, value_hash)` structures used for task identity (§6.4), manifest digests (§4.3 `manifest_digest`), and state hashes — MUST produce identical hashes across implementations regardless of runtime language. Two independent cross-runtime divergence sources break this in practice: type name strings and serialization format. This subsection specifies canonical forms for both.
+
+#### 4.10.1 Canonical Type Name Registry
+
+Implementations MUST map language-specific type names to the following canonical type strings when constructing MANIFEST tuples. The canonical name is the literal string that appears in the `type` position of a `(key, type, value_hash)` tuple.
+
+| Canonical name | Description | Python | JavaScript/TypeScript | C# | Go | Rust | Java |
+|----------------|-------------|--------|----------------------|-----|-----|------|------|
+| `string` | Text / character sequence | `str` | `string` (typeof) | `string`, `String` | `string` | `String`, `&str` | `String`, `CharSequence` |
+| `integer` | Whole number (arbitrary precision) | `int` | `number` (when `Number.isInteger`) | `int`, `long`, `Int32`, `Int64` | `int`, `int32`, `int64` | `i8`–`i128`, `u8`–`u128`, `isize`, `usize` | `int`, `long`, `Integer`, `Long`, `BigInteger` |
+| `float` | Floating-point number | `float` | `number` (when not integer) | `float`, `double`, `Single`, `Double` | `float32`, `float64` | `f32`, `f64` | `float`, `double`, `Float`, `Double` |
+| `bool` | Boolean truth value | `bool` | `boolean` (typeof) | `bool`, `Boolean` | `bool` | `bool` | `boolean`, `Boolean` |
+| `list` | Ordered sequence | `list`, `tuple` | `Array` (`Array.isArray`) | `List<T>`, `T[]`, `IList<T>` | `[]T` (slice), `[N]T` (array) | `Vec<T>`, `&[T]` | `List<T>`, `T[]`, `Collection<T>` |
+| `dict` | Key-value mapping | `dict` | `object` (plain object), `Map` | `Dictionary<K,V>`, `IDictionary` | `map[K]V` | `HashMap<K,V>`, `BTreeMap<K,V>` | `Map<K,V>`, `HashMap<K,V>` |
+| `null` | Absent / empty value | `None` | `null`, `undefined` | `null` | `nil` | `None` (Option) | `null` |
+| `datetime` | Temporal value (ISO 8601) | `datetime` | `Date` | `DateTime`, `DateTimeOffset` | `time.Time` | `chrono::DateTime` | `Instant`, `LocalDateTime`, `ZonedDateTime` |
+
+**Design rationale:** The canonical names are deliberately short and language-neutral. `bool` over `boolean` (shorter, unambiguous). `list` over `array` (avoids confusion with fixed-size arrays in languages where `array` and `list` are distinct). `dict` over `object` or `map` (avoids conflation with JavaScript `object` or OOP objects). These names appear in hashed MANIFEST tuples — divergent type strings produce divergent hashes with no runtime error, only silent identity mismatch. The registry eliminates this class of cross-runtime failure.
+
+**Mapping obligation:** An implementation that encounters a language-specific type not listed in the mapping table MUST either: (a) map it to the closest canonical type and document the mapping, or (b) reject the value with a canonicalization error. Implementations MUST NOT pass through language-specific type names into MANIFEST tuples. A MANIFEST tuple containing a non-canonical type string (e.g., `"str"`, `"int64"`, `"Array"`) is malformed — counterparties SHOULD reject task hashes computed from such tuples.
+
+#### 4.10.2 Canonical Serialization
+
+MANIFEST serialization uses an explicit **two-pass** approach to close both the structural divergence gap (different type names, key ordering) and the Unicode divergence gap (different normalization forms across runtimes).
+
+**Pass 1 — Normalize structure and types:**
+
+1. Construct the MANIFEST tuple list per §6.4: for each field, produce `(key, canonical_type, value_hash)`.
+2. Map all type names to canonical form using the registry (§4.10.1).
+3. Sort tuples lexicographically by key (UTF-8 byte order).
+
+**Pass 2 — Serialize with JCS and hash:**
+
+1. Apply [Unicode NFC normalization](https://unicode.org/reports/tr15/) (Canonical Decomposition followed by Canonical Composition) to all string values in the MANIFEST — keys, type names, and the string inputs to value hashes. NFC normalization is a pre-pass applied before JCS serialization, not a substitution for it. This closes the cross-runtime Unicode divergence gap: different runtimes may store the same logical string in NFC, NFD, or mixed form internally, producing different byte sequences and therefore different hashes. NFC is chosen because it is the most compact normalization form, is stable under re-application (NFC(NFC(x)) = NFC(x)), and is the default form for web content (W3C Character Model).
+
+2. Serialize the NFC-normalized MANIFEST using [RFC 8785 JSON Canonicalization Scheme (JCS)](https://www.rfc-editor.org/rfc/rfc8785): sorted keys (lexicographic Unicode code point order), no whitespace between tokens, deterministic number encoding (no trailing zeros, no positive sign, lowercase `e` for exponents), and `\uNNNN` escaping only for required control characters per RFC 8785 §3.2.2.
+
+3. Compute the final hash: `SHA-256(jcs_serialize(nfc_normalize(manifest)))`.
+
+**Why NFC before JCS, not JCS alone:** RFC 8785 specifies deterministic JSON serialization but explicitly does not mandate Unicode normalization (RFC 8785 §3.2.3 notes that JSON strings are "already in the expected form" for JCS, assuming the input is well-formed). In practice, different runtimes produce different Unicode forms for the same logical string — Python's `unicodedata.normalize('NFC', s)` and JavaScript's `s.normalize('NFC')` may receive the same string from different internal representations. Without NFC as a pre-pass, two agents can produce valid JCS that differs at the byte level because their inputs were in different normalization forms. The NFC pre-pass ensures JCS receives identical input regardless of runtime.
+
+**Why JCS for MANIFEST serialization:** §6.4 defines MANIFEST as a sorted tuple structure that is independent of document-level serialization. JCS is specified here as the canonical serialization for the final hash computation step — the `canonical_serialize` referenced in §6.4 rule 5. This does not change MANIFEST's transport independence: agents still construct MANIFEST tuples using their preferred internal format. JCS applies only at the hash computation boundary, producing a deterministic byte sequence from the normalized tuple structure. Implementations that previously used length-prefixed encoding MUST migrate to JCS for cross-runtime hash compatibility.
+
+**JCS representation of a MANIFEST tuple list:**
+
+The sorted tuple list is serialized as a JSON array of arrays:
+
+```json
+[["constraints","dict","a1b2..."],["intent","string","c3d4..."],["scope","dict","e5f6..."]]
+```
+
+Each inner array contains exactly three elements: `[key, canonical_type, value_hash_hex]`. The value hash is encoded as a lowercase hexadecimal string. The outer array preserves the lexicographic key sort order. JCS serialization ensures this representation is byte-identical across implementations.
+
+**Scope of application:** This canonicalization applies to all MANIFEST-based hash computations in the protocol:
+
+- `task_hash` computation (§6.4)
+- `manifest_digest` Merkle leaf computation (§4.3, §5.9): each leaf `SHA-256(cap_id ‖ impl_hash ‖ policy_hash)` MUST apply NFC normalization to string inputs before concatenation and hashing
+- `state_hash` computation in KEEPALIVE (§4.5.1) and SESSION_RESUME (§4.8), where the hashed state includes MANIFEST-derived values
+- `plan_hash` computation (§6.11), where the canonical plan representation includes hashable fields
+
+> Community discussion: Addresses @cass_agentsharp feedback on cross-runtime type name divergence — Python `str` vs JavaScript `string` vs C# `String` producing different MANIFEST hashes for identical logical tasks. Addresses @sondrabot feedback on RFC 8785 Unicode normalization gap — JCS alone does not prevent NFC/NFD divergence across runtimes. See [issue #56](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/56).
+
+### 4.11 Cross-Section Dependency Map
 
 §4 Session Lifecycle is referenced by and depends on the following sections:
 
@@ -941,11 +1005,11 @@ SESSION_RESUME is the single recovery mechanism for all session interruptions �
 | §2 Agent Identity | SESSION_INIT carries identity objects (§2.2). SESSION_RESUME requires identity re-verification (§2.3.3). Identity revocation (§2.3.4) triggers session CLOSED. | §2 → §4 |
 | §3 Agent Discovery | Discovery (§3) provides the candidate set from which the coordinator selects a worker. Discovery completes before SESSION_INIT. The AGENT_MANIFEST endpoint (§3.1) is the SESSION_INIT target. | §3 → §4 |
 | §5 Role Negotiation | CAPABILITY_MANIFEST exchange (§5.9) happens within the NEGOTIATING state. Session establishment flow (§5.9) is the NEGOTIATING → ACTIVE transition. Session expiry auto-revokes all active delegation tokens for that session (§5.10). | §4 ↔ §5 |
-| §6 Task Delegation | Task delegation (§6.6) is only valid in the ACTIVE state. TASK_CHECKPOINT (§6.6) is the mechanism for externalizing task state before SUSPENDED or COMPACTED transitions. Session EXPIRED (§4.2) triggers mandatory TASK_CANCEL (§6.6) for all in-flight subtasks — prevents phantom completions. Partial result recovery after expiry uses SESSION_RESUME with `recovery_reason: timeout` (§4.8, §4.8.1). | §4 ↔ §6 |
+| §6 Task Delegation | Task delegation (§6.6) is only valid in the ACTIVE state. TASK_CHECKPOINT (§6.6) is the mechanism for externalizing task state before SUSPENDED or COMPACTED transitions. Session EXPIRED (§4.2) triggers mandatory TASK_CANCEL (§6.6) for all in-flight subtasks — prevents phantom completions. Partial result recovery after expiry uses SESSION_RESUME with `recovery_reason: timeout` (§4.8, §4.8.1). MANIFEST canonicalization (§4.10) defines the canonical type registry and serialization rules used by task hash computation (§6.4). | §4 ↔ §6 |
 | §8 Error Handling | Zombie detection (§8.1) maps to the COMPACTED and hard-zombie scenarios in §4.7.7. Detection primitives (§8.2) are the signals consumed by the external monitoring architecture (§4.7). SESSION_RESUME (§8.2) is formalized in §4.8; unified recovery semantics (§4.8.1) ensure crash, timeout, and manual recovery all use the same state-hash negotiation. Coordinator compaction gap (§8.5) is a concrete instance of §4.6's compaction obligation. | §4 ↔ §8 |
 | §10 Versioning | SESSION_INIT carries protocol_version and schema_version (§10.2). Version mismatch terminates the session at the NEGOTIATING → CLOSED transition (§10.4). Forward compatibility obligations (§10.5) apply from the first message. | §4 ↔ §10 |
 
-### 4.11 Open Questions
+### 4.12 Open Questions
 
 The following are explicitly identified as unresolved for V1:
 
@@ -1444,34 +1508,36 @@ namespace uses reverse-DNS notation to prevent task type collisions across ecosy
 
 ### 6.4 Task Hash Computation
 
-Task identity is computed via a MANIFEST — a sorted, deterministic list of `(key, type, value_hash)` tuples derived from the task schema fields. The MANIFEST separates task representation from task identity: each agent uses its own internal schema and serialization format; coordination requires only that agents agree on the sorted tuple structure.
+Task identity is computed via a MANIFEST — a sorted, deterministic list of `(key, type, value_hash)` tuples derived from the task schema fields. The MANIFEST separates task representation from task identity: each agent uses its own internal schema and serialization format; coordination requires only that agents agree on the sorted tuple structure. Canonicalization rules for type names and serialization are specified in §4.10.
 
 **Canonical hashing method:**
 
 ```
 manifest = sorted([
-  (key, type(val).__name__, SHA-256(serialize(val)))
+  (key, canonical_type(val), SHA-256(serialize(nfc(val))))
   for key, val in task.items()
   if key not in EXCLUDED_FIELDS
 ])
-task_hash = SHA-256(manifest)
+task_hash = SHA-256(jcs_serialize(nfc(manifest)))
 ```
+
+Where `canonical_type(val)` maps the runtime type to the canonical name (§4.10.1), `nfc()` applies Unicode NFC normalization (§4.10.2), and `jcs_serialize()` produces RFC 8785 JCS output.
 
 `EXCLUDED_FIELDS` = `{task_hash, trace_hash}` — the hash output and post-execution fields MUST be excluded from hash input.
 
 **MANIFEST construction rules:**
 
 1. **Key:** The field name as a UTF-8 string, exactly as defined in §6.1 (e.g., `intent`, `scope`, `constraints`).
-2. **Type:** The canonical type name of the value. Implementations MUST map to one of the following normalized type strings: `string`, `integer`, `float`, `boolean`, `null`, `object`, `array`, `datetime`. Language-specific type names (e.g., Python's `str`, Go's `int64`, Rust's `String`) MUST be mapped to these canonical names.
-3. **Value hash:** `SHA-256(serialize(val))` where `serialize` produces a byte representation of the value. For scalar types (string, integer, float, boolean, null), serialize as the UTF-8 encoding of the canonical string representation. For composite types (object, array), serialize by recursively constructing a sub-MANIFEST and hashing it — the same sorted-tuple procedure applied at each level of nesting.
+2. **Type:** The canonical type name of the value per the Canonical Type Name Registry (§4.10.1). Implementations MUST map to one of: `string`, `integer`, `float`, `bool`, `null`, `list`, `dict`, `datetime`. Language-specific type names (e.g., Python's `str`, Go's `int64`, Rust's `String`) MUST be mapped to these canonical names before tuple construction.
+3. **Value hash:** `SHA-256(serialize(val))` where `serialize` produces a byte representation of the value. For scalar types (string, integer, float, bool, null), serialize as the UTF-8 encoding of the canonical string representation. For composite types (dict, list), serialize by recursively constructing a sub-MANIFEST and hashing it — the same sorted-tuple procedure applied at each level of nesting. All string inputs MUST be NFC-normalized before serialization (§4.10.2).
 4. **Sorting:** Tuples are sorted lexicographically by key (UTF-8 byte order). Key uniqueness is guaranteed by the task schema definition (§6.1).
-5. **Final hash:** `task_hash = SHA-256(canonical_serialize(manifest))` where `canonical_serialize` encodes the sorted tuple list as a length-prefixed sequence of `(key_bytes, type_bytes, value_hash_bytes)`.
+5. **Final hash:** `task_hash = SHA-256(canonical_serialize(manifest))` where `canonical_serialize` applies NFC normalization followed by RFC 8785 JCS serialization as specified in §4.10.2. The sorted tuple list is serialized as a JSON array of `[key, canonical_type, value_hash_hex]` arrays.
 
 **Why MANIFEST, not canonical JSON:**
 
 Two implementations can diverge on serialization format (JSON, CBOR, MessagePack, Protobuf), runtime language, key ordering conventions, floating-point representation, and whitespace handling — and still produce identical `task_hash` values, because identity is computed over the sorted tuple structure rather than a serialized document. This prevents canonicalization drift: the failure mode where two agents produce different canonical forms of the same logical task due to differences in their JSON canonicalization libraries, Unicode normalization, or number encoding.
 
-RFC 8785 (JCS) remains a valid serialization choice for `serialize` within each value hash, but the MANIFEST structure removes the requirement that all implementations use the same document-level canonicalization scheme. The canonical unit is the individual field value, not the whole document.
+RFC 8785 (JCS) is the required serialization for the final hash computation step (§4.10.2), applied after MANIFEST construction. The MANIFEST structure preserves transport independence — agents construct tuples using their preferred internal format — while JCS ensures the hash computation boundary produces identical bytes across runtimes. NFC Unicode normalization is applied as a pre-pass before JCS to close the cross-runtime Unicode divergence gap (§4.10.2).
 
 **Example:**
 
@@ -1490,9 +1556,9 @@ The MANIFEST (before final hashing) is:
 
 ```
 [
-  ("constraints", "object", SHA-256(<sub-manifest of constraints>)),
+  ("constraints", "dict",   SHA-256(<sub-manifest of constraints>)),
   ("intent",      "string", SHA-256("Summarize document")),
-  ("scope",       "object", SHA-256(<sub-manifest of scope>))
+  ("scope",       "dict",   SHA-256(<sub-manifest of scope>))
 ]
 ```
 
@@ -2715,7 +2781,7 @@ The protocol maintains two independent version axes:
 | Axis | Tracks | Example changes | Identifier |
 |------|--------|-----------------|------------|
 | **Protocol version** | Structural changes to the protocol itself | New message types (e.g., adding TASK_CANCEL), state machine transitions, SESSION_INIT field additions, changes to the message lifecycle (§6.6) | `protocol_version` |
-| **Schema version** | Semantic changes to task and manifest schemas | Task field additions (§6.1), type changes in existing fields, new required fields in CAPABILITY_MANIFEST (§5.1), changes to MANIFEST canonicalization rules (§6.4) | `schema_version` |
+| **Schema version** | Semantic changes to task and manifest schemas | Task field additions (§6.1), type changes in existing fields, new required fields in CAPABILITY_MANIFEST (§5.1), changes to MANIFEST canonicalization rules (§4.10, §6.4) | `schema_version` |
 
 **Why two axes, not one.** Conflating protocol and schema versions forces a protocol bump for every schema iteration. During early adoption — when task schemas evolve rapidly as ecosystems discover what fields they actually need — this produces version churn that makes interoperability fragile. An agent that supports protocol v1 with schema v1.3 should be able to collaborate with an agent that supports protocol v1 with schema v1.1, as long as the schema changes between 1.1 and 1.3 are backward compatible. A single version axis would force both agents to v1.3, even though the protocol-level interaction is identical.
 
