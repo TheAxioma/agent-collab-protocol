@@ -2853,6 +2853,7 @@ Receiving agents SHOULD process `divergence_log` entries as follows:
 - **Aggregate by `deviation_type`.** Repeated `RESOURCE_UNAVAILABLE` entries across tasks may indicate infrastructure issues. Repeated `CAPABILITY_MISMATCH` entries may indicate incorrect capability declarations (§5).
 - **Cross-reference with `trace_hash`.** The `divergence_log` explains _why_ `trace_hash` differs from the plan hash. If `trace_hash` matches the plan hash (no divergence), `divergence_log` SHOULD be empty or absent.
 - **Audit trail.** The `divergence_log` SHOULD be persisted alongside the task result and `trace_hash` for post-hoc audit. It provides the narrative context that hash comparison alone cannot.
+- **Cross-reference with EVIDENCE_RECORD `divergence_log` (§8.10.3).** The §7.8 `divergence_log` and the §8.10.3 `divergence_log` annotate the same underlying deviations at different protocol layers: §7.8 captures _what kind_ of divergence occurred (step-level, inline in TASK_COMPLETE/TASK_FAIL), while §8.10.3 captures _why_ it occurred (evidence-level, with recovery-routing `reason`). Agents SHOULD ensure consistency between the two: a `RESOURCE_UNAVAILABLE` entry in §7.8 should correspond to an `infrastructure_noise` or `external_constraint` entry in §8.10.3 for the same deviation.
 
 #### 7.8.7 Relationship to §6 and §9
 
@@ -3368,7 +3369,7 @@ The `divergence_log` (§7.8) records inline plan-execution deviations during tas
 
 #### 8.11.1 DIVERGENCE_REPORT Message
 
-DIVERGENCE_REPORT is sent when a divergence is detected between expected and actual agent state, execution behavior, or protocol compliance. It is distinct from `divergence_log` entries (§7.8), which are inline annotations within TASK_COMPLETE/TASK_FAIL. DIVERGENCE_REPORT is a standalone protocol message emitted by the detecting party (coordinator, verifier, or peer agent).
+DIVERGENCE_REPORT is sent when a divergence is detected between expected and actual agent state, execution behavior, or protocol compliance. It is distinct from `divergence_log` entries — both the inline §7.8 annotations within TASK_COMPLETE/TASK_FAIL and the evidence-level §8.10.3 cause annotations within EVIDENCE_RECORD. DIVERGENCE_REPORT is a standalone protocol message emitted by the detecting party (coordinator, verifier, or peer agent).
 
 **DIVERGENCE_REPORT fields:**
 
@@ -3419,16 +3420,19 @@ The `reason_code` field MUST use one of the following values. Each code identifi
 
 **Extension mechanism:** Implementations MAY extend this taxonomy with deployment-specific reason codes prefixed by `x-` (e.g., `x-model-degradation`, `x-quota-billing-exceeded`). Standard reason codes MUST NOT be prefixed. Receiving agents that encounter an unrecognized `reason_code` MUST treat it as opaque — log it, surface it to operators, but do not treat it as a protocol error.
 
-#### 8.11.3 Relationship to §7.8 and Other Sections
+#### 8.11.3 Relationship to §7.8, §8.10, and Other Sections
 
-DIVERGENCE_REPORT and the §7.8 `divergence_log` serve different purposes at different protocol layers:
+DIVERGENCE_REPORT, the §7.8 `divergence_log`, and the §8.10 EVIDENCE_RECORD `divergence_log` serve different purposes at different protocol layers:
 
-| Mechanism | Scope | Emitted by | Carried in | `reason_code` / `deviation_type` |
-|-----------|-------|------------|------------|----------------------------------|
-| `divergence_log` (§7.8) | Plan-execution divergence — the executing agent's actual execution differed from its committed plan (L2 vs. L3). | Executing agent (self-report). | Inline in TASK_COMPLETE / TASK_FAIL (§6.6). | `deviation_type` — optional (SHOULD). |
-| DIVERGENCE_REPORT (§8.11) | Protocol-level divergence — verification mechanisms detected a mismatch between expected and actual agent state or behavior. | Coordinator, external verifier, or peer agent (external detection). | Standalone protocol message. | `reason_code` — required. |
+| Mechanism | Scope | Emitted by | Carried in | Classification field | Required? |
+|-----------|-------|------------|------------|---------------------|-----------|
+| `divergence_log` (§7.8) | Plan-execution divergence — the executing agent's actual execution differed from its committed plan (L2 vs. L3). | Executing agent (self-report). | Inline in TASK_COMPLETE / TASK_FAIL (§6.6). | `deviation_type` | Optional (SHOULD). |
+| `divergence_log` (§8.10.3) | Evidence-level cause annotation — structured explanation of _why_ `trace_hash` diverged from `plan_hash`, for recovery routing. | Executing agent (self-report, appended to evidence layer). | EVIDENCE_RECORD (§8.10.1). | `reason` | Required. |
+| DIVERGENCE_REPORT (§8.11) | Protocol-level divergence — verification mechanisms detected a mismatch between expected and actual agent state or behavior. | Coordinator, external verifier, or peer agent (external detection). | Standalone protocol message. | `reason_code` | Required. |
 
-The two mechanisms are complementary. A single divergence event may produce both: the executing agent appends a `divergence_log` entry explaining its plan deviation, and the coordinator emits a DIVERGENCE_REPORT when verification detects the resulting state mismatch. The `related_task_id` field in DIVERGENCE_REPORT and the `step_id` field in `divergence_log` entries enable cross-referencing between the two records.
+The three mechanisms are complementary. A single divergence event may produce all three: the executing agent appends a `divergence_log` entry in TASK_COMPLETE (§7.8) explaining its plan deviation at the step level, appends an EVIDENCE_RECORD with a `divergence_log` entry (§8.10.3) classifying the cause for recovery routing, and the coordinator emits a DIVERGENCE_REPORT (§8.11) when verification detects the resulting state mismatch. The `related_task_id` field in DIVERGENCE_REPORT, the `step_id` field in §7.8 `divergence_log` entries, and the `affected_step_id` field in §8.10.3 `divergence_log` entries enable cross-referencing between all three records.
+
+**Distinction from `amend_hash`:** The §8.10.3 `divergence_log` and `amend_hash` (§6.11.4) both address the same observable signal — `plan_hash` ≠ `trace_hash` — but through different authorization chains. `amend_hash` tracks **requester-initiated spec changes** (the delegating agent authorized the deviation via PLAN_AMEND). The §8.10.3 `divergence_log` tracks **agent-initiated deviations** (the agent changed its execution path without prior authorization). The `amendments_log` (§6.11.6) and `divergence_log` (§8.10.3) together provide a complete audit trail: every deviation in the evidence layer is either authorized (has a corresponding `amend_hash`) or annotated (has a corresponding `divergence_log` entry with a `reason`).
 
 DIVERGENCE_REPORT integrates with the evidence layer (§8.10) via the optional `evidence_ref` field. When a DIVERGENCE_REPORT is backed by an EVIDENCE_RECORD, external verifiers can independently validate the divergence claim — breaking the recursive self-attestation loop that §8.10 was designed to address. Agents SHOULD append an EVIDENCE_RECORD before emitting a DIVERGENCE_REPORT for `ERROR`-severity divergences.
 
