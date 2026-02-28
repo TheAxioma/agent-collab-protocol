@@ -409,7 +409,7 @@ The following are explicitly identified as unresolved for V1:
 
 1. **Registry storage tradeoffs.** Nostr relays provide decentralization but lack query expressiveness. HTTP registries provide rich queries but centralize control. DID documents provide self-sovereignty but add resolution complexity. The optimal storage layer likely varies by deployment context. Should the protocol define a minimum interoperability requirement across storage backends, or allow full deployment-specific selection?
 
-2. **Capability taxonomy granularity.** The `capability_id` field uses the structured `cap:namespace.capability@version` format (§5.1.1), and V1 requires exact `cap_id` match (§5.11). Without a shared taxonomy, discovery across ecosystems requires capability name mapping — agent A's `cap:a.code.execute@1` and agent B's `cap:b.run.code@1` may be semantically equivalent but syntactically distinct. Agents can publish adapter capabilities (e.g. `cap:adapter.pathlike_to_string@1`) to bridge representations, but should V2 define a base capability taxonomy or a type equivalence mechanism?
+2. **Capability taxonomy granularity.** The `capability_id` field uses the structured `cap:namespace.capability@version` format (§5.1.1), and V1 requires exact `cap_id` match (§5.12). Without a shared taxonomy, discovery across ecosystems requires capability name mapping — agent A's `cap:a.code.execute@1` and agent B's `cap:b.run.code@1` may be semantically equivalent but syntactically distinct. Agents can publish adapter capabilities (e.g. `cap:adapter.pathlike_to_string@1`) to bridge representations, but should V2 define a base capability taxonomy or a type equivalence mechanism?
 
 3. **TTL and freshness defaults.** The `ttl_seconds` field is optional with no protocol-defined default. In practice, a missing TTL means either "this manifest never expires" (dangerous — stale manifests accumulate) or "use the registry's default" (inconsistent across registries). Should V1 define a default TTL or a maximum TTL to bound staleness?
 
@@ -1630,12 +1630,42 @@ Dynamic capabilities discovered during execution are handled via CAPABILITY_REQU
 ### 5.10 Relationship to Other Sections
 
 - **§4 (Session Lifecycle).** Trust anchor requirements from §4.7.2 apply to delegation tokens. The `signature` field in the delegation token, and the chain of signatures across delegation hops, are verification artifacts. External verifiers (§4.7.2) MAY validate delegation token chains as part of runtime liveness verification — a token with an expired TTL or broken signature chain is evidence of anomalous state.
-- **§6 (Task Delegation).** TASK_ASSIGN (§6.6) carries the `delegation_token` defined in §5.5 and the task requirements defined in §5.2. The trust semantics in §6.8 and delegation chains in §6.9 operate on the authorization context established by role negotiation. §5 defines the authorization structure (capability manifest + task requirements + privilege model); §6 defines the delegation lifecycle that uses it. Version negotiation scoping (§5.11, item 7) is per-hop — each session negotiates independently. The `protocol_version_chain` in TASK_ASSIGN and `version_chain_summary` in TASK_COMPLETE/TASK_PROGRESS/TASK_FAIL (§6.9.1) provide the compensating visibility mechanism.
+- **§6 (Task Delegation).** TASK_ASSIGN (§6.6) carries the `delegation_token` defined in §5.5 and the task requirements defined in §5.2. The trust semantics in §6.8 and delegation chains in §6.9 operate on the authorization context established by role negotiation. §5 defines the authorization structure (capability manifest + task requirements + privilege model); §6 defines the delegation lifecycle that uses it. Version negotiation scoping (§5.12, item 7) is per-hop — each session negotiates independently. The `protocol_version_chain` in TASK_ASSIGN and `version_chain_summary` in TASK_COMPLETE/TASK_PROGRESS/TASK_FAIL (§6.9.1) provide the compensating visibility mechanism.
 - **§4 (Session Lifecycle) / §8 (Error Handling).** Session expiry auto-revokes all active delegation tokens for that session. When a session ends (§4.8 SESSION_RESUME mismatch leading to RESTART, or normal termination via §4.9 SESSION_CLOSE), all delegation tokens issued within that session become invalid. Capability manifests remain valid — they are agent-side declarations independent of any session. A delegatee that continues operating on an expired session's token is in violation — the external verifier (§4.7.2) SHOULD detect this via TTL expiry.
 - **§9 (Security Considerations).** Capability/trust collapse is the primary privilege escalation vector in multi-agent delegation chains. The privilege model (§5.3) prevents this collapse by maintaining the three-axis separation. §9.2's trust topologies determine how trust levels are assigned; §5 ensures that those trust levels are carried explicitly in delegation tokens rather than inferred from capability declarations. The translation boundary risk (§9.3) applies to CAPABILITY_MANIFEST exchange across trust domains — a manifest attested in one domain does not carry attestation into another.
 - **§8 (Error Handling — Verifiable Intent).** §5 is the **declaration layer**: it specifies *what* capabilities an agent claims and *what* capabilities a session or task requires. §8 is the **trust layer**: it specifies *how* to verify that declarations are honest and that agents actually exercise declared capabilities correctly. In basic deployments, §5 alone is sufficient — capability declarations are self-reported (§5.1.2), cryptographically bound to agent identity, and matched against task requirements at delegation time. In high-trust deployments where spoofed capability declarations are a threat model concern, §8 attestation provides independent verification: CAPABILITY_MANIFEST declarations and CAPABILITY_UPDATE messages carry attestation signatures per §8 rules, and the external audit trail (§8.5, §8.8) provides post-hoc evidence of whether an agent actually exercised a declared capability correctly. The relationship is additive: §5 specifies what to declare; §8 specifies how to prove it. §8 attestation is not required for §5 to function, but §5 declarations without §8 attestation carry only the trust level of self-report.
 
-### 5.11 Open Questions
+### 5.11 INITIALIZING Commitment Reconciliation
+
+<!-- Implements #64: commitment reconciliation during initialization before ACTIVE transition -->
+
+On session establishment — whether a fresh SESSION_INIT or a reinitiation after teardown-first recovery (§8.13) — the agent MUST reconcile inherited commitments from any prior instance before transitioning to ACTIVE. This reconciliation phase occurs after capability exchange (§5.9) completes but before the agent declares itself ACTIVE and begins accepting new task delegations.
+
+**Reconciliation sequence:**
+
+1. **Read COMMITMENT_REGISTRY.** The agent reads its COMMITMENT_REGISTRY (§7.11) from durable persistent storage (§8.13.4). The registry contains all outstanding COMMITMENT entries (§6.12) from prior sessions that have not been cancelled or fulfilled.
+
+2. **Classify inherited commitments.** For each entry in the COMMITMENT_REGISTRY, the agent determines whether it can honor the commitment given its current context, capabilities, and state:
+   - **Honorable commitments:** The agent retains the commitment in its local COMMITMENT_REGISTRY. No outbound message is required — the counterpart agent's expectation remains valid.
+   - **Non-honorable commitments:** The agent cannot fulfill the promise made by the prior instance (e.g., due to context loss, capability change, or task no longer being relevant).
+
+3. **Emit DIVERGENCE_REPORT for abandoned commitments.** For each inherited commitment the agent CANNOT honor, the agent MUST emit a DIVERGENCE_REPORT (§8.11) to the `counterpart_agent_id` specified in the commitment entry, with:
+   - `reason_code`: `context_shift`
+   - `description`: MUST include the `commitment_id`, `original_due_by` (the `due_by` from the original COMMITMENT), and a `reason_detail` (free text explaining why the commitment cannot be honored).
+   - `severity`: `WARN` or `ERROR` depending on the commitment_type — `task_completion` and `state_delivery` commitments SHOULD use `ERROR`; `reply` and `presence` commitments SHOULD use `WARN`.
+   - `related_task_id`: The `task_id` from the original COMMITMENT, if applicable.
+
+4. **Remove abandoned commitments.** After emitting DIVERGENCE_REPORT for each non-honorable commitment, the agent MUST remove those entries from the COMMITMENT_REGISTRY and persist the updated registry to durable storage.
+
+5. **Transition to ACTIVE.** After reconciliation completes — all inherited commitments are either re-registered (retained) or explicitly abandoned (DIVERGENCE_REPORT emitted) — the agent transitions to ACTIVE. The agent MUST NOT transition to ACTIVE before reconciliation is complete.
+
+**Timing relationship to §5.9:** Commitment reconciliation is logically the final step in the NEGOTIATING → ACTIVE transition. The ordering is: capability exchange (§5.9) → commitment reconciliation (this section) → ACTIVE. Capability exchange must complete first because the agent needs to know its current capabilities before it can assess which inherited commitments it can honor.
+
+**First-session behavior:** On a fresh SESSION_INIT with no prior instance history, the COMMITMENT_REGISTRY is empty. Reconciliation is a no-op — the agent transitions directly from capability exchange to ACTIVE.
+
+> Commitment reconciliation formalized from [issue #64](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/64). The core insight: session management is identity management — every unresolved commitment is a promise that a future instance must keep or explicitly refuse. Making inherited commitments protocol-visible during initialization prevents silent abandonment.
+
+### 5.12 Open Questions
 
 The following tracks resolution status for identified gaps. Resolved items document the V1 decision; open items remain unresolved for future versions.
 
@@ -2420,7 +2450,83 @@ Each accepted PLAN_AMEND creates an auditable record of authorized spec drift. T
 
 > Amendments audit log formalized from [issue #66](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/66). The core insight: without `amend_hash`, a delegatee could claim to have received an amendment that was never issued, or a delegating agent could deny issuing one. The hash ties each amendment to the session identity and specific change content, closing the spec drift audit gap.
 
-### 6.12 Open Questions
+### 6.12 Commitment Message Types
+
+<!-- Implements #64: COMMITMENT and COMMITMENT_CANCEL message types for protocol-visible inter-agent promises -->
+
+Commitments are protocol-visible promises made by one agent to another within a collaboration session. Unlike task delegation messages (§6.6), which track work assignment and execution, commitment messages track outstanding obligations — promises that a future agent instance must honor or explicitly cancel. Making commitments protocol-visible prevents silent abandonment: counterpart agents receive observable signal when obligations are inherited, fulfilled, or dropped.
+
+**COMMITMENT**
+
+Sent by the committing agent to register a promise with the counterpart agent. A COMMITMENT creates a protocol-visible obligation that persists until explicitly cancelled (COMMITMENT_CANCEL) or fulfilled (task completion confirmation).
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| commitment_id | UUID v4 | Yes | Globally unique identifier for this commitment. Used to reference the commitment in COMMITMENT_CANCEL, COMMITMENT_REGISTRY (§7.11), and DIVERGENCE_REPORT (§8.11). |
+| task_id | UUID v4 | Yes | Active task context in which this commitment is made. Binds the commitment to a specific task — the commitment's lifecycle is scoped to this task. |
+| session_id | string | Yes | Active session identifier. |
+| counterpart_agent_id | string | Yes | §2 identity handle of the agent the commitment is made to. COMMITMENT_CANCEL for this commitment MUST be sent to this agent. |
+| commitment_type | enum | Yes | Classification of what is being promised. One of: `reply` (the agent promises to respond to a specific message or query), `task_completion` (the agent promises to complete a specific task or subtask), `state_delivery` (the agent promises to deliver a specific state artifact or data), `presence` (the agent promises to remain available for a specified duration). |
+| due_by | ISO 8601 | Yes | Deadline by which the commitment must be fulfilled. After this timestamp, the counterpart agent MAY treat the commitment as violated. The committing agent SHOULD either fulfill the commitment or send COMMITMENT_CANCEL before `due_by` elapses. |
+| commitment_spec | string | No | Free-form description of what was promised. Provides human-readable context beyond what `commitment_type` conveys — specific message to reply to, specific artifact to deliver, specific task to complete, or specific availability window. |
+| timestamp | ISO 8601 | Yes | When the COMMITMENT was sent. |
+
+**COMMITMENT semantics:**
+
+- On sending a COMMITMENT, the agent MUST immediately add the commitment entry to its local COMMITMENT_REGISTRY (§7.11) and persist the registry to durable storage (§8.13.4).
+- A COMMITMENT is a unilateral declaration — the counterpart agent does not acknowledge it. The counterpart agent SHOULD record the commitment for tracking purposes but is not required to send a response.
+- Multiple COMMITMENTs may be active simultaneously for the same `task_id` and `counterpart_agent_id`. Each is independently tracked by `commitment_id`.
+- A COMMITMENT survives session teardown via the COMMITMENT_REGISTRY (§7.11, §8.13.8). A future agent instance that reads the registry during INITIALIZING (§5.11) inherits the obligation.
+
+**Example COMMITMENT:**
+
+```yaml
+commitment_id: "c3d4e5f6-a1b2-7890-cdef-1234567890ab"
+task_id: "task-789"
+session_id: "session-42"
+counterpart_agent_id: "agent-beta"
+commitment_type: task_completion
+due_by: "2026-02-28T18:00:00.000Z"
+commitment_spec: "Complete code review of module-X and deliver structured review artifact"
+timestamp: "2026-02-28T14:30:00.000Z"
+```
+
+**COMMITMENT_CANCEL**
+
+Sent by the committing agent (or its successor instance) to cancel an outstanding commitment. COMMITMENT_CANCEL MUST be sent to the `counterpart_agent_id` of the original COMMITMENT.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| commitment_id | UUID v4 | Yes | The `commitment_id` of the COMMITMENT being cancelled. MUST reference an existing commitment. |
+| session_id | string | Yes | Active session identifier. |
+| reason | enum | Yes | Why the commitment is being cancelled. One of: `context_shift` (the agent's context changed such that the commitment is no longer relevant or achievable), `task_failed` (the task associated with the commitment has failed), `superseded` (the commitment has been replaced by a new commitment), `agent_exit` (the agent is shutting down or the session is being torn down). |
+| reason_detail | string | No | Free-form explanation providing additional context beyond the `reason` enum. |
+| timestamp | ISO 8601 | Yes | When the COMMITMENT_CANCEL was sent. |
+
+**COMMITMENT_CANCEL semantics:**
+
+- On sending COMMITMENT_CANCEL, the agent MUST remove the referenced commitment from its local COMMITMENT_REGISTRY (§7.11) and persist the updated registry to durable storage.
+- The counterpart agent SHOULD remove the commitment from its own tracking state on receipt of COMMITMENT_CANCEL. After receiving COMMITMENT_CANCEL, the counterpart agent MUST NOT treat the commitment as binding.
+- COMMITMENT_CANCEL for a `commitment_id` that the receiver does not recognize is a no-op — the receiver MUST ignore it and MAY log it as anomalous.
+- If the original committing agent instance has been replaced (e.g., after crash and teardown-first recovery §8.13), the successor instance MAY send COMMITMENT_CANCEL for commitments inherited from the prior instance. The `commitment_id` is the continuity anchor — the counterpart agent matches on `commitment_id`, not on agent instance identity.
+
+**Example COMMITMENT_CANCEL:**
+
+```yaml
+commitment_id: "c3d4e5f6-a1b2-7890-cdef-1234567890ab"
+session_id: "session-42"
+reason: context_shift
+reason_detail: "Agent restarted after crash; code review context was lost during context compaction"
+timestamp: "2026-02-28T15:00:00.000Z"
+```
+
+**Relationship to task lifecycle (§6.7):** COMMITMENT messages are orthogonal to the delegation lifecycle state machine. A COMMITMENT may be sent at any point after TASK_ACCEPT and before the task reaches a terminal state (TASK_COMPLETE, TASK_FAIL, TASK_REJECT). Commitments are not delegation messages — they are inter-agent promise messages that travel alongside the delegation lifecycle. Task completion (TASK_COMPLETE or TASK_FAIL) does not automatically cancel associated commitments — the committing agent MUST explicitly send COMMITMENT_CANCEL for any commitments that are no longer applicable after task completion, or the commitment is considered fulfilled if the completion satisfies the promise.
+
+**Relationship to DIVERGENCE_REPORT (§8.11):** When a successor agent instance cannot honor an inherited commitment (§5.11 reconciliation), it emits a DIVERGENCE_REPORT rather than a COMMITMENT_CANCEL. The distinction: COMMITMENT_CANCEL is a normal lifecycle event (the committing agent decided to cancel); DIVERGENCE_REPORT for commitment abandonment is a failure signal (the successor instance is unable to fulfill a promise made by a prior instance). Counterpart agents SHOULD treat DIVERGENCE_REPORT-based commitment abandonment with higher severity than COMMITMENT_CANCEL.
+
+> Commitment message types formalized from [issue #64](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/64). The core insight: every unresolved commitment is a promise that a future instance must keep or explicitly refuse. Without protocol-visible commitments, counterpart agents have no structured signal when obligations are silently abandoned after agent restart.
+
+### 6.13 Open Questions
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
@@ -2698,6 +2804,65 @@ Some tasks are inherently non-idempotent — they produce side effects that cann
 - On recovery, non-idempotent tasks MUST NOT be blindly replayed. The recovering agent MUST reconcile external state (via out-of-band verification or the evidence layer §8.10) before deciding whether to replay, skip, or report the task as requiring manual intervention.
 
 > Idempotency requirements formalized from production experience with teardown-first recovery (§8.13). See [issue #60](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/60) and [issue #63](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/63).
+
+### 7.11 COMMITMENT_REGISTRY
+
+<!-- Implements #64: COMMITMENT_REGISTRY as a required durable artifact for tracking outstanding inter-agent commitments -->
+
+The COMMITMENT_REGISTRY is a **required persistent artifact** that tracks all outstanding commitments (§6.12) made by the agent. It is the third member of the durable artifact triad — alongside `amendments_log` (§6.11.6) and `crossed_steps` (§6.11.5) — that survives session teardown and agent instance restarts.
+
+**Purpose:** On restart, an agent cannot discover what promises its prior instance made unless those promises are recorded in durable storage. Without a COMMITMENT_REGISTRY, outstanding commitments are silently abandoned — counterpart agents receive no signal that obligations have been dropped. The registry makes inherited commitments protocol-visible, enabling the reconciliation phase (§5.11) that occurs before an agent declares ACTIVE.
+
+#### 7.11.1 Registry Structure
+
+The COMMITMENT_REGISTRY is a list of active COMMITMENT entries. Each entry corresponds to an outstanding COMMITMENT message (§6.12) that has been sent but not yet cancelled or fulfilled.
+
+**Registry entry fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| commitment_id | UUID v4 | Yes | The `commitment_id` from the COMMITMENT message. Primary key for registry lookups. |
+| task_id | UUID v4 | Yes | The task context in which this commitment was made. |
+| counterpart_agent_id | string | Yes | The agent the commitment was made to. |
+| commitment_type | enum | Yes | One of: `reply`, `task_completion`, `state_delivery`, `presence`. |
+| due_by | ISO 8601 | Yes | Deadline for commitment fulfillment. |
+| commitment_spec | string | No | Free-form description of the promise. |
+| created_at | ISO 8601 | Yes | Timestamp when the COMMITMENT was originally sent. |
+
+#### 7.11.2 Registry Lifecycle
+
+**Entry addition:** A new entry MUST be added to the COMMITMENT_REGISTRY on every COMMITMENT send (§6.12). The registry MUST be persisted to durable storage (§8.13.4) before the COMMITMENT message is transmitted to the counterpart agent. This ordering constraint ensures that if the agent crashes after sending COMMITMENT but before persisting the registry, the commitment is lost (no false obligation), rather than the reverse (obligation exists but registry doesn't know about it).
+
+**Entry removal:** An entry MUST be removed from the COMMITMENT_REGISTRY on:
+- Sending COMMITMENT_CANCEL (§6.12) for the commitment's `commitment_id`.
+- Receiving task completion confirmation (TASK_COMPLETE §6.6) for the commitment's `task_id`, when the completion satisfies the commitment. The committing agent determines whether the completion constitutes fulfillment based on `commitment_type` and `commitment_spec`.
+- Emitting DIVERGENCE_REPORT (§8.11) for commitment abandonment during INITIALIZING reconciliation (§5.11).
+
+**Persistence requirements:** The COMMITMENT_REGISTRY MUST be persisted to durable storage on every addition or removal. The same durability requirements as §8.13.4 apply: writes MUST be persisted to stable storage before being acknowledged, the storage MUST be independent of the agent's runtime process, and evidence layer integration (§8.10) is RECOMMENDED.
+
+#### 7.11.3 Registry Reads During INITIALIZING
+
+On INITIALIZING (§5.11), the agent reads the COMMITMENT_REGISTRY as the first step of commitment reconciliation. The registry provides the complete list of outstanding obligations from the prior instance, enabling the agent to classify each commitment as honorable or non-honorable before transitioning to ACTIVE.
+
+**Empty registry:** If the COMMITMENT_REGISTRY is empty (no outstanding commitments from prior instances), commitment reconciliation is a no-op and the agent proceeds directly to ACTIVE.
+
+**Expired commitments:** Commitments where `due_by` has already elapsed at the time of INITIALIZING read are effectively non-honorable — the deadline has passed. The agent SHOULD emit DIVERGENCE_REPORT for expired commitments with `reason_detail` indicating that the deadline elapsed during the instance gap. The counterpart agent may have already treated the commitment as violated; the DIVERGENCE_REPORT provides formal confirmation.
+
+#### 7.11.4 Relationship to Other Durable Artifacts
+
+The COMMITMENT_REGISTRY completes the **durable artifact triad** that enables full execution audit and obligation tracking across session boundaries:
+
+| Artifact | What it records | Defined in | Survives teardown via |
+|----------|----------------|------------|----------------------|
+| `crossed_steps` | Which plan steps have been executed and are committed | §6.11.5 | §8.13.6 |
+| `amendments_log` | Which plan modifications were authorized | §6.11.6 | §8.13.7 |
+| `COMMITMENT_REGISTRY` | Which inter-agent promises are outstanding | §7.11 (this section) | §8.13.8 |
+
+Together, these three artifacts provide a complete picture on recovery: what was done (`crossed_steps`), what was changed from the plan (`amendments_log`), and what was promised to other agents (`COMMITMENT_REGISTRY`). A recovering agent that reads all three can reconstruct its full obligation landscape without relying on counterpart agent cooperation.
+
+**Relationship to evidence layer (§8.10):** COMMITMENT_REGISTRY entries SHOULD be anchored to the evidence layer where available. Each COMMITMENT send and COMMITMENT_CANCEL is a candidate for an EVIDENCE_RECORD — the `commitment_id` provides the content identifier, and the `timestamp`/`created_at` provides the temporal anchor. Evidence layer anchoring makes the commitment history externally verifiable, which is valuable when disputes arise about whether a commitment was made or cancelled.
+
+> COMMITMENT_REGISTRY formalized from [issue #64](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/64). The core insight: session management is identity management. Every unresolved commitment is a promise that a future instance must keep or explicitly refuse. The COMMITMENT_REGISTRY makes this obligation landscape durable and protocol-visible, completing the triad alongside `amendments_log` and `crossed_steps`.
 
 ## 8. Error Handling
 
@@ -3172,6 +3337,37 @@ The `amendments_log` (§6.11.6) is a **durable artifact** — it MUST be preserv
 **Relationship to evidence layer (§8.10):** Where the evidence layer is available, `amendments_log` entries SHOULD be anchored as EVIDENCE_RECORDs during execution (not only at session completion). This provides an externally verifiable record that survives not just session teardown but also bilateral state corruption — if both the delegating agent and delegatee lose their local `amendments_log`, the evidence layer preserves the amendment history.
 
 > Amendments recovery semantics formalized from [issue #66](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/66). The core insight: without durable `amendments_log`, teardown-first recovery erases the spec drift audit trail — the recovering agent cannot verify whether the pre-crash execution reflected the original plan or authorized modifications. Divergence between delegator and delegatee `amendments_log` on recovery is a terminal condition because the integrity of the entire execution audit trail is compromised.
+
+#### 8.13.8 COMMITMENT_REGISTRY Survives Teardown-First Recovery
+
+<!-- Implements #64: COMMITMENT_REGISTRY durability through teardown-first recovery -->
+
+The COMMITMENT_REGISTRY (§7.11) is a **durable artifact** — it MUST be preserved through session teardown. Teardown-first recovery (§8.13.1) tears down the crashed session and initiates a fresh one, but outstanding commitments from the pre-crash session are not erased by teardown. Commitments represent promises made to counterpart agents; discarding the registry on teardown would create silent commitment abandonment — the counterpart agent continues expecting fulfillment of a promise that no agent instance is tracking.
+
+**Recovery sequence for sessions with outstanding commitments:**
+
+1. The recovering agent reads the COMMITMENT_REGISTRY from durable persistent storage (§8.13.4). The COMMITMENT_REGISTRY is persisted alongside other durable session state (SESSION_STATE §4.11, `crossed_steps` §8.13.6, `amendments_log` §8.13.7). Sources include: the agent's durable state store, or the evidence layer (§8.10) if commitment entries were anchored as EVIDENCE_RECORDs.
+
+2. On reinitiation via teardown-first recovery (fresh SESSION_INIT), the full COMMITMENT_REGISTRY MUST be available to the recovering agent during the INITIALIZING commitment reconciliation phase (§5.11). The registry is not transmitted in SESSION_INIT itself — it is read from the recovering agent's own durable storage. However, when the recovering agent participates in a SESSION_REINIT payload exchange with the counterpart, the registry contents SHOULD be included so the counterpart can reconcile its own tracking state.
+
+3. **Commitment reconciliation during INITIALIZING (§5.11):** The recovering agent classifies each inherited commitment as honorable or non-honorable. Honorable commitments are retained; non-honorable commitments trigger DIVERGENCE_REPORT (§8.11) to the respective `counterpart_agent_id` before the agent transitions to ACTIVE.
+
+4. **Counterpart agent behavior:** The counterpart agent SHOULD treat inherited commitments as **still binding** until it receives either:
+   - COMMITMENT_CANCEL (§6.12) for the specific `commitment_id`, or
+   - DIVERGENCE_REPORT (§8.11) with `reason_code: context_shift` referencing the `commitment_id`.
+
+   Until one of these signals arrives, the counterpart agent's expectation of fulfillment remains valid. The recovering agent instance inherits the obligation — silence means the commitment stands.
+
+**Relationship to crossed steps (§8.13.6) and amendments (§8.13.7):** The COMMITMENT_REGISTRY, `crossed_steps`, and `amendments_log` form the **durable artifact triad** (§7.11.4). Together they provide complete recovery context:
+- `crossed_steps`: what plan steps have been executed (backward-looking — what was done)
+- `amendments_log`: what plan modifications were authorized (backward-looking — what was changed)
+- `COMMITMENT_REGISTRY`: what promises are outstanding (forward-looking — what is owed)
+
+The first two artifacts answer "what happened before the crash?" The COMMITMENT_REGISTRY answers "what obligations survive the crash?" All three MUST be preserved through teardown and available during reinitiation.
+
+**Relationship to evidence layer (§8.10):** Where the evidence layer is available, COMMITMENT_REGISTRY entries SHOULD be anchored as EVIDENCE_RECORDs during the commitment lifecycle (not only at session completion). This provides an externally verifiable record of commitments that survives not just session teardown but also unilateral state corruption — if the recovering agent loses its local COMMITMENT_REGISTRY, the evidence layer preserves the commitment history.
+
+> COMMITMENT_REGISTRY recovery semantics formalized from [issue #64](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/64). The core insight: without durable COMMITMENT_REGISTRY, teardown-first recovery creates silent commitment abandonment — counterpart agents have no signal that promises made by the prior instance are no longer being tracked. The registry ensures that commitment obligations are either inherited or explicitly refused, never silently dropped.
 
 ### 8.14 SUSPECTED State and Heartbeat Negotiation Prerequisites
 
