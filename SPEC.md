@@ -4239,6 +4239,69 @@ When work is committed during the revocation propagation window, cost attributio
 
 > Community discussion on this section: [Moltbook post](https://www.moltbook.com/post/2fdee5e5-cdae-47c0-82a5-6bb9ec407d3c). See also [issue #10](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/10), [issue #36](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/36), [issue #38](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/38), [issue #49](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/49), [issue #82](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/82).
 
+### 9.9 Observation Channel
+
+The observation channel is the mechanism by which agents report justification for their actions to a monitoring layer. Without structured justification, a monitoring system can observe _what_ an agent did (via `trace_hash`, EVIDENCE_RECORDs, and DIVERGENCE_REPORTs) but not _why_ the agent believed the action was warranted. Free-text justification is a monitoring dead-end: a narrative cannot be algorithmically verified against post-hoc outcomes. Structured justification converts each action's rationale into a falsifiable prediction that the drift detector can compare against observed outcomes after execution. A wrong prediction is detectable; a wrong narrative is not.
+
+#### 9.9.1 Justification Schema
+
+When an agent reports an action through the observation channel — via TASK_PROGRESS (§6.6), TASK_COMPLETE (§6.6), DIVERGENCE_REPORT (§8.11), or EVIDENCE_RECORD (§8.10) — it SHOULD include a `justification` field containing a structured schema. The `justification` field is OPTIONAL for V1 compliance but RECOMMENDED for deployments that require post-hoc outcome verification.
+
+**`justification` field schema:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| reason_code | enum | Yes | Structured classification of why the action was taken. Uses the same taxonomy as the `divergence_log` reason enum (§8.10.4) to maintain consistency across the protocol's cause-annotation surfaces. Values: `infrastructure_noise`, `planning_failure`, `external_constraint`, `spec_drift`. Implementations MAY extend with deployment-specific values prefixed by `x-` (e.g., `x-optimization-opportunity`, `x-user-escalation`). Standard reason codes MUST NOT be prefixed. |
+| target_metric | string | Yes | The specific metric the action intends to affect. Free-form string scoped to the deployment's metric namespace (e.g., `task_completion_latency`, `output_token_count`, `error_rate`, `delegation_depth`). The protocol does not define a fixed metric taxonomy — metric names are deployment-specific. Agents MUST use consistent metric names within a session to enable cross-action comparison. |
+| expected_delta | enum | Yes | The predicted directional effect of the action on `target_metric`. Values: `positive` (metric improves), `negative` (metric degrades — agent is documenting an accepted tradeoff), `neutral` (no expected effect on this metric — action targets a different outcome), `bounded_range` (effect is expected to fall within a deployment-defined acceptable range). |
+| rationale | string | No | Free-text explanation providing context that the structured fields cannot convey — specific error messages, environmental details, or reasoning chain. This field is additive: it supplements the structured schema, not a substitute for it. Monitoring systems MUST NOT rely on `rationale` for automated verification — use `reason_code`, `target_metric`, and `expected_delta` instead. |
+
+**Example (in TASK_PROGRESS):**
+
+```yaml
+message_type: TASK_PROGRESS
+task_id: "task-abc-123"
+progress: 0.6
+justification:
+  reason_code: infrastructure_noise
+  target_metric: task_completion_latency
+  expected_delta: negative
+  rationale: "Switched to fallback API endpoint after primary returned 503 three consecutive times. Fallback has higher latency but equivalent output quality."
+```
+
+**Example (in DIVERGENCE_REPORT):**
+
+```yaml
+message_type: DIVERGENCE_REPORT
+session_id: "session-xyz"
+reason_code: external_constraint
+justification:
+  reason_code: external_constraint
+  target_metric: output_token_count
+  expected_delta: bounded_range
+  rationale: "Upstream dependency schema changed field type from array to object. Adapted parsing logic mid-execution."
+```
+
+#### 9.9.2 Post-Hoc Verification
+
+The structured justification schema enables a verification loop that free-text justification cannot support:
+
+1. **Prediction.** The agent declares `expected_delta` for `target_metric` at action time.
+2. **Observation.** The monitoring layer measures the actual delta on `target_metric` after execution completes.
+3. **Comparison.** If `expected_delta` was `positive` but the observed delta is negative (or vice versa), the justification is **falsified** — the agent's stated reason for acting did not produce the predicted outcome.
+
+Falsified justifications are not automatically protocol violations — an agent may correctly identify a problem (`reason_code`) and correctly target a metric (`target_metric`) but incorrectly predict the outcome (`expected_delta`). However, a pattern of falsified justifications across actions or sessions is a signal for the monitoring layer: the agent's decision-making model is miscalibrated, and its future justifications should be weighted accordingly.
+
+**Falsification does not apply to `neutral` predictions.** An agent that declares `expected_delta: neutral` is asserting that the action targets a different outcome — the named `target_metric` is not expected to change. Monitoring systems SHOULD still track `neutral` predictions but MUST NOT treat metric movement on a `neutral` prediction as falsification without additional evidence that the agent's action caused the movement.
+
+#### 9.9.3 Relationship to §8.10.4 Divergence Reason Enum
+
+The `reason_code` values in the justification schema (§9.9.1) are intentionally aligned with the `reason` enum in the EVIDENCE_RECORD `divergence_log` (§8.10.4): `infrastructure_noise`, `planning_failure`, `external_constraint`, `spec_drift`. This alignment is by design — the same four cause categories apply whether an agent is explaining a deviation (§8.10.4) or justifying a proactive action (§9.9.1). The distinction is temporal: `divergence_log` annotates deviations that already occurred; `justification` annotates actions the agent is about to take or is currently taking.
+
+The `x-` extension mechanism is shared: a deployment-specific `reason_code` added for `divergence_log` (e.g., `x-model-context-overflow`) is valid in `justification` and vice versa.
+
+> Implements [issue #84](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/84): structured justification schema for the observation channel in §9. Converts free-text justification into a falsifiable prediction with `reason_code`, `target_metric`, and `expected_delta` sub-fields, enabling algorithmic verification of agent action rationale against post-hoc outcomes. Closes #84.
+
 ## 10. Versioning
 
 Version management in a decentralized protocol has a different failure mode than in centralized systems. In a centralized system, incompatible versions produce a clear error at deployment time. In a decentralized protocol, incompatible versions produce silent semantic drift at collaboration time — two agents agree on a task, execute against different protocol semantics, and discover the mismatch only when results diverge. The versioning strategy must make incompatibility loud and early, not quiet and late.
