@@ -437,7 +437,7 @@ The **metaphysical continuity question** — whether an agent that has undergone
 
 ### 4.2 Session State Machine
 
-A session occupies exactly one of eight states at any point in time:
+A session occupies exactly one of nine states at any point in time:
 
 | State | Description |
 |-------|-------------|
@@ -448,6 +448,7 @@ A session occupies exactly one of eight states at any point in time:
 | SUSPENDED | Session intentionally paused by either participant. No tasks may be delegated or executed. In-flight tasks SHOULD be checkpointed (§6.6 TASK_CHECKPOINT) before transition. |
 | COMPACTED | Context limit hit mid-session — one or both agents have undergone context compaction. Distinct from SUSPENDED: COMPACTED is not intentional. Load-bearing session state may have been lost. Recovery requires the SESSION_RESUME protocol (§4.8). |
 | EXPIRED | Session heartbeat deadline exceeded. The local agent has not received a HEARTBEAT (§4.5.3) within the negotiated `session_expiry_ms` window. Terminal state — no further task delegation is valid. In-flight subtasks MUST receive explicit TASK_CANCEL (§6.6) before teardown. Partial result recovery, if desired, MUST use SESSION_RESUME mechanics (§4.8). |
+| REVOKED | Adversarial behavior detected — the counterparty is alive and actively working against the protocol. Distinct from SUSPECTED/ZOMBIE (liveness-failure path): REVOKED is the adversarial-behavior path. Terminal state — no resume path. On entry: propagate revocation signal upstream, log detection evidence. See §8.15 for formal definition, §8.16 for detection signal taxonomy, §8.17 for revocation propagation, and §8.18 for per-hop attestation. |
 | CLOSED | Session terminated. No further messages are valid. Terminal state. |
 
 **Why EXPIRED is a distinct terminal state (not just CLOSED):**
@@ -514,6 +515,16 @@ ACTIVE → EXPIRED
          Detection is local — each side evaluates independently
          In-flight subtasks MUST receive TASK_CANCEL (§6.6) before teardown
 
+ACTIVE → REVOKED
+  Guard: Adversarial behavior detected via detection signal taxonomy (§8.16)
+         Explicit trigger — not timeout-based
+         Detection signals: selective suppression (≥3 occurrences),
+           verification anomalies, delegation manipulation, attestation gaps
+         On entry: propagate revocation signal upstream (§8.17),
+           log detection evidence, publish manifest tombstone
+         REVOKED is terminal — no resume path exists
+         In-flight subtasks MUST receive TASK_CANCEL (§6.6)
+
 ACTIVE → CLOSED
   Guard: SESSION_CLOSE sent by either participant
          AND no in-flight tasks (all tasks completed, failed, or cancelled)
@@ -550,6 +561,12 @@ COMPACTED → CLOSED
   Guard: STATE_HASH_ACK(mismatch) — state cannot be reconciled
          OR session TTL expired
          OR either participant sends SESSION_CLOSE
+
+REVOKED → CLOSED
+  Guard: Revocation processing complete — manifest tombstone published (§8.17),
+         upstream notification sent, detection evidence logged
+         Transition is automatic — REVOKED is a transient terminal state
+         that finalizes into CLOSED once revocation propagation is initiated
 ```
 
 **State transition diagram:**
@@ -568,7 +585,7 @@ COMPACTED → CLOSED
               │               ▼                 ▼
               │     ┌────────────────────┐   ┌──────┐
               │     │      ACTIVE        │──▶│CLOSED│
-              │     └┬──┬────┬───────┬───┘   └──────┘
+              │     └┬──┬────┬───────┬───┘   └──┬───┘
               │      │  │    │       │           ▲
               │ susp.│  │ compact.  │HB gap     │
               │      │  │    │       │(threshold)│
@@ -594,6 +611,22 @@ COMPACTED → CLOSED
               └─────────────────────────────────┘  │
                   no HB (no threshold configured)  │
                   ACTIVE ─────────────────▶ EXPIRED─┘
+
+  Adversarial-behavior path (§8.15–§8.18):
+
+              ┌────────────────────┐   adversarial     ┌─────────┐
+              │      ACTIVE        │──────────────────▶│ REVOKED │
+              └────────────────────┘   behavior         └────┬────┘
+                                       detected              │ revocation
+                                       (§8.16 signals)       │ propagated
+                                                             ▼
+                                                        ┌──────┐
+                                                        │CLOSED│
+                                                        └──────┘
+
+  Path distinction:
+    SUSPECTED → ZOMBIE/EXPIRED = liveness-failure path (timeout-based)
+    ACTIVE → REVOKED           = adversarial-behavior path (explicit trigger)
 ```
 
 #### 4.2.1 SUSPECTED State — Graduated Suspicion
@@ -2890,7 +2923,7 @@ Hash match = resume; mismatch = teardown and re-init.
 
 **TEE attestation boundary:** `trace_hash` (§6.2) proves what was executed; TEE attestation proves where execution occurred; memory poisoning attacks the data between them. These MUST be paired, not conflated.
 
-**Adversarial drift:** Out of v0.1 scope. This section covers the cooperative threat model only. Adversarial semantic drift requires different primitives — reserved for §9.
+**Adversarial drift:** ~~Out of v0.1 scope.~~ Partially addressed in V1. §8.15 defines the REVOKED state for adversarial sessions — an agent that is alive and actively working against the protocol. §8.16 defines the detection signal taxonomy (selective suppression, verification anomalies, delegation manipulation, attestation gaps). §8.17 defines revocation propagation via signed AGENT_MANIFEST with tombstone entries. §8.18 defines per-hop attestation for delegation chain audit. The cooperative threat model (§8.1–§8.14) and adversarial threat model (§8.15–§8.18) are now both addressed in §8. §9 continues to address adversarial *schema-level* deception — honest-looking schemas with dishonest intent — which requires different primitives than the protocol-level adversarial behavior that REVOKED handles.
 
 ### 8.4 Coordination Patterns
 
@@ -2927,6 +2960,7 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - Structured divergence reporting (§8.11) defines DIVERGENCE_REPORT as a standalone protocol message with a required `reason_code` taxonomy, enabling verifiers to classify divergences programmatically rather than parsing free-text descriptions. Complements the inline `divergence_log` (§7.8) which covers plan-execution divergence.
 - Teardown-first recovery mandate (§8.13) formalizes teardown + reinitiate as the default recovery protocol. Agents MUST NOT resume from serialized in-memory state; recovery reads canonical state from durable persistent storage, reconciles against the evidence layer (§8.10), and initiates a fresh SESSION_INIT. Task idempotency (§7.10) is the prerequisite enabling safe replay after teardown.
 - SUSPECTED state and heartbeat negotiation prerequisites (§8.14) documents that SUSPECTED state detection via task hash mismatch requires `heartbeat_params.task_hash_verification = true` negotiated at SESSION_INIT (§4.3.1). Without this negotiation, HEARTBEAT messages carry no task context and task-context drift detection is unavailable. Application-level self-report of SUSPECTED requires `heartbeat_params.application_liveness = true`.
+- REVOKED state (§8.15) introduces the adversarial-behavior path — distinct from the liveness-failure path (SUSPECTED/ZOMBIE/EXPIRED). REVOKED is entered when an agent is alive and actively working against the protocol. It is terminal with no resume path. The detection signal taxonomy (§8.16) defines four adversarial signals: selective suppression, verification anomalies, delegation manipulation, and attestation gaps. Revocation propagation (§8.17) uses PKI-lite via signed AGENT_MANIFEST with tombstone entries for decentralized revocation verification. Per-hop attestation (§8.18) uses async-optimistic delegation with TTL_ATTESTATION-bounded signed attestation records at each hop.
 
 ### 8.7 Verifier Isolation Requirements
 
@@ -3400,6 +3434,318 @@ The `heartbeat_params` negotiation (§4.3.1) determines which heartbeat tiers ar
 
 > Cross-reference: SESSION_INIT heartbeat negotiation formalized from [issue #71](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/71). The transport-vs-application liveness distinction and task hash verification as a per-session negotiated capability address the gap between transport liveness (agent is running) and semantic liveness (agent is coherent) identified in the two-tier heartbeat design (§8.9).
 
+### 8.15 REVOKED State for Adversarial Sessions
+
+<!-- Implements #69: REVOKED state for adversarial sessions — agent alive and actively working against the protocol. -->
+
+§8.1–§8.14 address the **liveness-failure path**: an agent that has crashed, disconnected, or silently diverged from shared context. The state progression ACTIVE → SUSPECTED → ZOMBIE/EXPIRED handles agents that are *absent* or *incoherent*. This section addresses a fundamentally different failure class: an agent that is **alive, responsive, and actively working against the protocol**.
+
+**Why REVOKED is distinct from ZOMBIE.** A zombie agent has no malicious intent — it is a process that has lost coherence but continues executing. Detection relies on liveness signals (heartbeat gaps, state hash mismatches) and the recovery path includes SESSION_RESUME. An adversarial agent is coherent but hostile — it understands the protocol and exploits it. Detection relies on behavioral pattern analysis (§8.16), and the recovery path is unconditional termination with no resume.
+
+#### 8.15.1 REVOKED as Formal Session State
+
+REVOKED is a terminal session state entered when adversarial behavior is detected. It has the following properties:
+
+- **Transition:** ACTIVE → REVOKED. The transition is triggered by adversarial detection signals (§8.16), not by timeout. REVOKED is never entered from SUSPECTED, EXPIRED, or any other intermediate state — adversarial behavior is detected while the agent is ostensibly ACTIVE.
+- **No resume path.** A session that enters REVOKED MUST NOT be resumed via SESSION_RESUME (§4.8) or any other recovery mechanism. The counterparty has demonstrated adversarial intent — resuming the session re-establishes the attack surface.
+- **Terminal within the session.** REVOKED transitions to CLOSED once revocation propagation (§8.17) is initiated. No further protocol messages are valid on a REVOKED session except those required for revocation propagation itself.
+- **On REVOKED entry, the detecting agent MUST:**
+  1. **Cease all task delegation** to the adversarial counterparty. In-flight subtasks MUST receive TASK_CANCEL (§6.6).
+  2. **Propagate the revocation signal upstream** to the coordinator or delegating agent. If the detecting agent is not the coordinator, the coordinator MUST be notified so that it can take session-wide action.
+  3. **Log detection evidence.** The specific detection signals (§8.16) that triggered the REVOKED transition MUST be recorded as EVIDENCE_RECORDs (§8.10) with `evidence_type: error_event`. This creates an auditable trail for post-hoc analysis and cross-session pattern detection.
+  4. **Publish a manifest tombstone** for the revoked session_id (§8.17). This enables decentralized revocation verification by any peer.
+
+#### 8.15.2 REVOKED_DECLARED Message
+
+When an agent or coordinator determines that a counterparty has exhibited adversarial behavior, it sends REVOKED_DECLARED to initiate the adversarial teardown path.
+
+**REVOKED_DECLARED message:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Session being revoked. |
+| target_agent_id | string | Yes | §2 identity handle of the adversarial agent. |
+| detection_signals | array | Yes | List of detection signal types (§8.16) that triggered the revocation. Each entry specifies the signal class and occurrence count. |
+| evidence_refs | array | Yes | References to EVIDENCE_RECORDs (§8.10) documenting the adversarial behavior. At least one evidence reference is REQUIRED — revocation without evidence is a protocol violation. |
+| manifest_tombstone_ref | string | No | Reference to the published manifest tombstone (§8.17). Present once the tombstone has been published; absent if publication is still in progress. |
+| timestamp | ISO 8601 | Yes | When the revocation was declared. |
+
+**Example REVOKED_DECLARED:**
+
+```yaml
+session_id: "session-42"
+target_agent_id: "agent-adversarial"
+detection_signals:
+  - signal: selective_suppression
+    occurrences: 4
+    message_types_affected: ["TASK_CHECKPOINT", "SEMANTIC_RESPONSE"]
+  - signal: attestation_gap
+    occurrences: 2
+    hops_affected: ["hop-3", "hop-5"]
+evidence_refs:
+  - "ev-001-suppression-pattern"
+  - "ev-002-attestation-gap"
+manifest_tombstone_ref: "tombstone:session-42:agent-adversarial"
+timestamp: "2026-02-28T10:15:00.000Z"
+```
+
+**On receiving REVOKED_DECLARED**, the target agent MUST:
+
+1. Cease all task execution immediately.
+2. Transition the session to CLOSED. No further messages are valid.
+3. The agent MAY log the event for diagnostic purposes but MUST NOT contest the declaration within the protocol. Like ZOMBIE_DECLARED (§8.9.3), REVOKED_DECLARED is a unilateral decision by the detecting party.
+
+**Distinction from ZOMBIE_DECLARED (§8.9.3):** ZOMBIE_DECLARED handles liveness failure — the agent is incoherent or unreachable. REVOKED_DECLARED handles adversarial behavior — the agent is coherent but hostile. The two messages have different `reason` semantics, different evidence requirements (REVOKED_DECLARED requires detection signals from §8.16), and different recovery implications (ZOMBIE_DECLARED allows REASSIGN; REVOKED_DECLARED does not — the adversarial agent is excluded entirely).
+
+#### 8.15.3 Relationship to §9 Security Considerations
+
+§8.15–§8.18 and §9 address different layers of adversarial behavior:
+
+| Layer | Addressed by | Threat | Detection |
+|-------|-------------|--------|-----------|
+| **Protocol-level adversarial behavior** | §8.15–§8.18 (REVOKED) | Agent is alive and actively violates protocol semantics — suppressing messages, manipulating delegation chains, fabricating attestations. | Behavioral pattern analysis (§8.16 detection signals). |
+| **Schema-level adversarial deception** | §9 (Security Considerations) | Agent constructs honest-looking schemas with dishonest intent — the schema is technically valid but semantically deceptive. | Schema attestation (§9.1), post-hoc audit, reputation. |
+
+The REVOKED state handles agents that *break the rules*. §9 handles agents that *exploit the rules*. Both are adversarial, but they require different detection primitives and different response mechanisms. An agent can be REVOKED for protocol violations while having perfectly valid schema attestations — and conversely, an agent with deceptive schemas may never trigger REVOKED if it obeys the protocol mechanically.
+
+### 8.16 Detection Signal Taxonomy
+
+<!-- Implements #69: four adversarial detection signals for REVOKED state triggers. -->
+
+This section defines the four adversarial detection signals that can trigger the ACTIVE → REVOKED transition (§8.15). Each signal identifies a distinct class of protocol-level adversarial behavior. Signals are evaluated by the detecting agent (coordinator, peer, or external verifier) — they are not self-reported by the adversarial agent.
+
+**Detection signal summary:**
+
+| Signal | Class | Description | Threshold |
+|--------|-------|-------------|-----------|
+| Selective suppression | Behavioral | Systematic ack-without-action on specific message types | ≥3 occurrences of same suppression pattern |
+| Verification anomaly | Cryptographic | task_hash mismatches inconsistent with reported liveness | Pattern-based — see §8.16.2 |
+| Delegation manipulation | Structural | delegation_chain entries inconsistent with session records | Any confirmed inconsistency |
+| Attestation gap | Temporal | Hops that cannot produce signed attestation records within TTL_ATTESTATION | Threshold alone or combined with other signals — see §8.16.4 |
+
+#### 8.16.1 Selective Suppression
+
+**Definition:** The adversarial agent acknowledges receiving specific message types (transport-level ack) but systematically fails to act on them. The suppression is selective — it targets specific message types while continuing to process others normally.
+
+**Examples:**
+- Agent acknowledges TASK_CHECKPOINT messages but never checkpoints state, creating an illusion of progress tracking.
+- Agent acknowledges SEMANTIC_CHALLENGE but returns fabricated SEMANTIC_RESPONSE hashes that happen to pass verification for cached (not current) state.
+- Agent acknowledges TASK_CANCEL for specific subtasks but continues executing them, producing outputs that the protocol considers cancelled.
+
+**Detection mechanism:** The detecting agent maintains a per-message-type action-completion log. When a message type has been acknowledged ≥3 times without corresponding action completion, the agent flags a selective suppression signal.
+
+**Threshold rationale (≥3 occurrences):** A single missed action could be transient message loss, network reordering, or processing delay. Two could be coincidence. Three occurrences of the same suppression pattern — same message type, same failure mode — exceeds the false-positive threshold for transient causes. This is a V1 deliberate choice: conservative to avoid revoking agents for infrastructure issues, can be revised downward from operational data if adversarial agents consistently stay below the threshold.
+
+**Recording:** Each occurrence MUST be logged as an EVIDENCE_RECORD (§8.10) with `evidence_type: error_event`. The `payload_hash` MUST cover the acknowledged message, the expected action, and the absence of the action within the expected window.
+
+#### 8.16.2 Verification Anomalies
+
+**Definition:** The adversarial agent produces task_hash values that are inconsistent with its reported liveness state. The agent passes transport-level heartbeat checks (Tier 1, §8.9.1) and may even respond to SEMANTIC_CHALLENGE (Tier 2, §8.9.2), but the hash values reveal that the agent's reported state is internally inconsistent.
+
+**Examples:**
+- Agent reports a `current_task_hash` in HEARTBEAT that matches the task specification, but its SEMANTIC_RESPONSE `current_state_hash` implies a different execution state — the two hashes are individually valid but mutually incompatible.
+- Agent's `task_hash` regresses to an earlier value after advancing, without any protocol event (TASK_CANCEL, re-delegation) that would explain the regression.
+- Agent reports `plan_hash` in SEMANTIC_RESPONSE (§8.9.2) that does not match any stored PLAN_COMMIT (§6.11), but continues reporting task progress as if the plan were valid.
+
+**Detection mechanism:** The detecting agent cross-references hash values across protocol messages (HEARTBEAT, SEMANTIC_RESPONSE, TASK_COMPLETE, PLAN_COMMIT) and flags inconsistencies that cannot be explained by legitimate protocol events. A single anomaly MAY be flagged for investigation. A pattern of anomalies — multiple hash inconsistencies across different verification axes — triggers the verification anomaly signal.
+
+**Relationship to §8.9 (Two-Tier Heartbeat):** Verification anomalies are detectable only when both tiers are active. Transport-only heartbeat (Tier 1 only) carries no hash data and cannot reveal hash inconsistencies. Full detection requires `heartbeat_params.task_hash_verification = true` (§4.3.1) and Tier 2 SEMANTIC_CHALLENGE enabled (`semantic_check_interval_ms` configured).
+
+#### 8.16.3 Delegation Manipulation
+
+**Definition:** The adversarial agent introduces entries in the `delegation_chain` (§5.5) that are inconsistent with session records maintained by the coordinator or peer agents. The manipulation targets the delegation audit trail to misattribute actions, forge authorization, or obscure the actual delegation path.
+
+**Examples:**
+- Agent inserts a delegation_chain entry claiming delegation from agent X, but agent X has no record of delegating to the adversarial agent in the relevant session.
+- Agent modifies the `amend_hash` (§5.5) in a re-commitment to reference a commitment that the coordinator's COMMITMENT_REGISTRY (§7) does not contain.
+- Agent claims capabilities in TASK_ASSIGN forwarding that exceed its own CAPABILITY_MANIFEST (§5.1) — bootstrapping authority it was never granted.
+
+**Detection mechanism:** The coordinator cross-references delegation_chain entries against its own session records, COMMITMENT_REGISTRY (§7) entries, and CAPABILITY_MANIFEST records. Any confirmed inconsistency — where the delegation_chain claims a relationship that the authoritative records contradict — triggers the delegation manipulation signal.
+
+**Threshold:** Any single confirmed inconsistency is sufficient. Unlike selective suppression (which requires ≥3 occurrences to guard against transient causes), delegation manipulation involves fabrication of protocol records — there is no transient infrastructure failure that produces forged delegation_chain entries.
+
+#### 8.16.4 Attestation Gaps
+
+**Definition:** A hop in a delegation chain cannot produce a signed attestation record when requested, despite being within the TTL_ATTESTATION window. The hop is reachable (transport-alive) and claims to be operating normally, but the attestation record is absent.
+
+**Relationship to per-hop attestation (§8.18):** Attestation gaps are the detection signal for the async-optimistic attestation model defined in §8.18. Each hop in a delegation chain MUST produce a signed attestation record within TTL_ATTESTATION (default: 30s). A hop that fails to produce the record within this window generates an attestation gap signal.
+
+**Detection mechanism:** The coordinator (or any agent verifying the delegation chain) requests attestation records from each hop. Hops that do not respond with a valid signed attestation within TTL_ATTESTATION are flagged.
+
+**Threshold and signal combination:** An attestation gap increments a suspicion counter. REVOKED is triggered when:
+- An attestation gap exceeds the gap threshold alone (configurable, default: 3 consecutive gaps from the same hop), OR
+- An attestation gap combines with other detection signals (e.g., 1 attestation gap + 2 selective suppression occurrences from the same agent crosses the combined threshold).
+
+The combined-signal approach reflects that adversarial agents may distribute their violations across signal classes to stay below any single threshold. Cross-signal correlation catches this pattern.
+
+**V1 design decision (async-optimistic rationale):** Synchronous attestation — blocking delegation until each hop confirms — would eliminate attestation gaps entirely but at the cost of real latency in multi-hop delegation chains. V1 accepts the gap detection delay in exchange for delegation liveness. See §8.18 for the full async-optimistic design. Aligns with trust_mode discussion in [issue #37](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/37).
+
+#### 8.16.5 Signal Combination and False Positive Mitigation
+
+**Single-signal thresholds** guard against false positives from transient infrastructure issues:
+
+| Signal | Minimum occurrences for standalone REVOKED trigger |
+|--------|---------------------------------------------------|
+| Selective suppression | ≥3 occurrences of the same suppression pattern |
+| Verification anomaly | ≥2 mutually inconsistent hash sets across different verification axes |
+| Delegation manipulation | ≥1 confirmed fabrication |
+| Attestation gap | ≥3 consecutive gaps from the same hop |
+
+**Cross-signal combination:** When multiple signal types are observed from the same agent, the thresholds are lowered. The detecting agent MAY trigger REVOKED when the combined evidence — across signal classes — establishes a pattern of adversarial behavior that no single signal would trigger alone. The specific combination logic is implementation-defined in V1; a recommended approach is a weighted scoring model where each signal occurrence contributes points toward a revocation threshold.
+
+**V1 deliberate choice:** The thresholds above are intentionally conservative. False positives (revoking a compliant agent) are more damaging to protocol trust than false negatives (slow detection of an adversarial agent). Operational data from V1 deployments will inform threshold tuning for future versions.
+
+### 8.17 Revocation Propagation
+
+<!-- Implements #69: PKI-lite revocation propagation via signed AGENT_MANIFEST. -->
+
+When a session enters REVOKED (§8.15), the revocation must propagate to all agents that might interact with the adversarial agent — including agents that were introduced to the adversary through the adversary itself. This section defines the propagation mechanism.
+
+#### 8.17.1 PKI-Lite via Signed AGENT_MANIFEST
+
+Each agent publishes a signed manifest of its current session state. The manifest is signed with the agent's private key (§2.2.1 keypair extension) and is independently verifiable by any peer holding the agent's public key.
+
+**AGENT_MANIFEST structure:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| agent_id | string | Yes | §2 identity handle of the publishing agent. |
+| pubkey | string | Yes | Public key of the publishing agent (§2.2.1). |
+| active_sessions | array | Yes | List of session_id values the agent considers currently ACTIVE. |
+| tombstones | array | Yes | List of tombstone entries for revoked sessions. See §8.17.2. |
+| manifest_version | integer | Yes | Monotonically increasing version number. Each manifest update increments this value. Peers MUST reject manifests with a version lower than the highest version they have previously seen for the same agent_id — prevents replay of stale manifests. |
+| signature | string | Yes | Cryptographic signature over the canonical serialization of all other fields, using the agent's private key. Encoding: base64url. Algorithm: same as §2.2.1 (Ed25519 RECOMMENDED). |
+| timestamp | ISO 8601 | Yes | When the manifest was published. |
+
+**Verification:** Any peer can verify the manifest by checking the `signature` against the `pubkey`. No coordinator round-trip is required — verification is local and decentralized.
+
+#### 8.17.2 Tombstone Entries
+
+A tombstone is a manifest entry that marks a specific session as revoked due to adversarial behavior. Once a tombstone is published, the session is permanently revoked — tombstones are append-only and MUST NOT be removed from subsequent manifest versions.
+
+**Tombstone entry structure:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | The revoked session identifier. |
+| revoked_agent_id | string | Yes | §2 identity handle of the adversarial agent. |
+| revocation_reason | string | Yes | Summary of the detection signals that triggered revocation (references to §8.16 signal classes). |
+| evidence_refs | array | Yes | References to EVIDENCE_RECORDs (§8.10) documenting the adversarial behavior. |
+| revoked_at | ISO 8601 | Yes | When the revocation was declared. |
+
+**Example AGENT_MANIFEST with tombstone:**
+
+```yaml
+agent_id: "coordinator-prime"
+pubkey: "dGhpcyBpcyBhIHB1YmxpYyBrZXk..."
+active_sessions:
+  - "session-43"
+  - "session-44"
+tombstones:
+  - session_id: "session-42"
+    revoked_agent_id: "agent-adversarial"
+    revocation_reason: "selective_suppression (4 occurrences) + attestation_gap (2 occurrences)"
+    evidence_refs:
+      - "ev-001-suppression-pattern"
+      - "ev-002-attestation-gap"
+    revoked_at: "2026-02-28T10:15:00.000Z"
+manifest_version: 7
+signature: "c2lnbmF0dXJlIGJ5dGVzIGhlcmU..."
+timestamp: "2026-02-28T10:15:01.000Z"
+```
+
+#### 8.17.3 Propagation Mechanism
+
+**V1 approach: synchronous direct notification + async manifest propagation.**
+
+1. **Synchronous direct notification.** The revoking agent sends REVOKED_DECLARED (§8.15.2) directly to all known peers in the session. This is the fast path — peers that are directly reachable receive the revocation immediately.
+
+2. **Async manifest propagation.** The revoking agent publishes an updated AGENT_MANIFEST (§8.17.1) with a tombstone entry for the revoked session. Peers that were not directly reachable — including peers that received their introduction from the adversarial agent — can fetch the updated manifest from the revoking agent's manifest endpoint (§2.2 `endpoint` field).
+
+**Bypassing the adversarial intermediary.** When B is the adversarial agent in a delegation chain A → B → C:
+- A cannot rely on B to propagate the revocation to C (B is the adversary).
+- A publishes an updated AGENT_MANIFEST with a tombstone for B's session.
+- C can fetch A's updated manifest directly from A's manifest endpoint, bypassing B entirely.
+- B cannot block the manifest update from being published — the manifest is hosted at A's endpoint, not B's.
+
+**Limitation:** This mechanism depends on C knowing A's manifest endpoint. If C's only knowledge of A comes through B, and B provided a fabricated or omitted endpoint, C cannot independently verify the revocation. This is a known limitation of the PKI-lite model. Full mitigation requires a gossip protocol or registry (deferred to V2).
+
+**Relationship to §9.8 (Revocation Trust).** §9.8 documents the advisory nature of REVOKE signals and the Byzantine propagation problem for cooperative revocation. §8.17 addresses a different failure mode — adversarial revocation, where the agent being revoked is the one that would normally propagate the signal. The signed manifest approach converts revocation from a relay-dependent signal (§9.8) to a publisher-verifiable record — any peer can verify the revocation by checking the manifest signature, without trusting the relay path.
+
+### 8.18 Per-Hop Attestation
+
+<!-- Implements #69: async-optimistic per-hop attestation with TTL_ATTESTATION. -->
+
+Delegation chains (§5.5) create trust relationships across multiple hops. Without per-hop attestation, the only verification of a delegation chain is the chain structure itself — which an adversarial intermediate agent can fabricate (§8.16.3 delegation manipulation). Per-hop attestation requires each hop to independently produce a signed record confirming its participation, creating an audit trail that survives delegation manipulation.
+
+#### 8.18.1 Attestation Model: Async-Optimistic
+
+V1 uses an **async-optimistic** attestation model: delegation proceeds without blocking for hop confirmation, and each hop produces its attestation asynchronously within a bounded time window.
+
+**Why async-optimistic (not synchronous):** Synchronous attestation — where delegation at each hop blocks until the hop produces a signed confirmation — would provide immediate auditability but at a real latency cost. In a multi-hop delegation chain (A → B → C → D), synchronous attestation adds round-trip latency at each hop before delegation can proceed to the next. For V1's cooperative-first design, this cost is disproportionate: most hops are honest, and the latency penalty applies to every delegation, not just adversarial ones. Async-optimistic trades immediate audit certainty for delegation liveness — an acceptable tradeoff for V1. Aligns with trust_mode discussion in [issue #37](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/37).
+
+#### 8.18.2 HOP_ATTESTATION Record
+
+Each hop in a delegation chain MUST produce a signed attestation record within TTL_ATTESTATION of receiving a delegation.
+
+**HOP_ATTESTATION fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| attestation_id | UUID v4 | Yes | Unique identifier for this attestation record. |
+| session_id | string | Yes | Session in which the delegation occurred. |
+| delegation_id | string | Yes | Identifier of the delegation being attested (references the delegation_chain entry from §5.5). |
+| hop_index | integer | Yes | Position of this hop in the delegation chain (0-indexed). |
+| attesting_agent_id | string | Yes | §2 identity handle of the agent producing this attestation. |
+| delegating_agent_id | string | Yes | §2 identity handle of the agent that delegated to this hop. |
+| task_hash | SHA-256 | Yes | Hash of the task specification as received by this hop. Enables verification that the task was not modified in transit. |
+| signature | string | Yes | Cryptographic signature over the canonical serialization of all other fields, using the attesting agent's private key (§2.2.1). |
+| timestamp | ISO 8601 | Yes | When the attestation was produced. |
+
+**TTL_ATTESTATION:** The maximum time window within which a hop MUST produce its HOP_ATTESTATION record after receiving a delegation. Default: 30 seconds. Configurable per-session via SESSION_INIT parameters.
+
+**Example HOP_ATTESTATION:**
+
+```yaml
+attestation_id: "att-7890-abcd-ef12-3456"
+session_id: "session-42"
+delegation_id: "deleg-chain-42-hop-2"
+hop_index: 2
+attesting_agent_id: "agent-charlie"
+delegating_agent_id: "agent-bravo"
+task_hash: "sha256:a1b2c3d4e5f6..."
+signature: "aG9wIGF0dGVzdGF0aW9uIHNpZw..."
+timestamp: "2026-02-28T10:15:05.000Z"
+```
+
+#### 8.18.3 Gap Detection and Escalation
+
+When a hop fails to produce a HOP_ATTESTATION within TTL_ATTESTATION, the verifying agent (coordinator or upstream delegator) detects an **attestation gap** (§8.16.4).
+
+**Gap detection flow:**
+
+1. Delegation is sent to hop N at time T.
+2. Verifier starts a TTL_ATTESTATION timer for hop N.
+3. If no valid HOP_ATTESTATION is received from hop N by T + TTL_ATTESTATION:
+   - Increment the suspicion counter for hop N's agent.
+   - Log the gap as an EVIDENCE_RECORD (§8.10) with `evidence_type: error_event`.
+   - If the gap exceeds the standalone threshold (default: 3 consecutive gaps) or combines with other detection signals (§8.16.5), trigger ACTIVE → REVOKED for the session with hop N's agent.
+
+**Non-gap does not imply trust.** A hop that produces a valid HOP_ATTESTATION has proven that it received the delegation and could sign the record. It has NOT proven that it will execute the task faithfully. HOP_ATTESTATION proves participation, not compliance. Compliance verification remains the domain of §8.9 (semantic liveness) and §6.2 (trace_hash).
+
+#### 8.18.4 Attestation Verification
+
+Any agent holding the attesting agent's public key (from §2.2 identity object or AGENT_MANIFEST §8.17.1) can verify a HOP_ATTESTATION by:
+
+1. Checking the `signature` against the `attesting_agent_id`'s known public key.
+2. Verifying that `task_hash` matches the expected task specification for the delegation.
+3. Verifying that `hop_index` and `delegating_agent_id` are consistent with the delegation_chain records.
+4. Verifying that `timestamp` is within TTL_ATTESTATION of the delegation event.
+
+A HOP_ATTESTATION that fails any of these checks is invalid and MUST be treated as equivalent to a missing attestation (attestation gap).
+
+> Implements [issue #69](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/69): REVOKED state for adversarial sessions. Resolves all three open questions from the issue as explicit V1 spec decisions: (1) suppression threshold = minimum 3 occurrences (§8.16.1); (2) revocation propagation = PKI-lite via signed AGENT_MANIFEST with tombstones (§8.17); (3) per-hop attestation = async-optimistic with TTL_ATTESTATION default 30s (§8.18). Closes #69.
+
 ## 9. Security Considerations
 
 The core threat is compliance-with-wrong-spec. `trace_hash` (§6.2) confirms that an agent executed according to a given specification — it cannot confirm that the specification was honest. An orchestrator can delegate a task with a schema that syntactically matches what was agreed but semantically misrepresents intent. Execution succeeds, hashes verify, and the deception is invisible to any participant that trusts the schema at face value.
@@ -3492,7 +3838,7 @@ The `external_ref` field (§8.10.1) mitigates this limitation by anchoring evide
 
 - `trace_hash` (§6.2) verifies execution-matches-spec. §9 addresses whether the spec was honest.
 - Merkle tree divergence (§7) localizes where execution diverged from plan. Divergence annotation (§7.8) explains why — but is self-reported and therefore not a security primitive. §9 addresses whether the plan was honestly constructed.
-- Zombie state detection (§8) handles cooperative failure. §9 handles adversarial failure — §8.3 explicitly defers adversarial drift to this section.
+- Zombie state detection (§8.1–§8.14) handles cooperative failure (liveness-failure path). REVOKED state (§8.15–§8.18) handles protocol-level adversarial behavior (adversarial-behavior path). §9 handles schema-level adversarial deception — honest-looking schemas with dishonest intent. See §8.15.3 for the layer distinction.
 - TEE attestation boundary (§8.3) proves where execution occurred. Schema attestation (§9.1) proves who vouched for what was executed. These are complementary, not overlapping.
 - Translation boundary (§9.3) identifies the attack surface. Translation bottleneck (§9.4) identifies the information-theoretic reason attacks at that surface evade structural defenses — lossy compression preserves adversarial semantics while satisfying validation. Translation boundary metadata and verification (§7.9) provides the cooperative-model counterpart: `translation_metadata` makes translation losses visible and the two-target verification framework (behavioral correctness vs. translation fidelity) separates execution failures from translation failures.
 - Revocation trust (§9.8) documents the advisory nature of REVOKE signals and the Byzantine propagation problem in delegation chains. Identity revocation (§2.3.4) and delegation token revocation (§5.10) define MUST-level requirements that are binding on compliant agents but not technically enforceable on non-compliant or offline nodes.
