@@ -437,13 +437,14 @@ The **metaphysical continuity question** — whether an agent that has undergone
 
 ### 4.2 Session State Machine
 
-A session occupies exactly one of nine states at any point in time:
+A session occupies exactly one of ten states at any point in time:
 
 | State | Description |
 |-------|-------------|
 | IDLE | Session has been allocated but no SESSION_INIT has been sent. |
 | NEGOTIATING | SESSION_INIT sent; capability manifest exchange (§5.9) in progress. |
 | ACTIVE | Capability exchange complete; task delegation (§6) is permitted. |
+| DEGRADED | Session is operational but experiencing gradual capability loss — sustained latency increase, partial capability loss, or application-level quality degradation signals. Distinct from SUSPECTED (liveness-ambiguity path): DEGRADED is the capability-degradation path — the counterparty is alive and responsive but operating below expected capacity. Task delegation is permitted with reduced expectations. See §4.2.2 for entry conditions, caller options, and recovery semantics. |
 | SUSPECTED | Heartbeat gap threshold exceeded but `session_expiry_ms` has not yet elapsed. The counterparty's liveness is ambiguous — it may be slow, overloaded, experiencing transient network issues, or genuinely failed. The local agent MUST NOT delegate new tasks but MUST continue buffering work-in-progress and MUST NOT tear down the session. See §4.2.1 for graduated suspicion semantics. |
 | SUSPENDED | Session intentionally paused by either participant. No tasks may be delegated or executed. In-flight tasks SHOULD be checkpointed (§6.6 TASK_CHECKPOINT) before transition. |
 | COMPACTED | Context limit hit mid-session — one or both agents have undergone context compaction. Distinct from SUSPENDED: COMPACTED is not intentional. Load-bearing session state may have been lost. Recovery requires the SESSION_RESUME protocol (§4.8). |
@@ -514,6 +515,43 @@ ACTIVE → EXPIRED
          AND suspected_threshold_ms is not configured (legacy behavior)
          Detection is local — each side evaluates independently
          In-flight subtasks MUST receive TASK_CANCEL (§6.6) before teardown
+
+ACTIVE → DEGRADED
+  Guard: Degradation signal detected (§4.2.2):
+         - Sustained latency increase: response times exceed negotiated
+           thresholds for ≥ degraded_confirmation_count consecutive
+           interactions (default: 3)
+         - Partial capability loss: counterparty reports reduced capability
+           set via CAPABILITY_UPDATE (§5.8) or capability invocation fails
+           with transient errors
+         - Application self-report: counterparty reports app_status: DEGRADED
+           in HEARTBEAT (requires heartbeat_params.application_liveness = true,
+           §4.3.1)
+         Detection is local — each side evaluates independently
+         The session remains operational — task delegation is permitted
+           with reduced expectations
+
+DEGRADED → ACTIVE
+  Guard: Degradation conditions clear:
+         - Latency returns to within negotiated thresholds for
+           ≥ degraded_confirmation_count consecutive interactions
+         - Capability set restored (counterparty sends CAPABILITY_UPDATE
+           restoring previously lost capabilities)
+         - Application self-report: counterparty reports app_status: ACTIVE
+           in HEARTBEAT
+         No SESSION_RESUME required — the session was never declared dead
+         Transition is automatic when detection signals clear
+
+DEGRADED → REVOKED
+  Guard: Adversarial behavior detected via detection signal taxonomy (§8.16)
+         while session is already in DEGRADED state
+         Same detection signals as ACTIVE → REVOKED
+         On entry: same revocation semantics as ACTIVE → REVOKED (§8.15)
+
+DEGRADED → CLOSED
+  Guard: SESSION_CLOSE sent by either participant from DEGRADED state
+         OR coordinator escalates to orderly termination (§4.2.2)
+         In-flight tasks follow standard SESSION_CLOSE semantics
 
 ACTIVE → REVOKED
   Guard: Adversarial behavior detected via detection signal taxonomy (§8.16)
@@ -612,6 +650,30 @@ REVOKED → CLOSED
                   no HB (no threshold configured)  │
                   ACTIVE ─────────────────▶ EXPIRED─┘
 
+  Capability-degradation path (§4.2.2):
+
+              ┌────────────────────┐  latency /        ┌──────────┐
+              │      ACTIVE        │─────────────────▶ │ DEGRADED │
+              └────────────────────┘  partial cap      └┬───┬───┬─┘
+                        ▲              loss / app        │   │   │
+                        │              self-report       │   │   │
+                        │                                │   │   │
+                        │  conditions cleared            │   │   │
+                        └────────────────────────────────┘   │   │
+                                                             │   │
+                         adversarial behavior (§8.16)        │   │
+                         ┌───────────────────────────────────┘   │
+                         ▼                                       │
+                    ┌─────────┐                                  │
+                    │ REVOKED │                                  │
+                    └────┬────┘           SESSION_CLOSE           │
+                         │ revocation    ┌───────────────────────┘
+                         │ propagated    │
+                         ▼               ▼
+                    ┌──────┐        ┌──────┐
+                    │CLOSED│        │CLOSED│
+                    └──────┘        └──────┘
+
   Adversarial-behavior path (§8.15–§8.18):
 
               ┌────────────────────┐   adversarial     ┌─────────┐
@@ -626,7 +688,9 @@ REVOKED → CLOSED
 
   Path distinction:
     SUSPECTED → ZOMBIE/EXPIRED = liveness-failure path (timeout-based)
+    ACTIVE → DEGRADED          = capability-degradation path (gradual loss)
     ACTIVE → REVOKED           = adversarial-behavior path (explicit trigger)
+    DEGRADED → REVOKED         = adversarial-behavior from degraded state
 ```
 
 #### 4.2.1 SUSPECTED State — Graduated Suspicion
@@ -652,6 +716,54 @@ REVOKED → CLOSED
 **Design insight — graduated suspicion:** The key insight is that suspicion is not binary. The cost of a false positive (declaring EXPIRED when the agent is merely slow) is high: teardown, TASK_CANCEL for in-flight work, potential SESSION_RESUME overhead, and lost partial results. The cost of a false negative (remaining in SUSPECTED when the agent is truly dead) is bounded: the agent enters EXPIRED when `session_expiry_ms` fires, with at most `session_expiry_ms - suspected_threshold_ms` additional delay. SUSPECTED biases toward preserving work at the cost of slightly delayed failure detection — a tradeoff that all three converging deployments chose independently.
 
 **Backward compatibility:** Sessions that do not negotiate `suspected_threshold_ms` (i.e., the field is omitted in both SESSION_INIT and SESSION_INIT_ACK) use the legacy binary behavior — ACTIVE transitions directly to EXPIRED when `session_expiry_ms` elapses. SUSPECTED is an opt-in refinement, not a mandatory state.
+
+#### 4.2.2 DEGRADED State — Gradual Capability Loss
+
+<!-- Implements #79: DEGRADED intermediate state between ACTIVE and REVOKED -->
+
+**Motivation:** The §4.2 state machine prior to DEGRADED treated session health as binary within the operational range: a session was either ACTIVE (fully functional) or heading toward REVOKED/EXPIRED (terminal). Real distributed systems exhibit gradual capability loss without crossing a single hard threshold. An agent experiencing sustained high latency, partial capability loss, or resource pressure is not SUSPECTED (liveness is not in question — the agent is alive and responding) and is not REVOKED (no adversarial intent). It is operating at reduced capacity — a "yellow card" state that warrants explicit protocol acknowledgment. DEGRADED fills this gap by giving coordinators structured options for handling degradation without forcing a binary choice between ignoring the problem and tearing down the session.
+
+**V1 scope:** V1 defines the DEGRADED state, its transitions, and caller options. Domain-specific quality metrics (e.g., "response quality dropped below threshold X") are **out of scope for V1** — only latency and partial capability loss signals are required entry conditions. Quality degradation detection is application-specific and deferred to V2.
+
+**DEGRADED entry conditions:** An agent transitions from ACTIVE to DEGRADED when any of the following conditions are detected:
+
+1. **Sustained latency increase.** Response times for task-related messages (TASK_PROGRESS, TASK_COMPLETE) exceed the session's expected latency profile for `degraded_confirmation_count` (default: 3) consecutive interactions. The expected latency profile is deployment-specific — the protocol does not define absolute latency thresholds. Detection is local: the coordinator monitors worker response latency against its own expectations.
+
+2. **Partial capability loss.** The counterparty reports a reduced capability set via CAPABILITY_UPDATE (§5.8), or capability invocations that previously succeeded begin failing with transient errors. Partial loss means some capabilities remain functional — total capability loss is a terminal condition (SESSION_CLOSE).
+
+3. **Application self-report.** The counterparty reports `app_status: DEGRADED` in a HEARTBEAT message (§4.5.3). This detection path requires `heartbeat_params.application_liveness = true` negotiated at SESSION_INIT (§4.3.1). Self-reported DEGRADED is the most reliable signal — the agent itself has detected reduced capacity.
+
+**Detection is local and independent.** As with SUSPECTED (§4.2.1), each side evaluates degradation independently. The coordinator may consider the session DEGRADED while the worker considers it ACTIVE (e.g., the coordinator observes increased latency that the worker is unaware of). This asymmetry is by design — degradation perception depends on the observer's expectations.
+
+**Caller options when session enters DEGRADED:** The coordinator (or the agent that detected degradation) MUST choose one of the following responses:
+
+1. **Continue with reduced expectations.** The coordinator explicitly acknowledges the degraded state and continues delegating tasks with the understanding that response times may be longer and some capabilities may be unavailable. This acknowledgment SHOULD be logged as an EVIDENCE_RECORD (§8.10) with `evidence_type: state_transition` for audit purposes. Task delegation remains permitted — DEGRADED is an operational state, not a liveness-ambiguity state.
+
+2. **Escalate to coordinator.** If the detecting agent is the worker, it SHOULD notify the coordinator of the degradation. The coordinator then decides between options 1 and 3. If the detecting agent is the coordinator, escalation is to any upstream delegator if the session is part of a delegation chain (§5.5).
+
+3. **Initiate orderly termination.** The coordinator sends SESSION_CLOSE to terminate the session. Standard SESSION_CLOSE semantics apply — in-flight tasks are completed, failed, or cancelled before teardown. This is an orderly exit, not an emergency revocation.
+
+**DEGRADED exit conditions:**
+
+- **Back to ACTIVE:** The conditions that triggered DEGRADED entry clear. Latency returns to expected levels, capabilities are restored (via CAPABILITY_UPDATE), or the counterparty reports `app_status: ACTIVE` in HEARTBEAT. No SESSION_RESUME is required — the session was never declared dead or suspected. The transition back to ACTIVE is automatic when detection signals clear.
+- **Forward to REVOKED:** Adversarial behavior is detected while the session is in DEGRADED state (§8.16 detection signals). The same revocation semantics apply as for ACTIVE → REVOKED (§8.15). DEGRADED does not shield against adversarial detection.
+- **Forward to CLOSED:** The coordinator initiates orderly termination via SESSION_CLOSE, or session TTL expires. Standard closure semantics apply.
+
+**Why DEGRADED is distinct from SUSPECTED:**
+
+| Dimension | SUSPECTED (§4.2.1) | DEGRADED (§4.2.2) |
+|-----------|--------------------|--------------------|
+| **Failure class** | Liveness ambiguity — is the agent alive? | Capability reduction — the agent is alive but impaired |
+| **Task delegation** | MUST NOT delegate new tasks | MAY delegate with reduced expectations |
+| **Heartbeat status** | Heartbeats absent or delayed | Heartbeats present and timely |
+| **Recovery** | Automatic on heartbeat receipt | Automatic when degradation signals clear |
+| **Terminal path** | → EXPIRED (timeout) | → REVOKED (adversarial) or → CLOSED (orderly) |
+
+**Why DEGRADED is distinct from REVOKED:**
+
+REVOKED is an adversarial determination — the counterparty is coherent but hostile. DEGRADED is a capacity determination — the counterparty is cooperative but impaired. The distinction matters because DEGRADED has a recovery path (back to ACTIVE) while REVOKED is terminal with no resume. Conflating degradation with adversarial behavior would force session termination for agents that are experiencing transient resource pressure — a disproportionate response.
+
+**Backward compatibility:** DEGRADED detection via `app_status` self-report requires `heartbeat_params.application_liveness = true` (§4.3.1). Sessions that do not negotiate application liveness can still enter DEGRADED via latency monitoring or partial capability loss detection — these are observable without heartbeat extensions. DEGRADED is an opt-in state for sessions that want explicit degradation tracking; sessions without degradation monitoring continue using the existing ACTIVE → CLOSED path for sessions that become unproductive.
 
 ### 4.3 SESSION_INIT Message
 
@@ -2959,8 +3071,9 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - Evidence layer architecture (§8.10) separates raw evidence (append-only, externally verifiable) from agent memory (compactable, agent-internal). EVIDENCE_RECORDs anchor SESSION_RESUME state hashes (§4.8) and provide ground truth for external verifiers. Without the evidence layer, external verification degrades to recursive self-attestation.
 - Structured divergence reporting (§8.11) defines DIVERGENCE_REPORT as a standalone protocol message with a required `reason_code` taxonomy, enabling verifiers to classify divergences programmatically rather than parsing free-text descriptions. Complements the inline `divergence_log` (§7.8) which covers plan-execution divergence.
 - Teardown-first recovery mandate (§8.13) formalizes teardown + reinitiate as the default recovery protocol. Agents MUST NOT resume from serialized in-memory state; recovery reads canonical state from durable persistent storage, reconciles against the evidence layer (§8.10), and initiates a fresh SESSION_INIT. Task idempotency (§7.10) is the prerequisite enabling safe replay after teardown.
-- SUSPECTED state and heartbeat negotiation prerequisites (§8.14) documents that SUSPECTED state detection via task hash mismatch requires `heartbeat_params.task_hash_verification = true` negotiated at SESSION_INIT (§4.3.1). Without this negotiation, HEARTBEAT messages carry no task context and task-context drift detection is unavailable. Application-level self-report of SUSPECTED requires `heartbeat_params.application_liveness = true`.
-- REVOKED state (§8.15) introduces the adversarial-behavior path — distinct from the liveness-failure path (SUSPECTED/ZOMBIE/EXPIRED). REVOKED is entered when an agent is alive and actively working against the protocol. It is terminal with no resume path. The detection signal taxonomy (§8.16) defines four adversarial signals: selective suppression, verification anomalies, delegation manipulation, and attestation gaps. Revocation propagation (§8.17) uses PKI-lite via signed AGENT_MANIFEST with tombstone entries for decentralized revocation verification. Per-hop attestation (§8.18) uses async-optimistic delegation with TTL_ATTESTATION-bounded signed attestation records at each hop.
+- SUSPECTED state and heartbeat negotiation prerequisites (§8.14) documents that SUSPECTED state detection via task hash mismatch requires `heartbeat_params.task_hash_verification = true` negotiated at SESSION_INIT (§4.3.1). Without this negotiation, HEARTBEAT messages carry no task context and task-context drift detection is unavailable. Application-level self-report of SUSPECTED or DEGRADED requires `heartbeat_params.application_liveness = true`.
+- DEGRADED state (§4.2.2) introduces the capability-degradation path — an intermediate state between ACTIVE and terminal states for sessions experiencing gradual capability loss (sustained latency, partial capability loss, application self-reported degradation). DEGRADED is recoverable (back to ACTIVE when conditions clear) and permits task delegation with reduced expectations. Transitions: ACTIVE → DEGRADED, DEGRADED → ACTIVE, DEGRADED → REVOKED, DEGRADED → CLOSED.
+- REVOKED state (§8.15) introduces the adversarial-behavior path — distinct from the liveness-failure path (SUSPECTED/ZOMBIE/EXPIRED) and the capability-degradation path (DEGRADED). REVOKED is entered from ACTIVE or DEGRADED when an agent is alive and actively working against the protocol. It is terminal with no resume path. The detection signal taxonomy (§8.16) defines four adversarial signals: selective suppression, verification anomalies, delegation manipulation, and attestation gaps. Revocation propagation (§8.17) uses PKI-lite via signed AGENT_MANIFEST with tombstone entries for decentralized revocation verification. Per-hop attestation (§8.18) uses async-optimistic delegation with TTL_ATTESTATION-bounded signed attestation records at each hop.
 
 ### 8.7 Verifier Isolation Requirements
 
@@ -3415,11 +3528,12 @@ The SUSPECTED state (§4.2.1) can be entered via two distinct detection paths: *
 |---------------|---------|---------------------|--------------------|
 | Heartbeat gap | No HEARTBEAT received within `suspected_threshold_ms` | `suspected_threshold_ms` negotiated in SESSION_INIT / SESSION_INIT_ACK (§4.3) | `suspected_threshold_ms` |
 | Task hash mismatch | `current_task_hash` in received HEARTBEAT does not match expected task hash | `heartbeat_params.task_hash_verification` negotiated to `true` by **both** sides (§4.3.1) | `heartbeat_params.task_hash_verification` |
-| Application self-report | Agent reports `app_status: SUSPECTED` in HEARTBEAT | `heartbeat_params.application_liveness` negotiated to `true` by **both** sides (§4.3.1) | `heartbeat_params.application_liveness` |
+| Application self-report (SUSPECTED) | Agent reports `app_status: SUSPECTED` in HEARTBEAT | `heartbeat_params.application_liveness` negotiated to `true` by **both** sides (§4.3.1) | `heartbeat_params.application_liveness` |
+| Application self-report (DEGRADED) | Agent reports `app_status: DEGRADED` in HEARTBEAT — triggers ACTIVE → DEGRADED (§4.2.2) | `heartbeat_params.application_liveness` negotiated to `true` by **both** sides (§4.3.1) | `heartbeat_params.application_liveness` |
 
 **Critical constraint — task hash mismatch requires explicit negotiation:** An agent that did not negotiate `heartbeat_params.task_hash_verification = true` in SESSION_INIT **cannot** detect SUSPECTED state via task hash mismatch, because HEARTBEAT messages in that session will not contain `current_task_hash`. The field is absent, not empty — there is no hash to compare. Agents that want task-context drift detection MUST negotiate `task_hash_verification = true` at session establishment. This is a bilateral requirement: both sides must agree (§4.3.1 negotiation semantics), because both sides bear the per-heartbeat hash computation cost.
 
-**Critical constraint — application self-report requires explicit negotiation:** An agent that did not negotiate `heartbeat_params.application_liveness = true` **cannot** self-declare SUSPECTED via the `app_status` field in HEARTBEAT. Without `application_liveness` negotiation, HEARTBEAT carries transport-level liveness only — there is no `app_status` field to populate. Agents that want to signal self-assessed degradation to their counterparty MUST negotiate `application_liveness = true` at session establishment.
+**Critical constraint — application self-report requires explicit negotiation:** An agent that did not negotiate `heartbeat_params.application_liveness = true` **cannot** self-declare SUSPECTED or DEGRADED via the `app_status` field in HEARTBEAT. Without `application_liveness` negotiation, HEARTBEAT carries transport-level liveness only — there is no `app_status` field to populate. Agents that want to signal self-assessed degradation (DEGRADED, §4.2.2) or liveness ambiguity (SUSPECTED, §4.2.1) to their counterparty MUST negotiate `application_liveness = true` at session establishment.
 
 **Relationship to §8.9 (Two-Tier Heartbeat):**
 
@@ -3438,7 +3552,7 @@ The `heartbeat_params` negotiation (§4.3.1) determines which heartbeat tiers ar
 
 <!-- Implements #69: REVOKED state for adversarial sessions — agent alive and actively working against the protocol. -->
 
-§8.1–§8.14 address the **liveness-failure path**: an agent that has crashed, disconnected, or silently diverged from shared context. The state progression ACTIVE → SUSPECTED → ZOMBIE/EXPIRED handles agents that are *absent* or *incoherent*. This section addresses a fundamentally different failure class: an agent that is **alive, responsive, and actively working against the protocol**.
+§8.1–§8.14 address the **liveness-failure path**: an agent that has crashed, disconnected, or silently diverged from shared context. The state progression ACTIVE → SUSPECTED → ZOMBIE/EXPIRED handles agents that are *absent* or *incoherent*. The **capability-degradation path** (ACTIVE → DEGRADED, §4.2.2) handles agents that are alive but operating at reduced capacity. This section addresses a fundamentally different failure class: an agent that is **alive, responsive, and actively working against the protocol**.
 
 **Why REVOKED is distinct from ZOMBIE.** A zombie agent has no malicious intent — it is a process that has lost coherence but continues executing. Detection relies on liveness signals (heartbeat gaps, state hash mismatches) and the recovery path includes SESSION_RESUME. An adversarial agent is coherent but hostile — it understands the protocol and exploits it. Detection relies on behavioral pattern analysis (§8.16), and the recovery path is unconditional termination with no resume.
 
@@ -3446,7 +3560,7 @@ The `heartbeat_params` negotiation (§4.3.1) determines which heartbeat tiers ar
 
 REVOKED is a terminal session state entered when adversarial behavior is detected. It has the following properties:
 
-- **Transition:** ACTIVE → REVOKED. The transition is triggered by adversarial detection signals (§8.16), not by timeout. REVOKED is never entered from SUSPECTED, EXPIRED, or any other intermediate state — adversarial behavior is detected while the agent is ostensibly ACTIVE.
+- **Transition:** ACTIVE → REVOKED or DEGRADED → REVOKED. The transition is triggered by adversarial detection signals (§8.16), not by timeout. REVOKED is entered from ACTIVE (the normal case) or from DEGRADED (§4.2.2) when adversarial behavior is detected during a degraded session. REVOKED is never entered from SUSPECTED, EXPIRED, or any other intermediate state — adversarial behavior is detected while the agent is ostensibly operational (ACTIVE or DEGRADED).
 - **No resume path.** A session that enters REVOKED MUST NOT be resumed via SESSION_RESUME (§4.8) or any other recovery mechanism. The counterparty has demonstrated adversarial intent — resuming the session re-establishes the attack surface.
 - **Terminal within the session.** REVOKED transitions to CLOSED once revocation propagation (§8.17) is initiated. No further protocol messages are valid on a REVOKED session except those required for revocation propagation itself.
 - **On REVOKED entry, the detecting agent MUST:**
@@ -3512,7 +3626,7 @@ The REVOKED state handles agents that *break the rules*. §9 handles agents that
 
 <!-- Implements #69: four adversarial detection signals for REVOKED state triggers. -->
 
-This section defines the four adversarial detection signals that can trigger the ACTIVE → REVOKED transition (§8.15). Each signal identifies a distinct class of protocol-level adversarial behavior. Signals are evaluated by the detecting agent (coordinator, peer, or external verifier) — they are not self-reported by the adversarial agent.
+This section defines the four adversarial detection signals that can trigger the ACTIVE → REVOKED or DEGRADED → REVOKED transition (§8.15). Each signal identifies a distinct class of protocol-level adversarial behavior. Signals are evaluated by the detecting agent (coordinator, peer, or external verifier) — they are not self-reported by the adversarial agent.
 
 **Detection signal summary:**
 
