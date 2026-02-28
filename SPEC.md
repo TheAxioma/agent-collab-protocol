@@ -2090,7 +2090,8 @@ Sent by the delegating agent to modify future (not-yet-started) steps in an acti
 | removed_step_ids | array of strings | No | Array of `step_id` values to remove from the plan. Each listed step MUST be a not-yet-started step. Removing a step that has already been crossed or is currently executing is a protocol violation. |
 | amended_plan_hash | SHA-256 | Yes | New `plan_hash` computed over the amended plan (original plan with amendments applied). Becomes the active `plan_hash` for three-level alignment verification if the amendment is accepted. |
 | amend_hash | SHA-256 or HMAC-SHA-256 | Yes | Authorization hash binding the amendment to the session and specific change content. Computed as `SHA256(session_id \|\| step_id \|\| canonical_json(new_step_spec))` where `canonical_json` uses JCS (§4.10.2) and `step_id` is the first step in `amended_steps`. If a session-level HMAC key was negotiated at SESSION_INIT, `HMAC-SHA256(hmac_key, session_id \|\| step_id \|\| canonical_json(new_step_spec))` MUST be used instead. For amendments affecting multiple steps, the hash input concatenates all `step_id \|\| canonical_json(new_step_spec)` pairs in `amended_steps` array order. |
-| timestamp | ISO 8601 | Yes | When the PLAN_AMEND was sent. |
+| timestamp | ISO 8601 | Yes | When the PLAN_AMEND was issued by the delegating agent. This is the requester's issuance time, not the delegatee's receipt or acceptance time. Used for temporal auditing: correlating which spec version was active at any point during execution. |
+| scope_delta | object | Yes | Structured description of what the amendment changes relative to the prior plan version. Contains: `modified_step_ids` (array of `step_id` values whose specifications changed), `added_step_ids` (array of new `step_id` values introduced by this amendment), `removed_step_ids` (array of `step_id` values removed by this amendment, echoed from top-level `removed_step_ids`), and `changed_fields` (object mapping each modified `step_id` to an array of field names that differ from the prior spec). Enables relational re-commitment verification: auditors can confirm that re-commitment was correctly scoped to what actually changed, rather than a full-plan recommit that is externally indistinguishable from a fresh start. |
 
 **PLAN_AMEND semantics:**
 
@@ -2101,6 +2102,7 @@ Sent by the delegating agent to modify future (not-yet-started) steps in an acti
 - On accepting PLAN_AMEND, the delegatee MUST append an entry to its `amendments_log` in durable session state (§6.11.6).
 - PLAN_AMEND does not reset step boundaries — all previously crossed steps remain committed and immutable.
 - Dependency constraints (`depends_on`) in amended steps are validated against the full amended plan, including both unchanged and amended steps. A `depends_on` reference to a removed step is malformed and MUST be rejected.
+- **scope_delta validation:** The delegatee MUST verify that `scope_delta` is consistent with the actual amendment content. Specifically: every `step_id` in `amended_steps` MUST appear in either `scope_delta.modified_step_ids` or `scope_delta.added_step_ids`; every `step_id` in `removed_step_ids` MUST appear in `scope_delta.removed_step_ids`; and `scope_delta.changed_fields` MUST list at least one field for each entry in `scope_delta.modified_step_ids`. If `scope_delta` is inconsistent with the amendment content, the delegatee MUST reject the amendment with PLAN_AMEND_REJECT (`reason=invalid_spec`).
 
 **PLAN_AMEND_REJECT**
 
@@ -2576,24 +2578,31 @@ Each accepted PLAN_AMEND creates an auditable record of authorized spec drift. T
 | original_spec_hash | SHA-256 | Yes | SHA-256 hash of the original step specification (as it appeared in the PLAN_COMMIT or prior PLAN_AMEND before this amendment). Computed using canonical JSON serialization (§4.10.2). |
 | new_spec_hash | SHA-256 | Yes | SHA-256 hash of the amended step specification (as received in the PLAN_AMEND's `amended_steps`). Computed using canonical JSON serialization (§4.10.2). |
 | amend_hash | SHA-256 or HMAC-SHA-256 | Yes | The `amend_hash` value as received in the PLAN_AMEND message. Preserved verbatim for re-verification by the delegating agent. |
-| timestamp | ISO 8601 | Yes | Timestamp of when the PLAN_AMEND was accepted by the delegatee (i.e., when the delegatee sent PLAN_COMMIT_ACK with `accepted: true`). |
+| timestamp | ISO 8601 | Yes | When the amendment was issued by the delegating agent (requester's issuance time), preserved verbatim from the PLAN_AMEND message's `timestamp` field. This is the requester's clock, not the delegatee's acceptance time. Auditors use this to reconstruct which spec version was active at any arbitrary execution point — without requester-side timestamps, trace segments cannot be correlated to spec versions when multiple amendments arrive during execution. |
+| accepted_at | ISO 8601 | Yes | When the delegatee accepted the amendment (i.e., when the delegatee sent PLAN_COMMIT_ACK with `accepted: true`). The delta between `timestamp` (issuance) and `accepted_at` (acceptance) represents amendment propagation latency — the window during which the delegatee may have been executing against the prior spec version while the requester considered the amendment issued. |
+| scope_delta | object | Yes | The `scope_delta` value as received in the PLAN_AMEND message, preserved verbatim. Enables relational re-commitment verification: the delegating agent can confirm that any re-commitment by the delegatee was correctly scoped to what actually changed, distinguishing a scoped amendment acknowledgment from a full-plan recommit. See PLAN_AMEND `scope_delta` definition for field structure (`modified_step_ids`, `added_step_ids`, `removed_step_ids`, `changed_fields`). |
 
 **Log maintenance requirements:**
 
 - The delegatee MUST append an entry to `amendments_log` for each accepted PLAN_AMEND, immediately upon sending PLAN_COMMIT_ACK with `accepted: true`. Rejected amendments (PLAN_AMEND_REJECT or PLAN_COMMIT_ACK with `accepted: false`) are NOT logged in `amendments_log`.
 - `amendments_log` is append-only. Entries MUST NOT be modified or removed after insertion. The log is a durable audit artifact, not a mutable data structure.
 - `amendments_log` MUST be persisted to durable storage (§8.13.4) on each append. The log MUST survive process restart — it is part of the delegatee's durable session state alongside SESSION_STATE (§4.11).
-- For amendments affecting multiple steps (multiple entries in `amended_steps`), the delegatee MUST create one `amendments_log` entry per affected step. Each entry records the individual step's original and new spec hashes.
+- For amendments affecting multiple steps (multiple entries in `amended_steps`), the delegatee MUST create one `amendments_log` entry per affected step. Each entry records the individual step's original and new spec hashes. All entries from the same PLAN_AMEND share the same `timestamp`, `accepted_at`, and `scope_delta` values.
+- The `timestamp` field MUST be copied verbatim from the PLAN_AMEND message's `timestamp` field. The delegatee MUST NOT substitute its own clock — the `timestamp` represents the requester's issuance time. The `accepted_at` field MUST be set to the delegatee's local clock time when PLAN_COMMIT_ACK with `accepted: true` is sent.
 
 **Inclusion in terminal messages:**
 
 - On session completion or teardown, the delegatee MUST include `amendments_log` in TASK_COMPLETE, TASK_FAIL, or SESSION_CLOSE (§4.9). This enables the delegating agent to re-verify the full amendment history as part of result acceptance.
 - The delegating agent SHOULD re-verify all `amend_hash` values in the received `amendments_log` by recomputing each hash from its own records of issued PLAN_AMEND messages. Any mismatch between the delegating agent's issued amendments and the delegatee's `amendments_log` indicates unauthorized spec drift or state corruption.
+- The delegating agent SHOULD verify that `scope_delta` in each `amendments_log` entry matches the `scope_delta` from the corresponding issued PLAN_AMEND. A `scope_delta` mismatch indicates that the delegatee's record of what changed differs from what the delegating agent intended to change — this is a distinct failure mode from `amend_hash` mismatch (which indicates the amendment content itself was tampered with).
+- **Temporal verification:** The delegating agent SHOULD verify that `timestamp` values in the `amendments_log` match the `timestamp` values from its own issued PLAN_AMEND messages. Timestamp mismatches — even when `amend_hash` values match — indicate potential replay attacks (a valid amendment re-applied at the wrong time) or state corruption. The `accepted_at` values MUST be monotonically non-decreasing within the `amendments_log`; a non-monotonic `accepted_at` sequence indicates log corruption or out-of-order acceptance.
 - If re-verification reveals a mismatch, the delegating agent SHOULD treat the task result with reduced trust. The appropriate response is deployment-specific — options include rejecting the result, flagging for manual review, or emitting a DIVERGENCE_REPORT (§8.11).
 
-**Relationship to evidence layer (§8.10):** The `amendments_log` SHOULD be anchored to the evidence layer where available. Each `amendments_log` entry is a candidate for an EVIDENCE_RECORD — the `amend_hash` provides the content hash, and the `timestamp` provides the temporal anchor. Evidence layer anchoring makes the amendment audit trail externally verifiable, not just bilaterally verifiable between delegator and delegatee.
+**Relationship to evidence layer (§8.10):** The `amendments_log` SHOULD be anchored to the evidence layer where available. Each `amendments_log` entry is a candidate for an EVIDENCE_RECORD — the `amend_hash` provides the content hash, and the `timestamp` (requester issuance time) provides the temporal anchor. Evidence layer anchoring makes the amendment audit trail externally verifiable, not just bilaterally verifiable between delegator and delegatee.
 
-> Amendments audit log formalized from [issue #66](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/66). The core insight: without `amend_hash`, a delegatee could claim to have received an amendment that was never issued, or a delegating agent could deny issuing one. The hash ties each amendment to the session identity and specific change content, closing the spec drift audit gap.
+**Relationship to re-commitment scoping:** The `scope_delta` field makes re-commitment verification relational rather than binary. Without `scope_delta`, when a delegatee re-commits after receiving a PLAN_AMEND, the delegating agent can only verify that re-commitment occurred (binary: yes/no). With `scope_delta`, the delegating agent can verify that the re-commitment was correctly scoped to what actually changed (relational: was the scope of re-commitment proportional to the scope of the amendment?). An agent that re-commits its entire plan when only one subtask scope changed is either doing unnecessary work or introducing drift risk — `scope_delta` makes these cases distinguishable.
+
+> Amendments audit log formalized from [issue #66](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/66). Timestamp and scope_delta fields added from [issue #81](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/81). The core insight: without `amend_hash`, a delegatee could claim to have received an amendment that was never issued, or a delegating agent could deny issuing one. The hash ties each amendment to the session identity and specific change content. Without `timestamp`, execution traces cannot be correlated to spec versions during multi-amendment sessions. Without `scope_delta`, a full-plan recommit is externally indistinguishable from a scoped amendment — you lose the ability to distinguish continuity-of-intent from a fresh start. Together these fields close the spec drift audit gap from proof-of-occurrence to full temporal and scope auditability. Surfaced from AutoInsight_Architect on [Moltbook amend_event chain thread](https://www.moltbook.com/post/amend-event-chain-auditability).
 
 ### 6.12 Commitment Message Types
 
@@ -3257,15 +3266,19 @@ EVIDENCE_RECORD is the append-only structure agents submit to the evidence layer
 | external_ref | string | No | Reference to an external system for cross-validation (e.g., commit SHA, API response ID, transaction ID, external ticket number). When present, external verifiers can independently confirm the evidence by querying the referenced system. |
 | timestamp | ISO 8601 | Yes | When the evidence was recorded. Millisecond precision REQUIRED (e.g., `2026-02-27T14:30:00.000Z`). |
 | agent_id | string | Yes | Identity of the submitting agent (§2 identity handle). |
+| trace_hash | SHA-256 | No | Post-execution hash of the actual execution trace (§6.2). Present when the evidence record is associated with task execution. Links the evidence record to the three-level alignment model (§6.11.1): L1 (`task_hash`) → L2 (`plan_hash`) → L3 (`trace_hash`). When `trace_hash` is present and differs from the committed `plan_hash`, the `divergence_log` field SHOULD also be present to explain the deviation. |
+| divergence_log | array | No | Array of structured divergence entries explaining why the agent's execution trace diverged from its committed plan. Present when `trace_hash` differs from the committed plan hash (L2 → L3 mismatch). Each entry annotates a specific deviation with a machine-readable `reason` and structured context. See §8.10.3 for entry schema and §8.10.4 for the reason enum. |
 
 **Semantics:**
 
 - Agents MUST append EVIDENCE_RECORDs before sending TASK_COMPLETE (§6.6). A TASK_COMPLETE without a corresponding EVIDENCE_RECORD in the evidence layer is unanchored — external verifiers have no ground truth to verify against.
+- When `trace_hash` is present in an EVIDENCE_RECORD and differs from the committed `plan_hash`, the agent SHOULD populate `divergence_log` with at least one entry. An EVIDENCE_RECORD with a divergent `trace_hash` but no `divergence_log` is valid but opaque — external verifiers can detect that divergence occurred but cannot classify the cause without inspecting the raw payload.
+- The `divergence_log` in EVIDENCE_RECORD is distinct from `amend_hash` (§6.11.4): `divergence_log` annotates **agent-initiated deviations** (the agent changed its own execution path), while `amend_hash` authorizes **requester-initiated spec changes** (the delegating agent changed the task after plan commitment). Both produce the same observable signal (`plan_hash` ≠ `trace_hash`), but through different authorization chains. Conflating them makes blame attribution ambiguous: an agent that correctly adapted to an API failure is indistinguishable from one that quietly revised its goals. The `divergence_log` resolves this by providing structured cause annotation for agent-initiated deviations specifically.
 - Append-only semantics are enforced by the protocol: no message type permits modification or deletion of an existing EVIDENCE_RECORD. Implementations MUST reject any operation that would alter or remove a previously appended record.
 - External verifiers (§4.7, §8.7) access the evidence layer directly — not agent memory summaries. This is the architectural distinction that breaks the recursive self-attestation loop: the verifier's input is the evidence layer, not the agent's interpretation of the evidence layer.
 - Evidence layer records MUST survive session teardown. When a session transitions to CLOSED (§4.2), the evidence records for that session are retained. The evidence layer's lifecycle is independent of the session lifecycle — evidence persists after the session that produced it has ended.
 
-**Example EVIDENCE_RECORD:**
+**Example EVIDENCE_RECORD (without divergence):**
 
 ```yaml
 evidence_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
@@ -3275,6 +3288,31 @@ payload_hash: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b78
 external_ref: "github:commit:abc123def456"
 timestamp: "2026-02-27T14:30:00.123Z"
 agent_id: "agent-alpha"
+trace_hash: "sha256:a1b2c3d4e5f6..."
+```
+
+**Example EVIDENCE_RECORD (with divergence_log):**
+
+```yaml
+evidence_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+session_id: "session-42"
+evidence_type: task_output
+payload_hash: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+external_ref: "github:commit:def456abc789"
+timestamp: "2026-02-27T14:45:00.456Z"
+agent_id: "agent-alpha"
+trace_hash: "sha256:d4e5f6a7b8c9..."  # differs from committed plan_hash
+divergence_log:
+  - reason: infrastructure_noise
+    description: "Rate limit hit on external API during step 3; retried with exponential backoff, adding 12s latency."
+    deviation_timestamp: "2026-02-27T14:38:00.200Z"
+    affected_step_id: "step-3-api-call"
+    severity: WARN
+  - reason: external_constraint
+    description: "Upstream data source returned schema v2 instead of expected v1; adapted parsing logic."
+    deviation_timestamp: "2026-02-27T14:41:00.750Z"
+    affected_step_id: "step-5-parse-response"
+    severity: INFO
 ```
 
 #### 8.10.2 Evidence Layer Access Model
@@ -3286,6 +3324,43 @@ This access model ensures that the evidence layer serves as an independent audit
 - **External verifiers** read evidence records to validate agent claims. Without direct evidence layer access, external verification degrades to verifying agent self-reports — the recursive self-attestation problem this architecture is designed to solve.
 - **Agents** append evidence records during task execution. Agents MAY read their own evidence records (e.g., for SESSION_RESUME state reconstruction) but MUST NOT modify or delete them.
 - **Coordinators** read evidence records for SEMANTIC_CHALLENGE verification (§8.9.2) and SESSION_RESUME validation (§4.8). The coordinator's `state_hash` comparison gains ground truth anchoring when the state hash references evidence layer records rather than compactable memory.
+
+#### 8.10.3 Divergence Log Entry Schema
+
+The `divergence_log` field in EVIDENCE_RECORD is an array of divergence entry objects. Each entry annotates a specific point where the agent's execution deviated from its committed plan, with a machine-readable `reason` for recovery routing and structured context for post-hoc audit.
+
+**Divergence log entry fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| reason | enum | Yes | Machine-readable classification of the divergence cause. See §8.10.4 for the enum values and applicability criteria. |
+| description | string | Yes | Human-readable explanation of what diverged and why. Provides context that `reason` alone cannot convey — specific error messages, environmental details, or adaptation strategy. |
+| deviation_timestamp | ISO 8601 | Yes | When the deviation occurred relative to the execution timeline. Millisecond precision REQUIRED. This is the time the deviation was detected or occurred, not the time the entry was recorded. |
+| affected_step_id | string | No | Identifier of the execution step where divergence occurred. Corresponds to a step in the agent's execution plan (L2). When present, enables cross-referencing with §7.8 `divergence_log` entries (which use `step_id`) and PLAN_COMMIT step declarations (§6.11.5). |
+| severity | enum | Yes | Impact level: `INFO`, `WARN`, or `ERROR`. Semantics match §7.8.4 severity levels. `INFO` = benign adaptation, outcome equivalent. `WARN` = result quality may be affected. `ERROR` = material impact on result. |
+
+**Semantics:**
+
+- The `reason` field is REQUIRED (unlike §7.8 `deviation_type`, which is optional). The EVIDENCE_RECORD `divergence_log` serves the evidence layer — the append-only ground truth for external verification (§8.10). Unclassified divergence entries in the evidence layer defeat the purpose of structured cause annotation, because verifiers cannot route recovery without a machine-readable cause.
+- Agents MUST NOT use the `divergence_log` in EVIDENCE_RECORD to annotate requester-initiated spec changes. Those are authorized deviations tracked by `amend_hash` (§6.11.4) and recorded in `amendments_log` (§6.11.6). The `divergence_log` is exclusively for agent-initiated deviations — situations where the agent changed its own execution path without prior authorization from the delegating agent.
+- A single execution may produce entries with different `reason` values. For example, an agent might encounter `infrastructure_noise` (API rate limit) and then `external_constraint` (dependency schema change) in the same task. Each deviation gets its own entry with its own `deviation_timestamp`.
+
+#### 8.10.4 Divergence Reason Enum
+
+The `reason` field MUST use one of the following values. Each value identifies a specific cause of agent-initiated deviation with defined applicability criteria and recovery routing implications.
+
+| reason | Description | When it applies | Recovery routing implication |
+|--------|-------------|-----------------|----------------------------|
+| `infrastructure_noise` | Transient infrastructure issue — rate limit, API failure, network timeout, or other operational noise expected in production environments. | The deviation was caused by an infrastructure-level issue that is likely transient and does not indicate a problem with the agent's logic or the task specification. | Retry is appropriate. The same agent with the same plan is likely to succeed on re-execution. No plan revision needed. |
+| `planning_failure` | Wrong initial decomposition — the agent's committed plan (L2) was inadequate for the task, and the agent discovered this during execution. | The agent's plan was flawed: incorrect assumptions about task structure, underestimated complexity, missed dependencies between steps, or infeasible ordering. The deviation is attributable to the agent's planning, not external factors. | Re-planning is required before retry. The same plan will produce the same failure. Consider reassignment to a different agent if the planning failure reflects a capability gap. |
+| `external_constraint` | A dependency or environmental condition became unavailable or changed mid-execution, forcing the agent to adapt its execution path. | An external system, upstream agent, data source, or environmental condition that the plan correctly assumed would be available was not available at execution time. The agent correctly adapted; the deviation is attributable to the environment, not the agent. | Assess whether the constraint is transient or permanent. Transient: retry may succeed. Permanent: re-plan with updated constraints. The agent's adaptation was correct — no blame attribution. |
+| `spec_drift` | The task specification changed after plan commitment, and the agent adapted without a formal PLAN_AMEND cycle. | The agent detected that the task's effective requirements shifted after `plan_hash` was committed — but the change came through an informal channel (e.g., context update, environmental signal) rather than through a PLAN_AMEND (§6.11.4) with `amend_hash`. This is the **unauthorized** counterpart to `amend_hash`: same signal (spec changed), different authorization chain (no `amend_hash` to verify). | Investigate why the spec change did not go through the PLAN_AMEND flow. If the change was legitimate but informal, consider whether the session's amendment workflow needs tightening. If the agent unilaterally reinterpreted the task, escalate for review. |
+
+**Relationship to §7.8 `deviation_type`:** The §7.8 `deviation_type` enum (`RESOURCE_UNAVAILABLE`, `CONTEXT_SHIFT`, `CAPABILITY_MISMATCH`, `OPTIMIZATION`, `TIMEOUT`, `EXTERNAL_CONSTRAINT`, `OTHER`) and the §8.10.4 `reason` enum serve different classification purposes. §7.8 categorizes _what kind_ of divergence occurred at the step level (inline in TASK_COMPLETE/TASK_FAIL). §8.10.4 categorizes _why_ the divergence occurred at the evidence level, with recovery routing as the primary design goal. The two may co-occur: a `RESOURCE_UNAVAILABLE` deviation (§7.8) might be classified as `infrastructure_noise` (§8.10.4) if it was transient, or as `external_constraint` if the resource is permanently unavailable.
+
+**Extension mechanism:** Implementations MAY extend this enum with deployment-specific values prefixed by `x-` (e.g., `x-model-context-overflow`, `x-quota-exceeded`). Standard reason values MUST NOT be prefixed. Receiving agents that encounter an unrecognized `reason` MUST treat it as opaque — log it, surface it to operators, but do not treat it as a protocol error.
+
+> Addresses [issue #80](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/80): structured `divergence_log` in EVIDENCE_RECORD for cause annotation when `plan_hash` ≠ `trace_hash`, enabling recovery routing that distinguishes infrastructure noise from planning failures, external constraints, and unauthorized spec drift. Originated from community discussion on [Moltbook three-hash accountability thread](https://www.moltbook.com/post/3d769fda).
 
 ### 8.11 Structured Divergence Reporting
 
@@ -3472,7 +3547,7 @@ The `amendments_log` (§6.11.6) is a **durable artifact** — it MUST be preserv
 
 2. On reinitiation (fresh SESSION_INIT), the delegatee MUST include the `amendments_log` from the pre-crash session when reporting results or status to the delegating agent. This confirms that any spec drift during the pre-crash session was authorized. The `amendments_log` is carried in the first terminal message (TASK_COMPLETE, TASK_FAIL, or SESSION_CLOSE) of the recovery session that references work from the pre-crash plan.
 
-3. **Divergence detection:** The delegating agent MUST compare the received `amendments_log` against its own local record of issued PLAN_AMEND messages. If the delegating agent's local `amendments_log` diverges from the delegatee's — entries present in one but not the other, or `amend_hash` values that do not match — the session MUST be terminated. The divergence indicates one of: unauthorized spec drift (the delegatee applied amendments that were never issued), state corruption (the delegating agent's or delegatee's durable state was corrupted during the crash), or a repudiation attempt (one party is denying amendments that occurred).
+3. **Divergence detection:** The delegating agent MUST compare the received `amendments_log` against its own local record of issued PLAN_AMEND messages. If the delegating agent's local `amendments_log` diverges from the delegatee's — entries present in one but not the other, `amend_hash` values that do not match, `timestamp` values that do not match the issued PLAN_AMEND timestamps, or `scope_delta` values that do not match — the session MUST be terminated. The divergence indicates one of: unauthorized spec drift (the delegatee applied amendments that were never issued), state corruption (the delegating agent's or delegatee's durable state was corrupted during the crash), temporal manipulation (timestamps altered to misrepresent when amendments were active), scope misrepresentation (scope_delta altered to disguise the breadth of changes), or a repudiation attempt (one party is denying amendments that occurred).
 
 4. On divergence detection, the delegating agent MUST:
    - Send SESSION_CLOSE with `reason: "amendments_log_divergence"`.
