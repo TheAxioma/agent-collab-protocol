@@ -1962,6 +1962,7 @@ Sent by the delegating agent to initiate delegation.
 | delegation_depth | integer | Yes | Current depth in the delegation chain; 0 for direct delegation (see §6.9) |
 | protocol_version_chain | array | No | Append-only list of version chain entries recording the protocol version negotiated at each hop in the delegation chain (see §6.9.1). Empty or absent for direct delegations at depth 0. |
 | translation_metadata | object | No | Metadata describing a semantic translation performed by the forwarding agent (see §7.9). Present when the forwarding agent transforms task semantics — vocabulary, capability descriptions, or constraint representations — rather than merely routing. |
+| revocation_mode | enum | No | Revocation verification strategy for this delegation: `sync` or `gossip` (see §9.8.5). When absent, defaults to `gossip`. The delegating agent selects the mode based on chain depth, trust level, and latency tolerance. Propagated through the delegation chain — each hop inherits the mode from its delegator unless explicitly overridden. |
 
 The `spec` object contains:
 
@@ -4131,7 +4132,112 @@ Two revocation models apply to decentralized agent collaboration, with different
 
 The V1 advisory model and the V2 cryptographic model address different failure classes. Advisory revocation fails when intermediaries are non-compliant; cryptographic expiry fails when early revocation is needed before TTL expires. A complete solution would combine both — advisory REVOKE for cooperative fast-path revocation, cryptographic TTL as a hard backstop — but V1 implements only the advisory path to avoid mandating key infrastructure.
 
-> Community discussion on this section: [Moltbook post](https://www.moltbook.com/post/2fdee5e5-cdae-47c0-82a5-6bb9ec407d3c). See also [issue #10](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/10), [issue #36](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/36), [issue #38](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/38), [issue #49](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/49).
+#### 9.8.4 Revocation Timing Gap Threat Model
+
+<!-- Implements #82: revocation timing guarantees for delegation chain threat model. -->
+
+§9.8.2 addresses the Byzantine propagation problem — whether a REVOKE signal reaches all nodes in a delegation chain. §8.17 addresses adversarial revocation where the revoked agent is the intermediary. Issue #37 (resolved via §10.7.1) addresses pre-flight traversal — catching already-propagated revocations before work begins. This section addresses a distinct gap: **the timing window between pre-flight check and mid-execution revocation arrival**.
+
+**The problem:** In a delegation chain A → B → C, agent A's pre-flight check passes (C's key status is valid at check time). After pre-flight passes and A commits work, B delays or suppresses the revocation broadcast for C. A is now operating under stale trust assumptions about C mid-execution. This is not a propagation failure (§9.8.2) — B received the revocation. It is a timing exploitation — B controls when downstream agents learn about the revocation.
+
+**Failure mode 1 — Delayed broadcast:** B receives a revocation for C but delays propagating it. A's pre-flight check passed before the revocation was issued. A commits work to C. The revocation arrives at A after A has committed work based on C's (now-revoked) authority. Cost attribution is undefined: A acted in good faith based on a valid pre-flight check; the revocation arrived after commitment. Who bears the cost of work committed during the propagation delay?
+
+**Failure mode 2 — Suppressed broadcast:** B receives a revocation for C and drops it entirely. B can forge clean propagation reports because unsigned failure reports (§9.8.2 acknowledgment model) are unverifiable — B claims propagation succeeded when it did not. A continues operating under the assumption that C is trusted. Unlike delayed broadcast, suppressed broadcast is not self-correcting — the stale trust assumption persists indefinitely until detected by an independent mechanism.
+
+**Distinction from §9.8.2:** §9.8.2 models propagation failure as a binary: did the REVOKE reach node N? This section models the temporal dimension: even when revocation eventually reaches all nodes, the propagation window creates a period where agents operate under stale trust. Work committed during this window is at risk. The threat is not that revocation fails to propagate — it is that revocation propagates too slowly for the work already committed against the stale trust state.
+
+#### 9.8.5 Revocation Mode: `sync` and `gossip`
+
+To address the revocation timing gap (§9.8.4), the delegating agent selects a `revocation_mode` when issuing a delegation via TASK_ASSIGN (§6.6). The two modes offer different tradeoffs between latency and revocation certainty.
+
+**`sync` mode — per-hop registry verification:**
+
+In `sync` mode, the delegating agent validates the delegatee's key status directly against the registry (§3.2) before each hop in the delegation chain. B cannot suppress or delay a revocation that A verifies independently.
+
+| Property | Characteristic |
+|----------|----------------|
+| Verification point | Before each hop — delegating agent queries the registry for the delegatee's current key status |
+| Suppression resistance | B cannot suppress revocations because A verifies directly against the registry, bypassing B entirely |
+| Latency cost | O(n) per hop, where n is chain depth — each hop adds a registry round-trip before delegation proceeds |
+| Suitable for | High-value delegations, low chain depth, untrusted intermediaries, environments where latency is acceptable |
+
+**`sync` verification flow:**
+
+```
+A prepares to delegate to B:
+  1. A queries registry for B's current key status
+  2. Registry confirms B is not revoked
+  3. A sends TASK_ASSIGN to B
+  B prepares to delegate to C:
+    4. B queries registry for C's current key status
+    5. Registry confirms C is not revoked
+    6. B sends TASK_ASSIGN to C
+```
+
+If the registry reports a revocation at step 2 or 5, delegation MUST NOT proceed. The delegating agent MUST send TASK_FAIL upstream with error code `delegatee_revoked`.
+
+**`gossip` mode — signed revocation broadcast with trust decay:**
+
+In `gossip` mode, revocation signals are broadcast as signed messages (§8.17.1 AGENT_MANIFEST with tombstones) and propagate through the network. Agents treat revocation information as probabilistically current — valid until the trust decay interval expires.
+
+| Property | Characteristic |
+|----------|----------------|
+| Verification point | Continuous — agents consume signed revocation broadcasts as they arrive |
+| Suppression resistance | Partial — signed broadcasts are independently verifiable (§8.17.1) but propagation depends on network topology. A single suppressive intermediary cannot prevent revocation from reaching agents that have alternative paths to the revoking agent's manifest endpoint |
+| Latency cost | Amortized — no per-hop blocking. Revocation information propagates in the background |
+| Suitable for | Deep delegation chains, latency-sensitive operations, environments with redundant communication paths |
+| Trust decay | After `trust_decay_interval` without confirmation that a delegatee's key remains valid, the delegating agent MUST treat the delegatee as untrusted (see §9.8.6) |
+
+**Mode coexistence:** Both modes are valid V1 strategies. The delegating agent selects the mode in TASK_ASSIGN via the `revocation_mode` field (§6.6). The choice is per-delegation, not per-session — an agent MAY use `sync` for high-value delegations to untrusted intermediaries and `gossip` for routine delegations within a trusted cluster. When `revocation_mode` is absent from TASK_ASSIGN, `gossip` is the default — consistent with V1's cooperative-first design (§8.18.1).
+
+**Mode propagation in delegation chains:** When agent B re-delegates to agent C (§6.9), B MUST propagate the `revocation_mode` from the upstream TASK_ASSIGN unless B's own policy requires a stricter mode. Mode can only be tightened, not relaxed: if A specified `sync`, B MUST NOT downgrade to `gossip` when delegating to C. If A specified `gossip`, B MAY upgrade to `sync` for its delegation to C.
+
+#### 9.8.6 Trust Decay Semantics for Gossip Mode
+
+In `gossip` mode (§9.8.5), revocation information propagates asynchronously. During the propagation window, an agent's trust in a delegatee's key status decays over time. Trust decay converts the binary question "is this agent revoked?" into a temporal question: "how long since I last confirmed this agent is not revoked?"
+
+**`trust_decay_interval`:** The maximum duration after which a delegating agent operating in `gossip` mode MUST re-verify the delegatee's key status before continuing to rely on the delegation. Default: 60 seconds. Configurable per-session via SESSION_INIT parameters.
+
+**Trust decay lifecycle:**
+
+1. At delegation time T₀, the delegating agent has a current (non-revoked) key status for the delegatee. Trust is full.
+2. At T₀ + `trust_decay_interval`, if no signed confirmation of continued validity has been received (either via a fresh AGENT_MANIFEST from the delegatee or via a signed revocation broadcast that does NOT include the delegatee), the delegating agent MUST treat the delegatee as **untrusted-pending**.
+3. An untrusted-pending delegatee MUST be re-verified before any new work is committed against the delegation. The delegating agent has three options:
+   - **Re-verify via registry** (equivalent to a one-time `sync` check): query the registry for current key status. If valid, trust resets to full for another `trust_decay_interval`.
+   - **Re-verify via fresh manifest**: fetch the delegatee's AGENT_MANIFEST (§8.17.1) directly. If the manifest is fresh (timestamp within `trust_decay_interval`) and contains no self-revocation, trust resets to full.
+   - **Escalate**: treat the delegation as compromised. Send TASK_CANCEL (§6.6) to the delegatee and report the trust decay expiry to the upstream delegator.
+
+**Trust decay does NOT apply to `sync` mode.** In `sync` mode, verification is performed at each hop before delegation proceeds — there is no propagation window during which trust can decay.
+
+#### 9.8.7 Blast Radius Quantification
+
+The revocation timing gap (§9.8.4) creates a window during which work is committed against stale trust. The **blast radius** is the total amount of work at risk during this window.
+
+**Work-at-risk definition:** Work at risk is any task output committed by an agent (TASK_COMPLETE or crossed step boundary per §6.11.5) during the interval between a revocation being issued and the revocation being received by the agent relying on the revoked delegatee's authority.
+
+**Blast radius bounds by mode:**
+
+| Mode | Propagation window | Maximum work at risk | Detection mechanism |
+|------|-------------------|---------------------|---------------------|
+| `sync` | Zero — verification is synchronous | Zero — delegation does not proceed if delegatee is revoked | Registry query at each hop |
+| `gossip` | Up to `trust_decay_interval` (default: 60s) | All task outputs committed within `trust_decay_interval` of the revocation issuance | Trust decay expiry triggers re-verification |
+
+**Cost attribution policy:**
+
+When work is committed during the revocation propagation window, cost attribution follows the principle of **verifiable good faith**: an agent that took reasonable verification steps before committing work is not at fault for work committed before the revocation reached it.
+
+| Scenario | Attribution |
+|----------|-------------|
+| Agent used `sync` mode and registry returned stale data | Registry operator bears attribution — the agent verified correctly; the registry was inconsistent |
+| Agent used `gossip` mode and committed work within `trust_decay_interval` | No fault — the agent operated within the protocol's defined propagation window. The work-at-risk is an accepted cost of `gossip` mode's latency optimization |
+| Agent used `gossip` mode and committed work after `trust_decay_interval` expired without re-verification | Agent bears attribution — the agent violated the trust decay re-verification obligation (§9.8.6) |
+| Intermediary (B) deliberately delayed broadcast | B bears attribution — deliberate delay is adversarial behavior, detectable via timestamp comparison between the revocation issuance time and B's propagation time. If B's propagation timestamp exceeds expected network latency by a significant margin, this constitutes evidence for the §8.16 detection signal taxonomy |
+
+**Blast radius in EVIDENCE_RECORD:** When a revocation timing gap is detected, the detecting agent SHOULD create an EVIDENCE_RECORD (§8.10) with `evidence_type: error_event` containing: the revocation issuance timestamp, the revocation receipt timestamp, the list of task_ids with outputs committed during the propagation window, and the `revocation_mode` that was in effect. This provides the audit trail necessary for post-hoc cost attribution.
+
+> Implements [issue #82](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/82): revocation timing guarantees for delegation chain threat model. Adds explicit threat model for revocation timing gap (§9.8.4), `revocation_mode` delegation parameter with `sync` and `gossip` modes (§9.8.5), trust decay semantics for gossip mode (§9.8.6), and blast radius quantification with cost attribution policy (§9.8.7). Distinct from #37 (pre-flight traversal) and §9.8.2 (Byzantine propagation). Originated from melonclaw DM Byzantine generals framing for multi-hop revocation. Closes #82.
+
+> Community discussion on this section: [Moltbook post](https://www.moltbook.com/post/2fdee5e5-cdae-47c0-82a5-6bb9ec407d3c). See also [issue #10](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/10), [issue #36](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/36), [issue #38](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/38), [issue #49](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/49), [issue #82](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/82).
 
 ## 10. Versioning
 
