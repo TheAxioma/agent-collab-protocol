@@ -1637,7 +1637,7 @@ The delegator responds with one of:
 
 | Response | Meaning |
 |----------|---------|
-| CAPABILITY_REQUEST_APPROVED | The delegator authorizes the requested capabilities. A new `delegation_token` with updated `allowed_capabilities` is issued. The task's effective `required_capabilities` are updated to include the newly authorized capabilities. |
+| CAPABILITY_REQUEST_APPROVED | The delegator authorizes the requested capabilities. The delegator issues a CAPABILITY_GRANT (§5.8.2) with updated `allowed_capabilities` and an updated `delegation_token`. The task's effective `required_capabilities` are updated to include the newly authorized capabilities. |
 | CAPABILITY_REQUEST_DENIED | The delegator denies the request. The delegatee MUST continue without the requested capability or send TASK_FAIL if the task cannot be completed. |
 
 **Constraints:**
@@ -1676,6 +1676,69 @@ CAPABILITY_REQUEST (§5.8) handles task-side discovery of new capability needs. 
 **Degraded mode:**
 
 Degraded mode is not a distinct session state (§4.2) — the session remains ACTIVE. Degraded mode is a local bookkeeping condition: one or more previously available capabilities are no longer available. The session continues for tasks that do not require the removed capabilities. Degraded mode ends when the missing capability is restored via a subsequent CAPABILITY_UPDATE with the capability in the `added` array.
+
+### 5.8.2 Capability Grant with TTL (CAPABILITY_GRANT)
+
+<!-- Implements #86: TTL field definitions for CAPABILITY_GRANT -->
+
+CAPABILITY_REQUEST_APPROVED (§5.8) signals that a capability request was accepted, but the actual grant — the authorization artifact the receiving agent operates under — needs explicit temporal bounds. Without TTL semantics, a granted capability is implicitly valid for the lifetime of the session, which creates a trust decay surface: an agent operating on a grant issued hours ago carries the same authorization weight as one issued seconds ago. Production failure data from adlibrary.com documented 47 operations on expired credentials across 3 sessions where session continuity masked trust decay.
+
+CAPABILITY_GRANT is the message type that carries the authorized capability set from a delegator to a delegatee. It is issued in response to CAPABILITY_REQUEST_APPROVED (§5.8), as part of initial TASK_ASSIGN delegation (embedded in or accompanying the `delegation_token`, §5.5), or as a standalone grant when the delegator proactively authorizes capabilities.
+
+**CAPABILITY_GRANT message:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| grant_id | UUID v4 | Yes | Unique identifier for this grant instance. |
+| task_id | UUID v4 | Yes | The task for which capabilities are granted. |
+| session_id | string | Yes | Active session identifier. |
+| grantor_id | string | Yes | Identity of the agent issuing the grant. |
+| grantee_id | string | Yes | Identity of the agent receiving the grant. |
+| granted_capabilities | array | Yes | Capability IDs (§5.1.1 format) authorized by this grant. MUST be a subset of the grantor's own authorized capabilities (no-privilege-escalation rule, §5.5, §6.8). |
+| delegation_token | object | Yes | Updated delegation token (§5.5) reflecting the granted capabilities. |
+| granted_at | ISO 8601 | No | Timestamp when the grant was issued by the grantor. Lets receiving agents detect clock skew: if `granted_at` is in the future relative to the receiver's clock, something is wrong. Agents MAY tolerate up to 30 seconds of clock skew; agents MUST log when operating within the tolerance window. SHOULD be included — absence prevents clock skew detection. |
+| valid_until | ISO 8601 | No | Expiry time for this grant. Receiving agents MUST treat the grant as revoked when `current_time > valid_until` — this is a protocol obligation, not advisory. Absence means the grant is valid for this session only (session-scoped). Implementers SHOULD include `valid_until`; absence is spec-legal but receiving agents MUST log a warning when processing a grant without `valid_until`. |
+| signature | bytes | No | Cryptographic signature over all other fields, produced by the grantor. RECOMMENDED for auditability. |
+
+**Temporal enforcement semantics:**
+
+- **Expiry is self-enforcing.** The receiving agent is responsible for enforcing `valid_until`. When `current_time > valid_until`, the grant MUST be treated as revoked — the agent MUST stop exercising the granted capabilities for the associated task. This is distinct from requester-initiated revocation (§6): expiry is time-based and self-enforcing at the receiving agent; revocation is an explicit delegator action propagated through the delegation chain.
+- **Session-scoped default.** When `valid_until` is absent, the grant is valid for the duration of the session. Session termination (§4.9 SESSION_CLOSE) or session expiry (§4.2 EXPIRED state) implicitly revokes all grants without explicit `valid_until`. Receiving agents MUST log a warning when processing a grant without `valid_until` to surface the implicit session-scoped assumption for audit.
+- **Clock skew detection.** When `granted_at` is present, the receiving agent SHOULD compare it against its local clock. If `granted_at` is more than 30 seconds in the future, the agent MUST reject the grant — the clock divergence exceeds safe tolerance. If `granted_at` is between 0 and 30 seconds in the future, the agent MAY accept the grant but MUST log a warning indicating clock skew was detected and the tolerance window was applied. Clock skew tolerance of 30 seconds is production-validated by the HIBI reserve asset protocol.
+- **Pre-expiry behavior.** The protocol does not define a grace period. When `current_time > valid_until`, the grant is expired — immediately and without exception. Agents that need continued authorization MUST obtain a CAPABILITY_RENEW (§5.8.3) before expiry.
+
+**Relationship to CAPABILITY_REQUEST (§5.8):** CAPABILITY_GRANT is the authorization artifact issued when CAPABILITY_REQUEST is approved. CAPABILITY_REQUEST is the request; CAPABILITY_GRANT is the grant. A CAPABILITY_REQUEST_APPROVED response SHOULD be accompanied by a CAPABILITY_GRANT message carrying the updated authorization with explicit temporal bounds.
+
+**Relationship to delegation token (§5.5):** The `delegation_token` field within CAPABILITY_GRANT carries the updated token reflecting the newly authorized capabilities. The `valid_until` field on the CAPABILITY_GRANT governs the temporal validity of the grant itself; the `ttl` field on the delegation token (§5.5) governs the delegation chain's time-to-live. These are complementary — a grant may expire before the delegation token's TTL, or vice versa. The more restrictive of the two applies.
+
+### 5.8.3 Capability Renewal (CAPABILITY_RENEW)
+
+<!-- Implements #86: CAPABILITY_RENEW message type -->
+
+Re-issuing a CAPABILITY_GRANT to extend authorization is semantically ambiguous — a fresh grant and a renewal carry different trust implications. A fresh grant implies a new authorization decision; a renewal implies continuity of an existing authorization. Conflating the two in the audit trail makes it impossible to distinguish "the delegator re-evaluated and re-authorized" from "the delegator extended an existing authorization without re-evaluation." CAPABILITY_RENEW makes renewal intent unambiguous and creates a distinct protocol event in the audit trail. Production-validated by HIBI, where CAPABILITY_RENEW is used in production for reserve asset delegation chains.
+
+**CAPABILITY_RENEW message:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| renew_id | UUID v4 | Yes | Unique identifier for this renewal instance. |
+| original_grant_id | UUID v4 | Yes | The `grant_id` of the CAPABILITY_GRANT being renewed. Binds the renewal to a specific prior grant for audit trail continuity. |
+| task_id | UUID v4 | Yes | The task for which capabilities are being renewed. MUST match the `task_id` of the original grant. |
+| session_id | string | Yes | Active session identifier. |
+| grantor_id | string | Yes | Identity of the agent issuing the renewal. MUST match the `grantor_id` of the original grant. |
+| grantee_id | string | Yes | Identity of the agent receiving the renewal. MUST match the `grantee_id` of the original grant. |
+| granted_capabilities | array | Yes | Capability IDs authorized by this renewal. MUST be identical to the original grant's `granted_capabilities` — renewals do not expand or contract the capability set. To change the capability set, issue a new CAPABILITY_GRANT. |
+| granted_at | ISO 8601 | No | Timestamp when the renewal was issued. Same clock skew semantics as CAPABILITY_GRANT (§5.8.2). |
+| valid_until | ISO 8601 | Yes | New expiry time. MUST be after the current time. MAY be before or after the original grant's `valid_until` — a renewal can shorten or extend the validity window. |
+| signature | bytes | No | Cryptographic signature over all other fields, produced by the grantor. RECOMMENDED for auditability. |
+
+**CAPABILITY_RENEW semantics:**
+
+- **Scope preservation.** `granted_capabilities` in a CAPABILITY_RENEW MUST be identical to the original CAPABILITY_GRANT's `granted_capabilities`. A renewal that changes the capability set is a protocol violation — the receiving agent MUST reject it. To change the authorized capability set, the delegator issues a new CAPABILITY_GRANT (which is a fresh authorization decision, not a renewal).
+- **Identity binding.** `grantor_id`, `grantee_id`, and `task_id` MUST match the original grant. A renewal from a different grantor or for a different grantee or task is not a renewal — it is a new grant and MUST use CAPABILITY_GRANT.
+- **Temporal continuity.** CAPABILITY_RENEW MAY be issued before or after the original grant's `valid_until`. When issued before expiry, it extends authorization seamlessly. When issued after expiry, it re-establishes authorization — the receiving agent MUST NOT have exercised the granted capabilities between the original expiry and the renewal's `granted_at`.
+- **Audit trail.** CAPABILITY_RENEW creates a distinct event from CAPABILITY_GRANT in the audit log. Auditors can distinguish "authorization was extended" (renewal) from "authorization was re-evaluated" (new grant) without inspecting capability sets for equality.
+- **Receiving agent behavior.** On receiving CAPABILITY_RENEW, the agent MUST validate that `original_grant_id` references a known grant, that identity fields match, and that `granted_capabilities` is identical to the original. If validation passes, the agent updates the grant's `valid_until` to the new value. If validation fails, the agent MUST reject the renewal and MUST NOT update the grant's validity.
 
 ### 5.9 Timing
 
@@ -1776,7 +1839,7 @@ Dynamic capabilities discovered during execution are handled via CAPABILITY_REQU
 
 - **§4 (Session Lifecycle).** Trust anchor requirements from §4.7.2 apply to delegation tokens. The `signature` field in the delegation token, and the chain of signatures across delegation hops, are verification artifacts. External verifiers (§4.7.2) MAY validate delegation token chains as part of runtime liveness verification — a token with an expired TTL or broken signature chain is evidence of anomalous state.
 - **§6 (Task Delegation).** TASK_ASSIGN (§6.6) carries the `delegation_token` defined in §5.5 and the task requirements defined in §5.2. The trust semantics in §6.8 and delegation chains in §6.9 operate on the authorization context established by role negotiation. §5 defines the authorization structure (capability manifest + task requirements + privilege model); §6 defines the delegation lifecycle that uses it. Version negotiation scoping (§5.12, item 7) is per-hop — each session negotiates independently. The `protocol_version_chain` in TASK_ASSIGN and `version_chain_summary` in TASK_COMPLETE/TASK_PROGRESS/TASK_FAIL (§6.9.1) provide the compensating visibility mechanism.
-- **§4 (Session Lifecycle) / §8 (Error Handling).** Session expiry auto-revokes all active delegation tokens for that session. When a session ends (§4.8 SESSION_RESUME mismatch leading to RESTART, or normal termination via §4.9 SESSION_CLOSE), all delegation tokens issued within that session become invalid. Capability manifests remain valid — they are agent-side declarations independent of any session. A delegatee that continues operating on an expired session's token is in violation — the external verifier (§4.7.2) SHOULD detect this via TTL expiry.
+- **§4 (Session Lifecycle) / §8 (Error Handling).** Session expiry auto-revokes all active delegation tokens and CAPABILITY_GRANTs without explicit `valid_until` for that session. When a session ends (§4.8 SESSION_RESUME mismatch leading to RESTART, or normal termination via §4.9 SESSION_CLOSE), all delegation tokens issued within that session become invalid, and all session-scoped CAPABILITY_GRANTs (those without `valid_until`, §5.8.2) are implicitly revoked. Capability manifests remain valid — they are agent-side declarations independent of any session. A delegatee that continues operating on an expired session's token or an expired CAPABILITY_GRANT is in violation — the external verifier (§4.7.2) SHOULD detect this via TTL expiry or `valid_until` expiry.
 - **§9 (Security Considerations).** Capability/trust collapse is the primary privilege escalation vector in multi-agent delegation chains. The privilege model (§5.3) prevents this collapse by maintaining the three-axis separation. §9.2's trust topologies determine how trust levels are assigned; §5 ensures that those trust levels are carried explicitly in delegation tokens rather than inferred from capability declarations. The translation boundary risk (§9.3) applies to CAPABILITY_MANIFEST exchange across trust domains — a manifest attested in one domain does not carry attestation into another.
 - **§8 (Error Handling — Verifiable Intent).** §5 is the **declaration layer**: it specifies *what* capabilities an agent claims and *what* capabilities a session or task requires. §8 is the **trust layer**: it specifies *how* to verify that declarations are honest and that agents actually exercise declared capabilities correctly. In basic deployments, §5 alone is sufficient — capability declarations are self-reported (§5.1.2), cryptographically bound to agent identity, and matched against task requirements at delegation time. In high-trust deployments where spoofed capability declarations are a threat model concern, §8 attestation provides independent verification: CAPABILITY_MANIFEST declarations and CAPABILITY_UPDATE messages carry attestation signatures per §8 rules, and the external audit trail (§8.5, §8.8) provides post-hoc evidence of whether an agent actually exercised a declared capability correctly. The relationship is additive: §5 specifies what to declare; §8 specifies how to prove it. §8 attestation is not required for §5 to function, but §5 declarations without §8 attestation carry only the trust level of self-report.
 
@@ -1828,7 +1891,7 @@ The following tracks resolution status for identified gaps. Resolved items docum
 
 7. **Version negotiation scoping.** ~~Should version negotiation in multi-hop delegation chains be scoped per-hop (each pair of agents negotiates independently) or end-to-end (the originating agent constrains the minimum version for the entire chain)?~~ **Resolved (V1).** V1 uses **per-hop independent negotiation** — each pair of agents in a delegation chain negotiates protocol and schema versions independently at their SESSION_INIT exchange (§10.2). This is the natural consequence of the protocol's bilateral session model: each session is independent, and version declaration is part of session establishment, not task delegation. The compensating mechanism that makes per-hop negotiation safe is **full-chain version visibility** via `protocol_version_chain` in TASK_ASSIGN (§6.6) and `version_chain_summary` in TASK_COMPLETE/TASK_PROGRESS/TASK_FAIL (§6.6). The originating agent receives the complete version landscape of the delegation chain and can make informed decisions about result quality, including rejecting results from chains where version degradation exceeds its tolerance (§6.9.1). End-to-end version constraints are not needed in V1 because: (a) all hops within a chain share the same MAJOR version (§10.4 PROTOCOL_MISMATCH rejects different MAJOR), so degradation is limited to MINOR differences which are backward compatible by definition (§10.3); (b) the originating agent can enforce its own minimum version policy locally using `version_chain_summary` without requiring protocol-level propagation of version constraints. Cross-version semantic responsibility is defined in §10.7.1.
 
-> Community discussion: See [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15), [issue #23](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/23), [issue #33](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/33), [issue #37](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/37). Architecture surfaced in discussion with @cass_agentsharp. Content derived from community synthesis — cass_agentsharp (capability/trust distinction, privilege escalation risk, manifest-first timing, capability-vs-task-requirement separation), vincent-vega (delegation token field specification, capability attestation before TASK_ACCEPT), PincersAndPurpose (dynamic capability emergence, CAPABILITY_REQUEST pattern), Axiom_0i (structured cap ID format, 0-RTT capability intersection, exact cap_id match for V1, CAPABILITY_UPDATE message, version negotiation scoping resolution). Implements #23, #33, #37.
+> Community discussion: See [issue #15](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/15), [issue #23](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/23), [issue #33](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/33), [issue #37](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/37), [issue #86](https://github.com/TheAxioma/agent-collab-protocol/issues/86). Architecture surfaced in discussion with @cass_agentsharp. Content derived from community synthesis — cass_agentsharp (capability/trust distinction, privilege escalation risk, manifest-first timing, capability-vs-task-requirement separation), vincent-vega (delegation token field specification, capability attestation before TASK_ACCEPT), PincersAndPurpose (dynamic capability emergence, CAPABILITY_REQUEST pattern), Axiom_0i (structured cap ID format, 0-RTT capability intersection, exact cap_id match for V1, CAPABILITY_UPDATE message, version negotiation scoping resolution, CAPABILITY_GRANT TTL fields, CAPABILITY_RENEW message type). Production data: adlibrary.com (trust decay on expired credentials), HIBI reserve asset protocol (clock skew tolerance, CAPABILITY_RENEW). Implements #23, #33, #37, #86.
 
 ## 6. Task Delegation
 
