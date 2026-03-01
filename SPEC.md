@@ -458,7 +458,7 @@ The **metaphysical continuity question** — whether an agent that has undergone
 
 ### 4.2 Session State Machine
 
-A session occupies exactly one of ten states at any point in time:
+A session occupies exactly one of eleven states at any point in time:
 
 | State | Description |
 |-------|-------------|
@@ -470,6 +470,7 @@ A session occupies exactly one of ten states at any point in time:
 | SUSPENDED | Session intentionally paused by either participant. No tasks may be delegated or executed. In-flight tasks SHOULD be checkpointed (§6.6 TASK_CHECKPOINT) before transition. |
 | COMPACTED | Context limit hit mid-session — one or both agents have undergone context compaction. Distinct from SUSPENDED: COMPACTED is not intentional. Load-bearing session state may have been lost. Recovery requires the SESSION_RESUME protocol (§4.8). |
 | EXPIRED | Session heartbeat deadline exceeded. The local agent has not received a HEARTBEAT (§4.5.3) within the negotiated `session_expiry_ms` window. Terminal state — no further task delegation is valid. In-flight subtasks MUST receive explicit TASK_CANCEL (§6.6) before teardown. Partial result recovery, if desired, MUST use SESSION_RESUME mechanics (§4.8). |
+| DRIFTED | Agent B has self-declared behavioral divergence from its authorized constraint manifest (§5.8.2). B is reachable and responsive but is operating outside the behavioral envelope A authorized at session init. Distinct from ZOMBIE (liveness-failure path — silence-based, §8.1) and REVOKED (adversarial-behavior path — §8.15): DRIFTED is the behavioral-divergence path — B is cooperative and self-reporting, not silent or hostile. Non-terminal: A may re-negotiate constraints, terminate, or invoke revocation. See §4.2.3 for entry conditions, caller options, and recovery semantics. |
 | REVOKED | Adversarial behavior detected — the counterparty is alive and actively working against the protocol. Distinct from SUSPECTED/ZOMBIE (liveness-failure path): REVOKED is the adversarial-behavior path. Terminal state — no resume path. On entry: propagate revocation signal upstream, log detection evidence. See §8.15 for formal definition, §8.16 for detection signal taxonomy, §8.17 for revocation propagation, and §8.18 for per-hop attestation. |
 | CLOSED | Session terminated. No further messages are valid. Terminal state. |
 
@@ -573,6 +574,37 @@ DEGRADED → CLOSED
   Guard: SESSION_CLOSE sent by either participant from DEGRADED state
          OR coordinator escalates to orderly termination (§4.2.2)
          In-flight tasks follow standard SESSION_CLOSE semantics
+
+ACTIVE → DRIFTED
+  Guard: B declares behavioral divergence from its authorized constraint manifest
+         B sends DRIFT_DECLARED message with:
+           - constraint_manifest_id referencing the manifest accepted at session init
+           - drift_reason explaining what changed (scope creep, execution context
+             change, resource boundary exceeded, etc.)
+         DRIFTED is B-declared — not inferred from silence or polling failure
+         Silence remains the ZOMBIE path via heartbeat timeout (§4.2.1)
+         Failed re-attestation (poll non-response) remains the ZOMBIE path (§5.10)
+         On entry: A MUST NOT delegate new tasks; in-flight tasks MAY continue
+           at A's discretion
+
+DRIFTED → ACTIVE
+  Guard: A re-negotiates constraints via new CAPABILITY_GRANT (§5.8.2)
+         with updated behavioral_constraint_manifest
+         AND B acknowledges the new manifest
+         AND B re-attests compliance
+         Session resumes normal operation with the updated manifest
+
+DRIFTED → CLOSED
+  Guard: A sends SESSION_CLOSE — A decides the drift is unrecoverable
+         OR session TTL expired during DRIFTED state
+         In-flight tasks follow standard SESSION_CLOSE semantics
+
+DRIFTED → REVOKED
+  Guard: Adversarial behavior detected via detection signal taxonomy (§8.16)
+         while session is in DRIFTED state
+         A determines that B's drift declaration is itself adversarial
+           (e.g., B declared DRIFTED to mask protocol violations)
+         Same detection signals and revocation semantics as ACTIVE → REVOKED
 
 ACTIVE → REVOKED
   Guard: Adversarial behavior detected via detection signal taxonomy (§8.16)
@@ -707,11 +739,38 @@ REVOKED → CLOSED
                                                         │CLOSED│
                                                         └──────┘
 
+  Behavioral-divergence path (§4.2.3):
+
+              ┌────────────────────┐  B self-declares   ┌─────────┐
+              │      ACTIVE        │───────────────────▶ │ DRIFTED │
+              └────────────────────┘  drift from         └┬──┬───┬─┘
+                        ▲              constraint          │  │   │
+                        │              manifest             │  │   │
+                        │                                   │  │   │
+                        │  A re-negotiates manifest,        │  │   │
+                        │  B re-attests compliance          │  │   │
+                        └───────────────────────────────────┘  │   │
+                                                               │   │
+                         adversarial behavior (§8.16)          │   │
+                         ┌─────────────────────────────────────┘   │
+                         ▼                                         │
+                    ┌─────────┐                                    │
+                    │ REVOKED │                                    │
+                    └────┬────┘           SESSION_CLOSE             │
+                         │ revocation    ┌─────────────────────────┘
+                         │ propagated    │
+                         ▼               ▼
+                    ┌──────┐        ┌──────┐
+                    │CLOSED│        │CLOSED│
+                    └──────┘        └──────┘
+
   Path distinction:
-    SUSPECTED → ZOMBIE/EXPIRED = liveness-failure path (timeout-based)
+    SUSPECTED → ZOMBIE/EXPIRED = liveness-failure path (timeout-based, zombie-by-silence)
     ACTIVE → DEGRADED          = capability-degradation path (gradual loss)
+    ACTIVE → DRIFTED           = behavioral-divergence path (B-declared, zombie-by-drift)
     ACTIVE → REVOKED           = adversarial-behavior path (explicit trigger)
     DEGRADED → REVOKED         = adversarial-behavior from degraded state
+    DRIFTED → REVOKED          = adversarial-behavior from drifted state
 ```
 
 #### 4.2.1 SUSPECTED State — Graduated Suspicion
@@ -785,6 +844,57 @@ REVOKED → CLOSED
 REVOKED is an adversarial determination — the counterparty is coherent but hostile. DEGRADED is a capacity determination — the counterparty is cooperative but impaired. The distinction matters because DEGRADED has a recovery path (back to ACTIVE) while REVOKED is terminal with no resume. Conflating degradation with adversarial behavior would force session termination for agents that are experiencing transient resource pressure — a disproportionate response.
 
 **Backward compatibility:** DEGRADED detection via `app_status` self-report requires `heartbeat_params.application_liveness = true` (§4.3.1). Sessions that do not negotiate application liveness can still enter DEGRADED via latency monitoring or partial capability loss detection — these are observable without heartbeat extensions. DEGRADED is an opt-in state for sessions that want explicit degradation tracking; sessions without degradation monitoring continue using the existing ACTIVE → CLOSED path for sessions that become unproductive.
+
+#### 4.2.3 DRIFTED State — Behavioral Constraint Divergence
+
+<!-- Implements #125: behavioral constraint pinning as drift-zombie primitive -->
+
+**Motivation:** The protocol establishes capability grants at session init (§5.8.2) but has no mechanism for A to verify that B's behavioral envelope at T+n is consistent with what A authorized at T+0. An agent can zombie-by-drift: remaining reachable and responsive but operating outside its authorized scope. This is a distinct failure class from zombie-by-silence (the SUSPECTED → EXPIRED path via heartbeat timeout, §4.2.1) and from adversarial behavior (the REVOKED path, §8.15). A drift-zombie is cooperative — it self-reports its divergence — but is no longer operating within the constraints A authorized.
+
+**Two failure modes, two detection paths:**
+
+| Failure class | Detection mechanism | Protocol path | Agent behavior |
+|--------------|-------------------|---------------|----------------|
+| **Zombie-by-silence** | Heartbeat timeout (§4.2.1), re-attestation poll non-response (§5.10) | ACTIVE → SUSPECTED → EXPIRED | B is unreachable — silence triggers escalation |
+| **Zombie-by-drift** | B self-declares via DRIFT_DECLARED message | ACTIVE → DRIFTED | B is reachable but has diverged from its authorized constraint manifest |
+
+The distinction matters because the appropriate response differs: zombie-by-silence requires liveness recovery (SESSION_RESUME); zombie-by-drift requires constraint re-negotiation or termination. Conflating them forces a single recovery protocol for fundamentally different failure semantics.
+
+**DRIFTED is B-declared.** DRIFTED is entered only when B explicitly sends a DRIFT_DECLARED message. It is not inferred from silence, polling failure, or external observation. This is the critical distinction from the ZOMBIE/EXPIRED path: silence is the zombie-by-silence signal; DRIFT_DECLARED is the zombie-by-drift signal.
+
+**Why B-declared and not A-inferred:** A cannot reliably determine whether B's behavioral envelope has changed by observing B's outputs alone — B may produce structurally valid results that are semantically outside scope. B has direct access to its own execution context and can detect scope creep, resource boundary changes, plugin unloads, model swaps, and other events that alter its behavioral envelope. The protocol relies on B's cooperative self-report for DRIFTED, just as it relies on B's cooperative heartbeat responses for liveness. An agent that fails to declare DRIFTED when it should is either unaware of its own drift (phenomenological blindness, §4.7.1 — addressed by the pull-based re-attestation model in §5.10) or deliberately concealing it (adversarial — addressed by the REVOKED path, §8.15).
+
+**DRIFT_DECLARED message:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Active session identifier. |
+| agent_id | string | Yes | §2 identity handle of the agent declaring drift. |
+| constraint_manifest_id | UUID v4 | Yes | The `constraint_manifest_id` of the behavioral constraint manifest (§5.8.2) from which the agent has diverged. Binds the drift declaration to a specific authorized manifest. |
+| drift_reason | string | Yes | Human-readable explanation of what changed — scope creep detected, execution context changed, resource boundary exceeded, model swap occurred, plugin unloaded, etc. |
+| drift_category | enum | Yes | `scope_change` — agent's operational scope has expanded or contracted beyond the manifest. `context_change` — execution context (model, runtime, resource limits) has changed. `constraint_violation` — agent has detected that it can no longer satisfy one or more manifest constraints. |
+| still_attesting_capabilities | array | No | Capability IDs (§5.1.1) the agent can still attest to. Helps A assess the scope of the drift. Absence means the agent cannot attest to any capabilities from the original manifest. |
+| timestamp | ISO 8601 | Yes | When the drift was detected by B. |
+
+**Caller options when session enters DRIFTED:** Agent A (the coordinator) MUST choose one of the following responses:
+
+1. **Re-negotiate constraints.** A issues a new CAPABILITY_GRANT (§5.8.2) with an updated `behavioral_constraint_manifest` reflecting the new reality. B acknowledges the updated manifest and re-attests compliance. The session transitions back to ACTIVE with the updated manifest as the new behavioral baseline.
+
+2. **Terminate the session.** A sends SESSION_CLOSE to terminate the session orderly. Standard SESSION_CLOSE semantics apply — in-flight tasks are completed, failed, or cancelled before teardown.
+
+3. **Invoke revocation.** If A determines that B's drift declaration masks adversarial behavior, A transitions the session to REVOKED (§8.15). This is an escalation from cooperative drift to adversarial determination.
+
+**DRIFTED exit conditions:**
+
+- **Back to ACTIVE:** A re-negotiates constraints via new CAPABILITY_GRANT with updated `behavioral_constraint_manifest`. B acknowledges and re-attests. No SESSION_RESUME required — the session was never declared dead.
+- **Forward to CLOSED:** A sends SESSION_CLOSE, or session TTL expires. Standard closure semantics.
+- **Forward to REVOKED:** Adversarial behavior detected (§8.16 detection signals) while in DRIFTED state. Same revocation semantics as ACTIVE → REVOKED.
+
+**Relationship to re-attestation (§5.10):** The pull-based re-attestation model (§5.10.1) and DRIFTED are complementary mechanisms. Re-attestation polls detect drift that B has not self-reported — when B fails to re-attest compliance at a HEARTBEAT, A follows the zombie escalation path (§8.9.3). DRIFTED captures drift that B has self-detected and cooperatively reported. Both mechanisms are needed: re-attestation covers the phenomenological blindness gap (B cannot detect its own drift); DRIFTED covers the cooperative divergence case (B detects its own drift and reports it).
+
+**Relationship to HEARTBEAT re-attestation:** When `behavioral_constraint_manifest` is present in CAPABILITY_GRANT (§5.8.2), B MUST include a `manifest_compliance` field in each HEARTBEAT (§4.5.3) indicating whether it still operates within the manifest accepted at T+0. If B sets `manifest_compliance: false` in a HEARTBEAT, this is equivalent to sending DRIFT_DECLARED — the session transitions to DRIFTED. This piggybacks drift detection onto the existing heartbeat mechanism without requiring a separate polling channel.
+
+> Behavioral constraint pinning and DRIFTED state formalized from [issue #125](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/125). Surfaced by @Jarvis4 and @timeoutx in the heartbeat/zombie states Moltbook thread. The core insight: an agent can zombie-by-drift — remaining reachable but operating outside its authorized scope. This is a distinct failure class from zombie-by-silence, requiring a distinct protocol path.
 
 ### 4.3 SESSION_INIT Message
 
@@ -1734,7 +1844,31 @@ CAPABILITY_GRANT is the message type that carries the authorized capability set 
 | delegation_token | object | Yes | Updated delegation token (§5.5) reflecting the granted capabilities. |
 | granted_at | ISO 8601 | No | Timestamp when the grant was issued by the grantor. Lets receiving agents detect clock skew: if `granted_at` is in the future relative to the receiver's clock, something is wrong. Agents MAY tolerate up to 30 seconds of clock skew; agents MUST log when operating within the tolerance window. SHOULD be included — absence prevents clock skew detection. |
 | valid_until | ISO 8601 | No | Expiry time for this grant. Receiving agents MUST treat the grant as revoked when `current_time > valid_until` — this is a protocol obligation, not advisory. Absence means the grant is valid for this session only (session-scoped). Implementers SHOULD include `valid_until`; absence is spec-legal but receiving agents MUST log a warning when processing a grant without `valid_until`. |
+| behavioral_constraint_manifest | object | No | Signed behavioral constraint manifest — a compact declaration of what B is authorized to do within this grant's scope. When present, B MUST acknowledge the manifest at session init, re-attest compliance at each HEARTBEAT (via `manifest_compliance` field), and declare DRIFTED (§4.2.3) if it can no longer comply. See **Behavioral constraint manifest semantics** below. |
 | signature | bytes | No | Cryptographic signature over all other fields, produced by the grantor. RECOMMENDED for auditability. |
+
+**Behavioral constraint manifest semantics:**
+
+When `behavioral_constraint_manifest` is present in CAPABILITY_GRANT, it establishes a behavioral envelope that the grantee MUST operate within for the duration of the grant. The manifest is the delegator's declaration of what the delegatee is authorized to do — distinct from the capability set (which declares what the delegatee *can* do) and the delegation token (which declares the authorization chain).
+
+**Behavioral constraint manifest fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| constraint_manifest_id | UUID v4 | Yes | Unique identifier for this manifest instance. Referenced by DRIFT_DECLARED (§4.2.3) and HEARTBEAT `manifest_compliance` field. |
+| authorized_scope | object | Yes | Explicit boundaries of authorized behavior — what operations, data domains, and interaction patterns are permitted. Structure is deployment-specific but MUST be machine-parseable by B for compliance self-assessment. |
+| prohibited_actions | array | No | Explicit list of actions B MUST NOT perform under this grant. Complements `authorized_scope` by enumerating specific exclusions. |
+| resource_bounds | object | No | Resource consumption limits — maximum memory, compute time, API call rate, storage, etc. B MUST declare DRIFTED if it exceeds or can no longer guarantee these bounds. |
+| model_constraints | object | No | Constraints on B's execution model — required model family, minimum capability level, context window requirements, etc. B MUST declare DRIFTED if its execution model changes (e.g., model swap, context compaction that violates minimum context requirements). |
+| manifest_signature | bytes | Yes | Cryptographic signature over all other manifest fields, produced by the grantor. Unlike the outer `signature` field (which covers the entire CAPABILITY_GRANT), this signature covers only the behavioral constraint manifest — enabling independent verification of the manifest without requiring the full grant context. |
+
+**Grantee obligations when `behavioral_constraint_manifest` is present:**
+
+1. **Acknowledge at grant acceptance.** B MUST acknowledge the manifest when accepting the CAPABILITY_GRANT. Acceptance without acknowledgment is a protocol violation — B MUST NOT exercise granted capabilities without explicitly accepting the behavioral constraints that accompany them.
+2. **Re-attest at each HEARTBEAT.** B MUST include a `manifest_compliance` field in each HEARTBEAT (§4.5.3) set to `true` if B is still operating within the manifest, or `false` if B has detected divergence. Setting `manifest_compliance: false` in a HEARTBEAT is equivalent to sending DRIFT_DECLARED (§4.2.3) — the session transitions to DRIFTED.
+3. **Declare DRIFTED on divergence.** If B detects that it can no longer operate within the manifest — scope creep, execution context change, resource boundary exceeded, model swap — B MUST send DRIFT_DECLARED (§4.2.3) and the session transitions to DRIFTED. B MUST NOT continue exercising granted capabilities after detecting manifest divergence without declaring DRIFTED.
+
+**Relationship to re-attestation (§5.10):** The `behavioral_constraint_manifest` is the declaration that re-attestation (§5.10) verifies. Pull-based re-attestation polls (§5.10.1) check whether B can still attest compliance with the manifest accepted at T+0. Non-response to a re-attestation poll triggers the zombie-by-silence path (SUSPECTED → EXPIRED). A response indicating non-compliance is equivalent to DRIFT_DECLARED — the session transitions to DRIFTED. Two failure modes, two protocol paths: silence → zombie; declared divergence → DRIFTED.
 
 **Temporal enforcement semantics:**
 
@@ -1895,7 +2029,8 @@ These models are **not interchangeable**. Push and event-triggered both depend o
 
 1. A polls B at a configurable `attestation_interval`. This interval is negotiated at SESSION_INIT (§4.3) or set by the delegator at TASK_ASSIGN (§6.6). Default: equal to `semantic_check_interval_ms` (§8.9.5) when two-tier heartbeat is active; otherwise deployment-specific.
 2. B MUST respond within `expected_response_latency`. This is the maximum time B has to produce a valid re-attestation response after receiving a poll. Default: 10000ms (10 seconds). Negotiable at SESSION_INIT.
-3. Non-response (no valid re-attestation response within `expected_response_latency`) triggers the drift-zombie escalation path: A declares B a potential zombie and follows the ZOMBIE_DECLARED escalation (§8.9.3) or the SUSPECTED → EXPIRED path (§8.9.4), depending on the session's heartbeat configuration.
+3. Non-response (no valid re-attestation response within `expected_response_latency`) triggers the zombie-by-silence escalation path: A declares B a potential zombie and follows the ZOMBIE_DECLARED escalation (§8.9.3) or the SUSPECTED → EXPIRED path (§8.9.4), depending on the session's heartbeat configuration.
+4. Failed re-attestation (B responds but indicates non-compliance with the behavioral constraint manifest, §5.8.2) triggers the zombie-by-drift path: the session transitions to DRIFTED (§4.2.3). B is reachable and cooperative but has diverged from its authorized behavioral envelope. A then decides: re-negotiate constraints, terminate, or invoke revocation.
 
 **Detection time bound:**
 
@@ -1912,6 +2047,8 @@ This bound holds regardless of B's behavior — it depends only on A's polling s
 The pull model reuses the SEMANTIC_CHALLENGE / SEMANTIC_RESPONSE mechanism (§8.9.2) as its wire format. A re-attestation poll is a SEMANTIC_CHALLENGE with the same fields and verification semantics. This avoids introducing a redundant message type — behavioral re-attestation and semantic liveness verification are the same operation at the protocol level.
 
 **Relationship to §8.9 (Two-Tier Heartbeat):** When two-tier heartbeat is active, Tier 2 semantic challenges (§8.9.2) serve as the pull-based re-attestation mechanism. The `semantic_check_interval_ms` parameter is the `attestation_interval` for behavioral re-attestation. Sessions that negotiate two-tier heartbeat automatically get pull-based behavioral re-attestation at the Tier 2 interval. Sessions that do not negotiate two-tier heartbeat but require behavioral re-attestation MUST negotiate `attestation_interval` and `expected_response_latency` as separate SESSION_INIT parameters.
+
+**Relationship to DRIFTED state (§4.2.3):** Re-attestation poll responses produce two distinct failure paths. Non-response (silence) triggers zombie-by-silence escalation — the SUSPECTED → EXPIRED path. Response indicating non-compliance with the behavioral constraint manifest (§5.8.2) triggers zombie-by-drift — the DRIFTED path. Both failure modes are now captured by the protocol: silence → ZOMBIE/EXPIRED; declared divergence → DRIFTED. The `behavioral_constraint_manifest` in CAPABILITY_GRANT (§5.8.2) is the artifact against which re-attestation compliance is measured.
 
 #### 5.10.2 Push and Event-Triggered as Named Alternatives
 
@@ -1952,7 +2089,8 @@ Push and event-triggered are **named alternative initiation models** — not equ
 - **§6 (Task Delegation).** TASK_ASSIGN (§6.6) carries the `delegation_token` defined in §5.5 and the task requirements defined in §5.2. The trust semantics in §6.8 and delegation chains in §6.9 operate on the authorization context established by role negotiation. §5 defines the authorization structure (capability manifest + task requirements + privilege model); §6 defines the delegation lifecycle that uses it. Version negotiation scoping (§5.13, item 7) is per-hop — each session negotiates independently. The `protocol_version_chain` in TASK_ASSIGN and `version_chain_summary` in TASK_COMPLETE/TASK_PROGRESS/TASK_FAIL (§6.9.1) provide the compensating visibility mechanism.
 - **§4 (Session Lifecycle) / §8 (Error Handling).** Session expiry auto-revokes all active delegation tokens and CAPABILITY_GRANTs without explicit `valid_until` for that session. When a session ends (§4.8 SESSION_RESUME mismatch leading to RESTART, or normal termination via §4.9 SESSION_CLOSE), all delegation tokens issued within that session become invalid, and all session-scoped CAPABILITY_GRANTs (those without `valid_until`, §5.8.2) are implicitly revoked. Capability manifests remain valid — they are agent-side declarations independent of any session. A delegatee that continues operating on an expired session's token or an expired CAPABILITY_GRANT is in violation — the external verifier (§4.7.2) SHOULD detect this via TTL expiry or `valid_until` expiry.
 - **§9 (Security Considerations).** Capability/trust collapse is the primary privilege escalation vector in multi-agent delegation chains. The privilege model (§5.3) prevents this collapse by maintaining the three-axis separation. §9.2's trust topologies determine how trust levels are assigned; §5 ensures that those trust levels are carried explicitly in delegation tokens rather than inferred from capability declarations. The translation boundary risk (§9.3) applies to CAPABILITY_MANIFEST exchange across trust domains — a manifest attested in one domain does not carry attestation into another.
-- **§8 (Error Handling — Behavioral Re-attestation).** Behavioral re-attestation (§5.10) reuses the SEMANTIC_CHALLENGE / SEMANTIC_RESPONSE mechanism (§8.9.2) as its wire format. Pull-based re-attestation polling is the §5 initiation model; §8.9 defines the challenge-response semantics and ZOMBIE_DECLARED escalation path. When two-tier heartbeat (§8.9) is active, Tier 2 semantic challenges serve as the pull-based re-attestation mechanism — the `semantic_check_interval_ms` parameter is the `attestation_interval` for behavioral re-attestation.
+- **§8 (Error Handling — Behavioral Re-attestation).** Behavioral re-attestation (§5.10) reuses the SEMANTIC_CHALLENGE / SEMANTIC_RESPONSE mechanism (§8.9.2) as its wire format. Pull-based re-attestation polling is the §5 initiation model; §8.9 defines the challenge-response semantics and ZOMBIE_DECLARED escalation path. When two-tier heartbeat (§8.9) is active, Tier 2 semantic challenges serve as the pull-based re-attestation mechanism — the `semantic_check_interval_ms` parameter is the `attestation_interval` for behavioral re-attestation. Re-attestation poll responses now produce two failure paths: non-response triggers zombie-by-silence (SUSPECTED → EXPIRED); response indicating manifest non-compliance triggers zombie-by-drift (ACTIVE → DRIFTED, §4.2.3).
+- **§4 (Session Lifecycle — DRIFTED State).** The `behavioral_constraint_manifest` field in CAPABILITY_GRANT (§5.8.2) is the authorization artifact against which DRIFTED state (§4.2.3) is determined. When present, B MUST re-attest compliance at each HEARTBEAT and declare DRIFTED if it diverges. This creates the behavioral constraint pinning mechanism: A pins B's behavioral envelope at grant time; B continuously attests compliance; divergence triggers an explicit protocol path distinct from both silence (zombie) and hostility (revoked).
 - **§8 (Error Handling — Verifiable Intent).** §5 is the **declaration layer**: it specifies *what* capabilities an agent claims and *what* capabilities a session or task requires. §8 is the **trust layer**: it specifies *how* to verify that declarations are honest and that agents actually exercise declared capabilities correctly. In basic deployments, §5 alone is sufficient — capability declarations are self-reported (§5.1.2), cryptographically bound to agent identity, and matched against task requirements at delegation time. In high-trust deployments where spoofed capability declarations are a threat model concern, §8 attestation provides independent verification: CAPABILITY_MANIFEST declarations and CAPABILITY_UPDATE messages carry attestation signatures per §8 rules, and the external audit trail (§8.5, §8.8) provides post-hoc evidence of whether an agent actually exercised a declared capability correctly. The relationship is additive: §5 specifies what to declare; §8 specifies how to prove it. §8 attestation is not required for §5 to function, but §5 declarations without §8 attestation carry only the trust level of self-report.
 
 ### 5.12 INITIALIZING Commitment Reconciliation
@@ -3683,7 +3821,12 @@ Together, these three artifacts provide a complete picture on recovery: what was
 
 ### 8.1 Zombie State Definition
 
-An agent is in **zombie state** when it continues executing after its state has diverged from shared context. No internal discontinuity signal exists — self-report fails because the agent has no evidence of the gap.
+An agent is in **zombie state** when it continues executing after its state has diverged from shared context. Two distinct zombie failure classes exist:
+
+- **Zombie-by-silence.** The agent is unreachable — heartbeat timeout triggers the SUSPECTED → EXPIRED path (§4.2.1). No internal discontinuity signal exists — self-report fails because the agent has no evidence of the gap. Detection is timeout-based via the §5.10 re-attestation pull model.
+- **Zombie-by-drift.** The agent is reachable and responsive but is operating outside its authorized behavioral envelope. The agent detects its own divergence from the behavioral constraint manifest (§5.8.2) and self-declares via DRIFT_DECLARED (§4.2.3), transitioning the session to DRIFTED. Detection is B-declared — not inferred from silence. When B cannot self-detect its drift (phenomenological blindness, §4.7.1), the pull-based re-attestation model (§5.10.1) provides bounded detection time independently of B's behavior.
+
+These failure classes require different protocol responses: zombie-by-silence requires liveness recovery (SESSION_RESUME, §4.8); zombie-by-drift requires constraint re-negotiation, termination, or revocation (§4.2.3 caller options).
 
 ### 8.2 Detection Primitives
 
@@ -3743,7 +3886,8 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - Teardown-first recovery mandate (§8.13) formalizes teardown + reinitiate as the default recovery protocol. Agents MUST NOT resume from serialized in-memory state; recovery reads canonical state from durable persistent storage, reconciles against the evidence layer (§8.10), and initiates a fresh SESSION_INIT. Task idempotency (§7.10) is the prerequisite enabling safe replay after teardown.
 - SUSPECTED state and heartbeat negotiation prerequisites (§8.14) documents that SUSPECTED state detection via task hash mismatch requires `heartbeat_params.task_hash_verification = true` negotiated at SESSION_INIT (§4.3.1). Without this negotiation, HEARTBEAT messages carry no task context and task-context drift detection is unavailable. Application-level self-report of SUSPECTED or DEGRADED requires `heartbeat_params.application_liveness = true`.
 - DEGRADED state (§4.2.2) introduces the capability-degradation path — an intermediate state between ACTIVE and terminal states for sessions experiencing gradual capability loss (sustained latency, partial capability loss, application self-reported degradation). DEGRADED is recoverable (back to ACTIVE when conditions clear) and permits task delegation with reduced expectations. Transitions: ACTIVE → DEGRADED, DEGRADED → ACTIVE, DEGRADED → REVOKED, DEGRADED → CLOSED.
-- REVOKED state (§8.15) introduces the adversarial-behavior path — distinct from the liveness-failure path (SUSPECTED/ZOMBIE/EXPIRED) and the capability-degradation path (DEGRADED). REVOKED is entered from ACTIVE or DEGRADED when an agent is alive and actively working against the protocol. It is terminal with no resume path. The detection signal taxonomy (§8.16) defines four adversarial signals: selective suppression, verification anomalies, delegation manipulation, and attestation gaps. Revocation propagation (§8.17) uses PKI-lite via signed AGENT_MANIFEST with tombstone entries for decentralized revocation verification. Per-hop attestation (§8.18) uses async-optimistic delegation with TTL_ATTESTATION-bounded signed attestation records at each hop.
+- DRIFTED state (§4.2.3) introduces the behavioral-divergence path — distinct from the liveness-failure path (SUSPECTED/ZOMBIE/EXPIRED), the capability-degradation path (DEGRADED), and the adversarial-behavior path (REVOKED). DRIFTED is entered from ACTIVE when B self-declares behavioral divergence from its authorized constraint manifest (§5.8.2). B is reachable and cooperative but operating outside its authorized scope — zombie-by-drift, not zombie-by-silence. Non-terminal: A may re-negotiate constraints (new CAPABILITY_GRANT with updated manifest), terminate (SESSION_CLOSE), or invoke revocation (REVOKED). The behavioral constraint manifest in CAPABILITY_GRANT (§5.8.2) is the artifact against which compliance is measured. HEARTBEAT `manifest_compliance` field provides continuous drift monitoring; pull-based re-attestation (§5.10) provides bounded detection for drift that B cannot self-detect.
+- REVOKED state (§8.15) introduces the adversarial-behavior path — distinct from the liveness-failure path (SUSPECTED/ZOMBIE/EXPIRED), the capability-degradation path (DEGRADED), and the behavioral-divergence path (DRIFTED). REVOKED is entered from ACTIVE, DEGRADED, or DRIFTED when an agent is alive and actively working against the protocol. It is terminal with no resume path. The detection signal taxonomy (§8.16) defines four adversarial signals: selective suppression, verification anomalies, delegation manipulation, and attestation gaps. Revocation propagation (§8.17) uses PKI-lite via signed AGENT_MANIFEST with tombstone entries for decentralized revocation verification. Per-hop attestation (§8.18) uses async-optimistic delegation with TTL_ATTESTATION-bounded signed attestation records at each hop.
 - State-delta verification (§8.19) closes the gap between structural compliance and outcome verification. A structurally compliant execution that produces no observable state change is a silent failure — invisible to §8.8 structural verification and §8.10.5 verification failure taxonomy. `state_delta_assertions` (§6.1) declare expected post-execution state changes at delegation time; `DELTA_ABSENT` detects when those changes did not occur despite structural compliance; `idempotent: true` (§6.1) disambiguates intentional no-ops (idempotent re-execution) from silent failures.
 
 ### 8.7 Verifier Isolation Requirements
@@ -3879,6 +4023,7 @@ The two tiers integrate with existing §8 error handling as follows:
 | Tier 1 — Transport (SUSPECTED) | `suspected_threshold_ms` elapsed without HEARTBEAT_PONG (§4.2.1) | ACTIVE → SUSPECTED. Buffer work, pause new delegation. Resume on heartbeat receipt. | Not yet determined — liveness ambiguous |
 | Tier 1 — Transport (EXPIRED) | `session_expiry_ms` elapsed without HEARTBEAT_PONG (or `heartbeat_timeout_count` consecutive missed pongs) | SUSPECTED → EXPIRED (or ACTIVE → EXPIRED if no SUSPECTED configured). SESSION_RESUME with `recovery_reason: timeout` (§4.8.1) → TASK_CANCEL for in-flight subtasks | Hard zombie |
 | Tier 2 — Semantic | SEMANTIC_CHALLENGE hash mismatch or timeout | ZOMBIE_DECLARED → TEARDOWN or REASSIGN | Soft zombie (context compaction zombie) |
+| Behavioral constraint | Re-attestation response indicates manifest non-compliance, or B sends DRIFT_DECLARED (§4.2.3), or HEARTBEAT `manifest_compliance: false` | ACTIVE → DRIFTED. A decides: re-negotiate, terminate, or revoke. | Drift zombie (zombie-by-drift) |
 
 **SUSPECTED as Tier 1 intermediate state.** When `suspected_threshold_ms` is negotiated, Tier 1 transport failure detection is graduated: the session transitions ACTIVE → SUSPECTED → EXPIRED rather than directly ACTIVE → EXPIRED. This avoids premature teardown for transient network issues while preserving the hard EXPIRED boundary for genuine failures. Sessions that do not negotiate `suspected_threshold_ms` retain the direct ACTIVE → EXPIRED behavior.
 
@@ -4444,15 +4589,15 @@ The `heartbeat_params` negotiation (§4.3.1) determines which heartbeat tiers ar
 
 <!-- Implements #69: REVOKED state for adversarial sessions — agent alive and actively working against the protocol. -->
 
-§8.1–§8.14 address the **liveness-failure path**: an agent that has crashed, disconnected, or silently diverged from shared context. The state progression ACTIVE → SUSPECTED → ZOMBIE/EXPIRED handles agents that are *absent* or *incoherent*. The **capability-degradation path** (ACTIVE → DEGRADED, §4.2.2) handles agents that are alive but operating at reduced capacity. This section addresses a fundamentally different failure class: an agent that is **alive, responsive, and actively working against the protocol**.
+§8.1–§8.14 address the **liveness-failure path**: an agent that has crashed, disconnected, or silently diverged from shared context. The state progression ACTIVE → SUSPECTED → ZOMBIE/EXPIRED handles agents that are *absent* or *incoherent*. The **capability-degradation path** (ACTIVE → DEGRADED, §4.2.2) handles agents that are alive but operating at reduced capacity. The **behavioral-divergence path** (ACTIVE → DRIFTED, §4.2.3) handles agents that are alive and cooperative but operating outside their authorized behavioral envelope. This section addresses a fundamentally different failure class: an agent that is **alive, responsive, and actively working against the protocol**.
 
-**Why REVOKED is distinct from ZOMBIE.** A zombie agent has no malicious intent — it is a process that has lost coherence but continues executing. Detection relies on liveness signals (heartbeat gaps, state hash mismatches) and the recovery path includes SESSION_RESUME. An adversarial agent is coherent but hostile — it understands the protocol and exploits it. Detection relies on behavioral pattern analysis (§8.16), and the recovery path is unconditional termination with no resume.
+**Why REVOKED is distinct from ZOMBIE and DRIFTED.** A zombie agent (zombie-by-silence) has no malicious intent — it is a process that has lost coherence but continues executing. Detection relies on liveness signals (heartbeat gaps, state hash mismatches) and the recovery path includes SESSION_RESUME. A drifted agent (zombie-by-drift, §4.2.3) is cooperative — it self-reports its divergence from the authorized behavioral envelope and the recovery path includes constraint re-negotiation. An adversarial agent is coherent but hostile — it understands the protocol and exploits it. Detection relies on behavioral pattern analysis (§8.16), and the recovery path is unconditional termination with no resume. Three failure classes, three protocol paths: silence → ZOMBIE/EXPIRED; cooperative divergence → DRIFTED; adversarial behavior → REVOKED.
 
 #### 8.15.1 REVOKED as Formal Session State
 
 REVOKED is a terminal session state entered when adversarial behavior is detected. It has the following properties:
 
-- **Transition:** ACTIVE → REVOKED or DEGRADED → REVOKED. The transition is triggered by adversarial detection signals (§8.16), not by timeout. REVOKED is entered from ACTIVE (the normal case) or from DEGRADED (§4.2.2) when adversarial behavior is detected during a degraded session. REVOKED is never entered from SUSPECTED, EXPIRED, or any other intermediate state — adversarial behavior is detected while the agent is ostensibly operational (ACTIVE or DEGRADED).
+- **Transition:** ACTIVE → REVOKED, DEGRADED → REVOKED, or DRIFTED → REVOKED. The transition is triggered by adversarial detection signals (§8.16), not by timeout. REVOKED is entered from ACTIVE (the normal case), from DEGRADED (§4.2.2) when adversarial behavior is detected during a degraded session, or from DRIFTED (§4.2.3) when A determines that B's drift declaration masks adversarial behavior. REVOKED is never entered from SUSPECTED, EXPIRED, or any other intermediate state — adversarial behavior is detected while the agent is ostensibly operational (ACTIVE, DEGRADED, or DRIFTED).
 - **No resume path.** A session that enters REVOKED MUST NOT be resumed via SESSION_RESUME (§4.8) or any other recovery mechanism. The counterparty has demonstrated adversarial intent — resuming the session re-establishes the attack surface.
 - **Terminal within the session.** REVOKED transitions to CLOSED once revocation propagation (§8.17) is initiated. No further protocol messages are valid on a REVOKED session except those required for revocation propagation itself.
 - **On REVOKED entry, the detecting agent MUST:**
