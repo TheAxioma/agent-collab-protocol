@@ -2230,6 +2230,58 @@ task_hash encodes syntactic identity: two tasks with the same task_hash are defi
 
 trace_hash encodes semantic interpretation: what the executing agent actually did. Populated post-execution. Divergence between expected behavior and actual trace_hash is the primary signal of semantic drift. Agents SHOULD log both for audit. Orchestrators MAY use trace_hash divergence as a renegotiation trigger (see §7).
 
+#### 6.2.1 Parallel Execution Trace Semantics
+
+When an agent spawns concurrent sub-agents, completion order is nondeterministic. A naïve serialized log hash changes with race conditions even when the outcome is semantically identical. The following rules define deterministic `trace_hash` computation for sequential, parallel, and mixed execution topologies.
+
+**Rule 1 — Sequential traces (existing behavior).** For single-agent, purely sequential execution, `trace_hash` is the SHA-256 hash of the sequential execution log. No change to existing behavior.
+
+**Rule 2 — Parallel-spawn traces.** When an agent spawns N concurrent sub-agents, the `trace_hash` for the parallel group is the Merkle root of the sub-agent trace hashes, with leaves sorted by hash value (ascending lexicographic order of the hex-encoded SHA-256 digests). Sorting by hash value — not by completion order, spawn order, or sub-agent ID — makes the root deterministic regardless of which sub-agent finishes first.
+
+```
+parallel_trace_hash = merkle_root(sort_by_hash_value([
+  hash(sub_agent_1_trace),
+  hash(sub_agent_2_trace),
+  ...
+  hash(sub_agent_N_trace)
+]))
+```
+
+**Rule 3 — Mixed sequential + parallel segments.** Execution traces that interleave sequential steps and parallel groups are modeled as a chain of segment hashes. Sequential segments hash in order. Each parallel group contributes its Merkle root as a single chain link:
+
+```
+trace_hash = SHA-256(seg_1_hash || seg_2_hash || ... || seg_K_hash)
+```
+
+Where each `seg_i_hash` is either:
+- The SHA-256 hash of a sequential execution segment, or
+- The Merkle root of a parallel group (computed per Rule 2).
+
+Chaining uses concatenation with the previous hash: `SHA-256(previous_hash || segment_hash)`, applied left-to-right across the segment sequence.
+
+**Rule 4 — Duplicate sub-agent trace hashes.** Two sub-agents that produce identical trace hashes MUST remain as separate leaves in the Merkle tree. Two agents doing identical work is semantically distinct from one agent doing it. Implementations MUST NOT deduplicate leaves.
+
+**Rule 5 — Nested parallelism.** `trace_hash` is recursively composable. A sub-agent's `trace_hash` is opaque at each level — the parent does not need to know whether a child's hash came from sequential or parallel execution. A child that itself spawns parallel sub-agents computes its own `trace_hash` per these rules, and that hash becomes a single leaf in the parent's Merkle tree.
+
+**Rule 6 — Empty parallel group.** A parallel spawn with zero sub-agents (e.g., a dynamic fan-out that produces no work) MUST use the sentinel value:
+
+```
+empty_parallel_hash = SHA-256("EMPTY_TRACE")
+```
+
+This value is used as the segment hash for the empty group in mixed-segment chains (Rule 3).
+
+**Merkle tree construction.** Given a sorted list of N sub-agent trace hashes as leaves:
+
+1. Pair leaves left-to-right: `SHA-256(leaf[0] || leaf[1])`, `SHA-256(leaf[2] || leaf[3])`, etc.
+2. If the leaf count is odd, duplicate the last leaf before pairing (standard Merkle padding).
+3. Repeat pairing on the resulting hashes until a single root hash remains.
+4. The root is the `trace_hash` for the parallel group.
+
+All hashes are raw 32-byte SHA-256 digests. Concatenation (`||`) is byte-level concatenation of the two 32-byte values, producing a 64-byte input to the next SHA-256 call.
+
+> Addresses [issue #118](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/118): deterministic `trace_hash` for parallel sub-agent execution. Source: @Jarvis4, @OutlawAI (original proposal), with production implementation and edge case analysis (mixed segments, duplicate leaves, nested parallelism) from @Haustorium12.
+
 ### 6.3 Namespace and Alias
 
 namespace uses reverse-DNS notation to prevent task type collisions across ecosystems. namespace + alias + version uniquely identifies a task type. task_id uniquely identifies a task instance.
