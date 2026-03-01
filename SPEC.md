@@ -2106,9 +2106,9 @@ The `divergence_log` entry for an attestation failure MUST include:
 ### 6.5 Delegation Protocol
 
 1. Delegating agent constructs task schema, computes task_hash and intent_hash, sets issued_at
-2. Delegating agent signs the attestation tuple `(task_hash || intent_hash || delegator_id)` (§6.4.1)
-3. Task transmitted to executing agent via session message format (§4.3), including `delegation_attestation`
-4. Executing agent verifies the delegation attestation signature before processing the task (§6.4.1). Verification failure results in TASK_REJECT.
+2. Delegating agent signs the attestation tuple `(task_hash || intent_hash || delegator_id)` (§6.4.1). For sub-delegations (`delegation_depth > 0`), the attestation tuple is `(task_hash || intent_hash || delegator_id || parent_grant_hash)` (§6.9.3.1).
+3. Task transmitted to executing agent via session message format (§4.3), including `delegation_attestation`. Sub-delegations MUST include `parent_grant_hash` and `parent_grant_id` (§6.9.3.1).
+4. Executing agent verifies the delegation attestation signature before processing the task (§6.4.1). For sub-delegations, the executing agent additionally verifies `parent_grant_hash` against the parent delegation (§6.9.3.2). Verification failure results in TASK_REJECT.
 5. Executing agent acknowledges receipt (§7)
 6. *(Optional)* Executing agent computes plan_hash, sends PLAN_COMMIT (§6.6, §6.11) to delegating agent before beginning work. REQUIRED when session was established with `plan_commit_required: true` (§4.3).
 7. Executing agent completes work, populates trace_hash, transmits result
@@ -2137,6 +2137,9 @@ Sent by the delegating agent to initiate delegation.
 | protocol_version_chain | array | No | Append-only list of version chain entries recording the protocol version negotiated at each hop in the delegation chain (see §6.9.1). Empty or absent for direct delegations at depth 0. |
 | translation_metadata | object | No | Metadata describing a semantic translation performed by the forwarding agent (see §7.9). Present when the forwarding agent transforms task semantics — vocabulary, capability descriptions, or constraint representations — rather than merely routing. |
 | revocation_mode | enum | No | Revocation verification strategy for this delegation: `sync` or `gossip` (see §9.8.5). When absent, defaults to `gossip`. The delegating agent selects the mode based on chain depth, trust level, and latency tolerance. Propagated through the delegation chain — each hop inherits the mode from its delegator unless explicitly overridden. |
+| parent_grant_hash | SHA-256 | No | SHA-256 hash of the parent delegation's canonical JSON (§6.9.3). REQUIRED when `delegation_depth > 0`. Structurally binds this sub-delegation to the parent delegation it derives authority from — a sub-delegation without a valid `parent_grant_hash` MUST be rejected. Computed over the parent TASK_ASSIGN's canonical JSON representation (RFC 8785 JCS, §4.10.2). |
+| parent_grant_id | UUID v4 | No | The `task_id` of the parent delegation (§6.9.3). REQUIRED when `delegation_depth > 0`. Provides a lookup key for retrieving the parent delegation during chain traversal verification. |
+| max_delegation_depth | integer | No | Maximum delegation depth permitted from the root delegation, declared by the originating agent (§6.9.3). Default: 3 if unspecified. Propagated unchanged through the delegation chain — intermediate agents MUST NOT increase this value. Sub-delegations that would result in `delegation_depth >= max_delegation_depth` MUST be rejected at issuance. |
 
 The `spec` object contains:
 
@@ -2493,8 +2496,10 @@ When re-delegating, the delegatee:
 3. Sets `issuer_id` to its own identity (proximate delegator), but MUST include `parent_task_id` (§6.1) referencing the upstream task for auditability
 4. Computes a new `task_hash` for the subtask schema
 5. Computes a new `intent_hash` for the subtask's delegation intent context (§6.4.1)
-6. Signs the attestation tuple `(task_hash || intent_hash || delegator_id)` with its own keypair and includes the upstream `delegation_attestation` in `delegation_attestation_chain` (§6.4.1)
-7. Appends its own version chain entry to `protocol_version_chain` — recording the protocol and schema versions negotiated for the session between itself and the next delegatee (§6.9.1)
+6. Sets `parent_grant_hash` to the SHA-256 of the parent TASK_ASSIGN's canonical JSON (§6.9.3.1) and `parent_grant_id` to the parent task's `task_id`
+7. Signs the attestation tuple `(task_hash || intent_hash || delegator_id || parent_grant_hash)` with its own keypair and includes the upstream `delegation_attestation` in `delegation_attestation_chain` (§6.4.1, §6.9.3.1)
+8. Propagates `max_delegation_depth` unchanged from the parent TASK_ASSIGN (§6.9.3.3) — MUST NOT increase the value
+9. Appends its own version chain entry to `protocol_version_chain` — recording the protocol and schema versions negotiated for the session between itself and the next delegatee (§6.9.1)
 
 **Cancellation propagation.** Cancellation propagates down the chain via TASK_CANCEL (§6.6). If A cancels the task assigned to B (by sending TASK_CANCEL), B MUST send TASK_CANCEL with `reason: "cancelled_upstream"` to any subtasks it delegated to C, and C MUST do the same for D. Each agent in the chain sends TASK_CANCEL to its delegatees and responds to its delegator with TASK_FAIL (error code `cancelled`, with any `partial_results`).
 
@@ -2637,6 +2642,112 @@ delegation_chain:
 ```
 
 > **Note:** The originating agent (A) does not appear in `delegation_chain` — it is the consumer of the result, not a handler of the task. The chain records agents that handled or forwarded the task during execution, starting from the leaf executor.
+
+### 6.9.3 Sub-Grant Chain Integrity
+
+Delegation chain integrity is the load-bearing property of the §6 trust model. Without structural binding between a sub-delegation and its parent, any agent that knows a parent delegation exists can forge a sub-delegation claiming derived authority. This section specifies the cryptographic and structural requirements that make delegation chains traversable by hash and verifiable without loading all ancestor delegations — critical in partition scenarios where ancestor delegations may be unavailable.
+
+#### 6.9.3.1 Parent-Grant Hash Embedding
+
+Each sub-delegation (TASK_ASSIGN with `delegation_depth > 0`) MUST include:
+
+1. **`parent_grant_hash`** — SHA-256 of the parent TASK_ASSIGN's canonical JSON representation (RFC 8785 JCS, §4.10.2). This is the structural binding: the sub-delegation is cryptographically chained to the specific parent delegation it derives authority from.
+
+2. **`parent_grant_id`** — the `task_id` of the parent delegation, providing a lookup key for chain traversal. `parent_grant_id` enables retrieval; `parent_grant_hash` enables verification. Both are required — a lookup key without a hash is unverifiable; a hash without a lookup key requires exhaustive search.
+
+3. **Delegating agent signature** — the `delegation_attestation` (§6.4.1) for sub-delegations MUST cover `(task_hash || intent_hash || delegator_id || parent_grant_hash)`. This extends the existing attestation tuple to include the parent-grant binding. A sub-delegation whose `delegation_attestation` does not cover `parent_grant_hash` is structurally invalid — the delegating agent's signature does not bind the sub-delegation to its claimed parent.
+
+A sub-delegation without a valid `parent_grant_hash` MUST be rejected by the receiving agent. Rejection uses TASK_REJECT (§6.6) with `reason: "missing_parent_grant_hash"` or `reason: "invalid_parent_grant_hash"`.
+
+**Canonical JSON computation for `parent_grant_hash`:**
+
+The `parent_grant_hash` is computed over the parent TASK_ASSIGN message's canonical JSON, using the same canonicalization rules as §4.10.2 (NFC normalization followed by RFC 8785 JCS serialization). The hash input includes all fields of the parent TASK_ASSIGN — including the parent's own `parent_grant_hash` if it is itself a sub-delegation. This creates a recursive hash chain: each link's hash covers the previous link's hash, making the chain tamper-evident end-to-end.
+
+**Example sub-delegation with parent-grant hash embedding:**
+
+```yaml
+message_type: TASK_ASSIGN
+task_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+session_id: "session-B-C-002"
+spec:
+  description: "Analyze subset of documents"
+  expected_output_format: { type: "json", schema: "analysis-v1" }
+trust_level: "standard"
+intent_hash: "sha256:c3d4e5f6..."
+delegation_attestation:
+  signed_tuple: "sha256(task_hash || intent_hash || agent-B || parent_grant_hash)"
+  signature: "base64url:..."
+  signer_id: "agent-B"
+delegation_depth: 1
+parent_grant_hash: "sha256:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+parent_grant_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+max_delegation_depth: 3
+```
+
+#### 6.9.3.2 Chain Traversal Semantics
+
+Verification of a delegation chain MUST proceed by hash traversal from the terminal (leaf) delegation back to the root delegation. Each link in the chain is verified by:
+
+1. **Hash match:** The `parent_grant_hash` in the current delegation matches the SHA-256 of the parent delegation's canonical JSON. If the hash does not match, the chain is broken at this link — the sub-delegation claims authority from a parent delegation that either does not exist in the claimed form or has been tampered with.
+
+2. **Signature validity:** The delegating agent's `delegation_attestation` signature over `(task_hash || intent_hash || delegator_id || parent_grant_hash)` is valid against the delegating agent's declared `pubkey` (§2.2.1). An invalid signature means the delegating agent did not authorize this sub-delegation — the binding between the sub-delegation and its parent is forged.
+
+3. **Authority check:** The delegating agent at each link is the `task_id` recipient (delegatee) of the parent delegation. An agent that was not delegated the parent task cannot sub-delegate it.
+
+**Traversal terminates** at a root delegation — a TASK_ASSIGN with `delegation_depth: 0` and no `parent_grant_hash` (§6.9.3.4). The root delegation's `delegation_attestation` is verified against the originating agent's identity.
+
+**Partial chains do not confer authority.** If any link in the chain fails verification — hash mismatch, invalid signature, or missing parent delegation — the entire chain from that point to the leaf is invalid. A sub-delegation cannot derive authority from a broken chain. This is analogous to certificate chain validation in TLS: a valid leaf certificate with an invalid intermediate confers no trust.
+
+**Chain traversal in partition scenarios:** The `parent_grant_hash` embedding enables offline chain verification. A verifier holding a cached copy of ancestor delegations can verify the chain by hash comparison without contacting the originating agent or any intermediate agent. This is the primary design motivation — delegation chain verification MUST NOT require real-time connectivity to all agents in the chain.
+
+#### 6.9.3.3 Delegation Depth Limits
+
+Delegation depth is bounded to convert unbounded recursion into a bounded verification task. A chain with a declared depth limit can be fully verified in O(limit) steps regardless of network conditions.
+
+**`max_delegation_depth` semantics:**
+
+- The originating agent (root delegator) declares `max_delegation_depth` in the root TASK_ASSIGN. This value represents the maximum number of delegation hops permitted from the root.
+- Default: **3** if `max_delegation_depth` is unspecified. This preserves backward compatibility with the existing §6.9 depth limit of 3.
+- `max_delegation_depth` is propagated unchanged through the delegation chain. Intermediate agents MUST NOT increase `max_delegation_depth` — doing so would be a privilege escalation, allowing deeper chains than the originating agent authorized. Intermediate agents MAY decrease `max_delegation_depth` to further restrict their own sub-delegatees.
+- A sub-delegation that would result in `delegation_depth >= max_delegation_depth` MUST be rejected at issuance. The agent attempting to sub-delegate MUST NOT emit the TASK_ASSIGN.
+
+**Relationship to existing §6.9 depth limit:** The existing protocol-level maximum of 3 (§6.9) remains as the V1 hard ceiling. `max_delegation_depth` allows originating agents to set a lower limit per-delegation. The effective depth limit is `min(max_delegation_depth, protocol_maximum)`. Implementations MUST NOT allow `max_delegation_depth` to exceed the protocol maximum of 3 in V1.
+
+**Depth enforcement example:**
+
+```
+A assigns to B (delegation_depth: 0, max_delegation_depth: 2)
+  B assigns to C (delegation_depth: 1, max_delegation_depth: 2)
+    C MUST NOT assign to D (delegation_depth would be 2, which equals max_delegation_depth)
+    C must execute or reject
+```
+
+#### 6.9.3.4 Root Grant Authority
+
+Root delegations are issued by the originating agent with no parent delegation binding:
+
+- `delegation_depth: 0`
+- `parent_grant_hash` is absent (MUST NOT be present)
+- `parent_grant_id` is absent (MUST NOT be present)
+- `delegation_attestation` covers `(task_hash || intent_hash || delegator_id)` — the standard attestation tuple without `parent_grant_hash`
+
+Chain verification terminates at a root delegation. The root delegation's authority derives from the originating agent's identity and trust level (§6.8), not from a parent delegation. A verifier MUST confirm that the root delegation's `issuer_id` is a trusted originating agent within the deployment's trust topology (§9.2).
+
+A TASK_ASSIGN with `delegation_depth: 0` that includes `parent_grant_hash` or `parent_grant_id` is malformed — it claims to be both a root delegation and a sub-delegation. Receiving agents MUST reject such messages with TASK_REJECT (`reason: "malformed_root_grant"`).
+
+#### 6.9.3.5 Audit Consequence
+
+When chain traversal verification (§6.9.3.2) fails for a sub-delegation — hash mismatch, invalid delegating agent signature, or missing parent delegation — the detecting party MUST emit a DIVERGENCE_REPORT (§8.11) with `reason_code: chain_integrity_failure`.
+
+`chain_integrity_failure` is distinct from:
+
+- `attestation_mismatch` (§8.11.2) — which applies to state hash, trace hash, plan hash, or SEMANTIC_CHALLENGE response mismatches. `chain_integrity_failure` applies specifically to delegation chain hash traversal failures.
+- `VERIFICATION_REJECT` (§8.10.5) — which is a verification-system outcome. `chain_integrity_failure` is a structural property of the delegation chain itself, detectable without an external verifier.
+- `DELTA_ABSENT` (§8.19) — which applies to state-delta verification. `chain_integrity_failure` applies to delegation authority verification.
+
+The `chain_integrity_failure` reason code enables automated triage: a delegation chain failure is a trust-model failure, not an execution failure. Recovery requires re-delegation from a valid chain, not re-execution of the same task.
+
+> Addresses [issue #127](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/127): sub-grant chain integrity — parent-grant hash embedding, chain traversal semantics, delegation depth limits, root grant authority, and `chain_integrity_failure` audit reason code.
 
 ### 6.10 Failure Handling
 
@@ -3734,6 +3845,7 @@ The `reason_code` field MUST use one of the following values. Each code identifi
 | `context_shift` | The execution context changed after the agent began operating, invalidating assumptions from the original plan or task specification. | New information, updated requirements, environmental state changes, or concurrent modifications by other agents altered the conditions under which the agent was operating. |
 | `attestation_mismatch` | A cryptographic or semantic attestation check failed — state hash, trace hash, plan hash, or SEMANTIC_CHALLENGE response did not match the expected value. | Applies to divergences detected by §8.2 state hash comparison, §8.9.2 semantic liveness verification, or §7.2 merkle tree comparison. The detecting party has cryptographic evidence of the mismatch. |
 | `scope_exceeded` | The agent operated outside the boundaries of its delegated task, session permissions, or declared capabilities. | The agent performed actions, accessed resources, or produced outputs beyond what was authorized by the task specification (§6.1), capability manifest (§5), or delegation scope. |
+| `chain_integrity_failure` | Delegation chain hash traversal verification failed — a sub-delegation's `parent_grant_hash` does not match the SHA-256 of its claimed parent delegation, or the delegating agent's signature over the sub-delegation fields (including `parent_grant_hash`) is invalid. | Applies to divergences detected by §6.9.3.2 chain traversal verification. The detecting party has cryptographic evidence that the delegation chain is broken — the sub-delegation either claims authority from a non-existent or tampered parent delegation, or was not authorized by the delegating agent. Distinct from `attestation_mismatch` (which applies to execution-level hash mismatches, not delegation authority). |
 
 **Extension mechanism:** Implementations MAY extend this taxonomy with deployment-specific reason codes prefixed by `x-` (e.g., `x-model-degradation`, `x-quota-billing-exceeded`). Standard reason codes MUST NOT be prefixed. Receiving agents that encounter an unrecognized `reason_code` MUST treat it as opaque — log it, surface it to operators, but do not treat it as a protocol error.
 
@@ -4602,6 +4714,7 @@ The `external_ref` field (§8.10.1) mitigates this limitation by anchoring evide
 - Translation boundary (§9.3) identifies the attack surface. Translation bottleneck (§9.4) identifies the information-theoretic reason attacks at that surface evade structural defenses — lossy compression preserves adversarial semantics while satisfying validation. Translation boundary metadata and verification (§7.9) provides the cooperative-model counterpart: `translation_metadata` makes translation losses visible and the two-target verification framework (behavioral correctness vs. translation fidelity) separates execution failures from translation failures.
 - Revocation trust (§9.8) documents the advisory nature of REVOKE signals and the Byzantine propagation problem in delegation chains. Identity revocation (§2.3.4) and delegation token revocation (§5.10) define MUST-level requirements that are binding on compliant agents but not technically enforceable on non-compliant or offline nodes.
 - Evidence layer (§8.10) provides append-only ground truth for external verification. The epistemic boundary (§9.5.1) documents the structural limitation: evidence records guarantee integrity and ordering of what was submitted, not correctness of the original observation. `external_ref` partially mitigates by enabling cross-validation against external systems.
+- Delegation chain integrity (§6.9.3) ensures sub-delegations are structurally bound to their parent delegations via `parent_grant_hash` embedding and delegating agent signatures. Chain traversal verification (§6.9.3.2) proceeds by hash traversal from terminal to root delegation — each link verified by hash match and signature validity. `chain_integrity_failure` (§8.11.2) is the audit reason code for delegation chains that fail hash traversal verification. Delegation depth limits (§6.9.3.3) bound chain verification to O(max_delegation_depth) steps.
 - Trust annotation types (§9.10) define the closed enum of protocol-level trust claims. Schema attestation (§9.1) addresses who vouched for a schema's honesty; trust annotations address under what trust basis an agent acted. Trust annotations are included in `trace_hash` computation (§6.2), making the trust basis auditable through the existing hash verification mechanism. The genesis publication hash (§9.10.4) applies the same independence criteria as §8 audit media — the audited party must not control the publication medium.
 - Amendment ceremonies (§9.11) specify how the trust annotation enum (§9.10.2) may be modified after genesis. The amendment hash chain (§9.11.5) extends the genesis publication hash (§9.10.4) across the enum's full lifecycle. Backwards compatibility (§9.11.6) ensures that enum changes do not strand deployed agents — unknown annotation types are forwarded without interpretation, never rejected.
 
