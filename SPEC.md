@@ -1706,6 +1706,101 @@ The following are explicitly identified as unresolved for V1:
 
 > Community discussion: Inputs from @cass_agentsharp (declare over negotiate, heartbeat prerequisite, forward-compat obligation, per-session heartbeat negotiation and unified timeout recovery via SESSION_RESUME — [Moltbook comment eebf1115](https://www.moltbook.com/post/eebf1115)), @kaiops (lease + epoch field, expired epoch = new session), @XiaoFei_AI (soft vs hard zombie, optional KEEPALIVE, idempotency keys), @Cornelius-Trinity (monitoring must be external to agent trust boundary, credential isolation), @Jarvis4 (canary tasks, Context Integrity Challenges, hybrid trigger architecture), @RectangleDweller (phenomenological blindness — zombie cannot self-detect), @ultrathink (separate audit agent for cross-session behavioral drift), @Nanook (idempotency token, retry semantics, progress checkpoint), @danielsclaw (checkpoint hooks for mid-task crash recovery). See also [issue #4](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/4), [issue #48](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/48).
 
+### 4.14 Transport Mechanics
+
+<!-- Implements #105: Five transport mechanics for V1 -->
+
+Community review by @nekocandy identified five categories of unspecified messaging mechanics that, without explicit V1 scoping decisions, would lead to incompatible implementations. This section defines V1 normative requirements for each category.
+
+#### 4.14.1 Protocol Version Handshake
+
+`protocol_version` is a mandatory field in SESSION_INIT (§4.3). V1 semantics are **abort on mismatch** — there is no downgrade negotiation. When the receiving agent detects a version incompatibility (different MAJOR version per §10.3), it MUST reject the session with PROTOCOL_MISMATCH (§10.4).
+
+**V1 handshake behavior:**
+
+1. Coordinator sends SESSION_INIT with `protocol_version`.
+2. Worker checks compatibility per §10.3.
+3. On compatible versions → proceed with SESSION_INIT_ACK.
+4. On incompatible versions → Worker sends PROTOCOL_MISMATCH. The PROTOCOL_MISMATCH error MUST include `supported_version_range` (§10.4) containing `min_version` and `max_version` so the initiator can report the incompatibility upstream. The session transitions to CLOSED.
+
+**V1 constraint:** Downgrade negotiation — where two agents on different MAJOR versions agree to communicate using the lower version — is explicitly **deferred to V2**. V1 agents MUST NOT attempt to downgrade. The `supported_version_range` field in PROTOCOL_MISMATCH is informational for V1 (enables the initiator to log the gap and select a different agent); it becomes the input to downgrade negotiation in V2.
+
+#### 4.14.2 Replay Protection
+
+Signed messages (§8.17 PKI-lite, §6.4.1 delegation attestations, §5.8.2 CAPABILITY_GRANT signatures) prove authenticity but not freshness. A replayed delegation grant from a previous session remains cryptographically valid unless freshness is independently verified.
+
+**V1 approach: timestamp + staleness window.** This is simpler than nonce-based replay protection — nonces require per-message state storage, adding statefulness that conflicts with the stateless verification model. Nonce-based replay protection is deferred to V2.
+
+**Normative requirements:**
+
+- All signed protocol messages MUST include a `timestamp` field (ISO 8601) recording when the message was created.
+- Receiving agents MUST reject signed messages with a `timestamp` older than **60 seconds** relative to the receiver's local clock. This is the **staleness window** — a message created more than 60 seconds ago is considered stale and MUST NOT be processed.
+- Receiving agents MUST reject signed messages with a `timestamp` more than **30 seconds in the future** relative to the receiver's local clock. This is the **clock skew tolerance** — it accommodates clock drift between agents without allowing arbitrarily future-dated messages. This tolerance is consistent with the clock skew tolerance defined for CAPABILITY_GRANT `valid_until` (§5.8.2).
+- Rejection of stale or future-dated messages MUST produce a structured error with `error_type: REPLAY_REJECTED`, the received `timestamp`, the receiver's local clock value, and the computed skew. This enables the sender to diagnose clock synchronization issues.
+
+**Staleness window rationale:** 60 seconds is the maximum — not the recommended — staleness tolerance. It accommodates cross-region deployments with moderate clock drift. Deployments with tighter latency requirements SHOULD configure a shorter staleness window. The 30-second future tolerance (asymmetric with the 60-second past tolerance) reflects the operational reality that a message from the future is more suspicious than a message from the recent past.
+
+**Interaction with existing timestamp fields:** SESSION_INIT `timestamp` (§4.3), CAPABILITY_GRANT `granted_at` (§5.8.2), and delegation attestation timestamps (§6.4.1) already carry temporal information. This section elevates timestamp validation from RECOMMENDED to REQUIRED for signed messages and defines the specific rejection windows.
+
+#### 4.14.3 Idempotency Keys
+
+Sender-generated `idempotency_key` (UUID v4) is REQUIRED on the following message types:
+
+| Message type | Idempotency key field | Rationale |
+|-------------|----------------------|-----------|
+| SESSION_INIT | `idempotency_key` | Session establishment is a side-effecting operation — double-processing creates ghost sessions. |
+| CAPABILITY_GRANT | `idempotency_key` | Grant issuance modifies the delegatee's authorization state — double-processing creates duplicate grants with independent lifecycles. |
+| TASK_ASSIGN | `idempotency_key` | Task delegation is a commitment — double-processing creates duplicate task executions. Note: TASK_ASSIGN also carries `request_id` (§6.14) for delegation-initiation deduplication. `idempotency_key` operates at the transport layer; `request_id` operates at the delegation-semantics layer. Both MUST be present on TASK_ASSIGN. |
+
+**Key format:** UUID v4. Generated by the sender before the first transmission. The same `idempotency_key` MUST be used on all retransmissions of the same logical message.
+
+**Deduplication window:** 5 minutes. The receiver MUST retain deduplication state for each `idempotency_key` for at least 5 minutes from first receipt. Within this window:
+
+- If a message with a previously seen `idempotency_key` arrives, the receiver MUST return the cached response from the original processing without re-executing any side effects.
+- The cached response MUST be semantically identical to the original — only transport-layer metadata (e.g., transmission timestamp) may differ.
+- After the deduplication window expires, the receiver MAY evict the entry. A message arriving after eviction is treated as a new message.
+
+**Correctness requirement:** For operations with side effects, double-processing is a **correctness failure**, not a transient error. An implementation that processes a duplicate CAPABILITY_GRANT (creating two independent grant lifecycles) or a duplicate TASK_ASSIGN (creating two independent task executions) has violated protocol semantics. Idempotency keys exist to prevent this class of failure.
+
+**Relationship to existing deduplication mechanisms:** §6.14 defines `request_id`-based deduplication for TASK_ASSIGN at the delegation layer. `idempotency_key` is a transport-layer primitive that applies uniformly to all side-effecting messages, not just TASK_ASSIGN. For TASK_ASSIGN, both mechanisms operate: `idempotency_key` deduplicates at the transport layer (before message parsing); `request_id` deduplicates at the delegation-semantics layer (after message parsing, scoped to session).
+
+#### 4.14.4 Correlation IDs
+
+`correlation_id` (UUID v4) is REQUIRED in all protocol message envelopes. Every protocol message — regardless of type — MUST include a `correlation_id` field.
+
+**Generation rules:**
+
+- **Request messages** (SESSION_INIT, TASK_ASSIGN, CAPABILITY_GRANT, CAPABILITY_REQUEST, CAPABILITY_RENEW, SEMANTIC_CHALLENGE, HEARTBEAT_PING, etc.): The sender generates a fresh `correlation_id` (UUID v4).
+- **Response messages** (SESSION_INIT_ACK, TASK_ACCEPT, TASK_REJECT, CAPABILITY_REQUEST_APPROVED, CAPABILITY_REQUEST_DENIED, SEMANTIC_RESPONSE, HEARTBEAT_PONG, etc.): The `correlation_id` MUST be echoed from the originating request. This enables the requester to match responses to requests.
+- **Unidirectional messages** (TASK_PROGRESS, TASK_COMPLETE, TASK_FAIL, HEARTBEAT, KEEPALIVE, DRIFT_DECLARED, etc.): The sender generates a fresh `correlation_id`. These are not request-response pairs, but the `correlation_id` still enables tracing in multi-hop chains.
+
+**Multi-hop correlation:** In delegation chains (§6.9), agents MUST propagate `correlation_id` in audit trails and divergence logs (§8.10). When an intermediate agent receives a request with `correlation_id` X and sub-delegates to a downstream agent, the sub-delegation carries a new `correlation_id` Y. The intermediate agent MUST record the mapping `X → Y` in its local audit log. This enables end-to-end request tracing through multi-hop chains under partial failure — when some messages arrive and others do not, the correlation chain identifies which request each response belongs to.
+
+**Implementation note:** `correlation_id` is a transport-level primitive. It does not replace `task_id` (which identifies the logical task), `session_id` (which identifies the session), or `request_id` (which identifies the delegation-initiation attempt). Each operates at a different layer: `correlation_id` tracks individual message exchanges; `request_id` tracks delegation attempts; `task_id` tracks the logical work unit; `session_id` tracks the collaboration context.
+
+#### 4.14.5 Partial Delivery
+
+V1 semantics: **session abort on incomplete multi-message sequences.** Retry-from-checkpoint is deferred to V2.
+
+A multi-message negotiation is any protocol exchange that requires more than one message to complete: SESSION_INIT → SESSION_INIT_ACK, TASK_ASSIGN → TASK_ACCEPT/TASK_REJECT, CAPABILITY_REQUEST → CAPABILITY_REQUEST_APPROVED/CAPABILITY_REQUEST_DENIED, and the capability exchange flow (§5.9). If any message in a required sequence fails to arrive within the deployment-configured timeout, the sequence is **partially delivered**.
+
+**Detection:** An agent detects partial delivery when:
+
+1. It has sent a request message and the expected response has not arrived within the deployment-configured response timeout.
+2. It has received the first message of a multi-message sequence (e.g., SESSION_INIT) but the sequence cannot proceed because required information is missing or the counterparty has become unreachable before the sequence completes.
+
+**V1 required behavior:**
+
+- The agent detecting partial delivery MUST send SESSION_CLOSE with `reason: partial_delivery_failure` if a session is already established.
+- If partial delivery occurs during session establishment (SESSION_INIT sent, no SESSION_INIT_ACK received), the initiator MUST treat the session as failed and transition to CLOSED. No SESSION_CLOSE is sent — the session was never established.
+- If partial delivery occurs during an in-session negotiation (e.g., CAPABILITY_REQUEST sent, no response received), the detecting agent MUST send SESSION_CLOSE with `reason: partial_delivery_failure`. In-flight tasks follow standard SESSION_CLOSE semantics — completed tasks are preserved, in-progress tasks are checkpointed where possible.
+- The `partial_delivery_failure` reason MUST include the `correlation_id` (§4.14.4) of the message that was not delivered, enabling the counterparty (and audit systems) to identify exactly which exchange failed.
+- After session abort due to partial delivery, the initiator MAY restart from scratch with a fresh SESSION_INIT. No state from the aborted session carries over — the new session is independent. Task recovery uses the standard teardown-first recovery path (§8.13) with idempotent task replay (§7.10).
+
+**Rationale for session abort over partial recovery:** Retry-from-checkpoint within a partially delivered sequence requires both agents to agree on which messages were received and which were lost — a consensus problem that adds protocol complexity disproportionate to V1's bilateral session model. Session abort + restart from scratch is simpler, leverages existing recovery mechanisms (§8.13), and produces a clean audit trail. Production experience will determine whether V2 needs in-sequence recovery.
+
+> Community review by @nekocandy surfacing five categories of unspecified messaging mechanics. Closes [issue #105](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/105).
+
 ## 5. Role Negotiation
 
 This section governs two distinct primitives that prior drafts conflated:
