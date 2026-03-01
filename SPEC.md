@@ -5377,6 +5377,40 @@ The sub-grant schema and validation rules in this section are consistent with an
 
 > V1 hop-local chain integrity primitive for §7 progress reporting sub-delegations. Full ZK proof-based chain verification (issues #126, #129, #109) is deferred to V2. Addresses [issue #93](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/93).
 
+### 7.13 Discovery Hygiene and Bootstrap Limitations
+
+§7.12 addresses the **forgery** case in adversarial delegation chains: B cannot fabricate or misrepresent a parent grant A never issued, because `parent_grant_hash` cryptographically binds each sub-grant to its parent. A distinct failure mode — **omission** — remains outside V1 scope and is documented here as a known limitation of the bilateral session model.
+
+#### 7.13.1 The Omission Problem
+
+B controls the introduction channel to C. In all delegation flows (§6.9.3, §7.12), C learns about A's existence exclusively through B — via the sub-grant B issues and the parent grant metadata B provides. B can therefore sandbox C into a world where A does not exist: omitting A's existence entirely, providing no `parent_grant_id`, or pointing C to an incorrect manifest URL.
+
+Unlike the forgery case (§7.12), omission has no cryptographic solution within the bilateral session model. Cryptographic verification requires a reference value to verify against — C must already possess or be able to independently obtain A's manifest or grant. If B never introduces A, C has nothing to verify. No signature, hash, or attestation can detect a reference that was never provided.
+
+#### 7.13.2 V1 Scope Statement
+
+§7.12 `parent_grant_hash` addresses **forgery**: B misrepresents A's grant content — C can detect this because C holds the parent grant and can recompute the hash. It does not address **omission**: B never introduces A — C cannot detect this because C has no reference to verify against.
+
+Both forgery and omission are required for a complete adversarial delegation threat model in multi-hop chains. V1 covers forgery only. Omission requires protocol-level discovery primitives outside the current bilateral session architecture — these are deferred to V2.
+
+#### 7.13.3 Compliant vs Trustworthy
+
+A hop-locally-valid chain (satisfying §7.12 validation) is **necessary but not sufficient** for end-to-end trust in multi-hop delegation chains. An adversarial B can omit A's existence while passing all §7.12 protocol checks — every `parent_grant_hash` verifies correctly, every delegation depth constraint holds, and every sub-grant schema validates — yet C operates under a fabricated delegation topology where upstream principals are invisible.
+
+Protocol compliance (§7.12 chain integrity, §6.9.3 delegation semantics) establishes structural correctness. It does not establish completeness of the delegation chain as seen by downstream agents. Consumers of delegation chain verification results MUST NOT treat hop-local validity as proof that the full delegation topology has been disclosed.
+
+#### 7.13.4 V2 Direction (Non-Normative)
+
+Candidate mechanisms for addressing the omission problem include:
+
+1. **Out-of-band agent discovery.** A public or federated registry that C can query independently of B to discover A's canonical identity and manifest. C verifies the delegation chain against registry-provided data rather than relying solely on B's introduction.
+2. **Manifest-embedded known-peers lists.** Agent manifests include a list of known collaborators or upstream delegators, enabling gossip-seeded discovery. C can cross-reference B's manifest claims against independently obtained peer lists.
+3. **Session metadata propagation at initiation time.** SESSION_INITIATE or TASK_ASSIGN messages carry upstream principal metadata (identities, manifest URLs) that C can verify against out-of-band sources.
+
+All three mechanisms require infrastructure outside the bilateral session model: registries, gossip networks, or multi-party metadata propagation. The bootstrap problem — how C learns A's canonical identity independent of B — remains open in V1.
+
+> V1 limitation: discovery hygiene and the omission problem in adversarial delegation chains. §7.12 covers forgery; omission is deferred to V2. Cross-references: §7.12 (forgery case), §6.9.3 (delegation chain integrity). Addresses [issue #117](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/117).
+
 ## 8. Error Handling
 
 ### 8.1 Zombie State Definition
