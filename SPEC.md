@@ -7658,7 +7658,7 @@ Typos, non-semantic language corrections, editorial improvements with no behavio
 
 **Observable Tier 1 criteria:** A change qualifies as Tier 1 only if it is limited to prose, formatting, cross-reference text, or typographic corrections that alter no behavioral specification. The observable test is: no agent implementation would need to change code, configuration, or runtime behavior as a result of the change. If an implementation could produce different outputs, accept different inputs, or make different decisions after the change, it is not Tier 1.
 
-Tier 1 process: documented proposal published with justification, followed by a **no-objection window of 7 days** from active implementors (§9.11.3). If no objections are raised within the window, the change is ratified. No full ceremony is required.
+Tier 1 process: documented proposal published with justification, followed by a **no-objection window of 7 days** from active implementors (§9.11.3). The applicable quorum for the no-objection window is determined by the governance tier (§9.11.3 governance tier quorum defaults table). If no objections are raised within the window, the change is ratified. No full ceremony is required.
 
 **Tier 2 — Semantic changes:**
 
@@ -7666,7 +7666,7 @@ New annotation type, modified verification behavior, deprecated annotation type,
 
 **Observable Tier 2 criteria:** A change is Tier 2 if it affects field semantics, message formats, required behaviors, interoperability guarantees, audit event schemas, or enumeration values. The observable test is: any change where at least one conforming implementation would need to modify code, alter validation logic, update message processing, or change runtime behavior to remain conformant after the change. Tier 2 is the default classification — a change is Tier 2 unless it can be affirmatively demonstrated to meet the Tier 1 observable criteria.
 
-Tier 2 process: full amendment ceremony required, with rigor comparable to genesis. The minimum 14-day deliberation window (§9.11.1) applies. The participant threshold (§9.11.3) must be met. The amendment record (§9.11.4) must be produced. Tier 2 amendments continue to require a major version increment per §9.10.3.
+Tier 2 process: full amendment ceremony required, with rigor comparable to genesis. The minimum 14-day deliberation window (§9.11.1) applies. The participant threshold (§9.11.3) must be met, with the applicable quorum determined by the governance tier (§9.11.3 governance tier quorum defaults table) — STANDARD for routine amendments, STRUCTURAL for changes targeting governance, trust model, or versioning sections. The amendment record (§9.11.4) must be produced. Tier 2 amendments continue to require a major version increment per §9.10.3.
 
 **Worked examples at the tier boundary:**
 
@@ -7686,7 +7686,23 @@ These examples are not exhaustive. The general principle is: observable impact o
 
 **Genesis ceremony participants** (§9.10.3) have permanent standing as active implementors. Their standing does not expire and does not require re-qualification. This ensures that the original ceremony participants retain governance authority over the artifact they defined.
 
-**Quorum** for Tier 2 amendment ceremonies = majority of active implementors recorded on the amendment record at proposal time. The active implementor list is fixed at proposal time to prevent quorum manipulation during the deliberation window — adding or removing implementors after a proposal is published does not change the quorum requirement for that proposal.
+**Quorum** thresholds for amendment ceremonies are determined by the governance tier of the amendment, as defined in the governance tier quorum defaults table below. The active implementor list is fixed at proposal time to prevent quorum manipulation during the deliberation window — adding or removing implementors after a proposal is published does not change the quorum requirement for that proposal.
+
+**Governance Tier Quorum Defaults**
+
+The protocol defines three governance tiers with default quorum thresholds. These defaults ensure interoperability — implementors apply the same governance requirements without out-of-band negotiation.
+
+| Governance Tier | Applies To | Default Quorum Threshold | Rationale |
+|-----------------|------------|--------------------------|-----------|
+| **BOOTSTRAP** | Genesis ceremony (§9.10.3) | No quorum required | No pre-existing governance body exists at genesis. The genesis ceremony establishes the initial governance participants; requiring a quorum of a body that does not yet exist is a logical impossibility. |
+| **STANDARD** | Routine amendments — Tier 1 cosmetic (§9.11.2) and Tier 2 semantic (§9.11.2) changes under the normal amendment ceremony (§9.11) | Simple majority (>50% of active implementors at proposal time) | Routine amendments follow the standard deliberation process with tier-appropriate ceremony windows. Simple majority balances governance participation against amendment velocity for non-structural changes. |
+| **STRUCTURAL** | Protocol-level changes — modifications to governance procedures (§9.11, §9.12), trust model foundations (§9.10), or versioning guarantees (§10) via the standard amendment path | Supermajority (≥66% of active implementors at proposal time) | Changes to the governance framework itself or to foundational protocol invariants require broader consensus than routine amendments. A simple majority modifying the rules by which majorities are determined is a governance capture vector. |
+
+**Tier assignment is determined by the amendment's target sections**, not by the proposer's classification. An amendment that modifies any section listed under STRUCTURAL governance — even if the modification appears cosmetic under the legitimacy tier criteria (§9.11.2) — requires the STRUCTURAL quorum threshold. The legitimacy tier (§9.11.2) determines the ceremony process (deliberation window length, no-objection vs. full ceremony); the governance tier determines the quorum threshold. These are orthogonal dimensions: a Tier 1 cosmetic change to a STRUCTURAL section still requires supermajority quorum during its no-objection window, and a Tier 2 semantic change to a non-structural section requires only simple majority.
+
+**Relationship to emergency amendments (§11):** Emergency amendments operate under §11's own quorum requirements (unanimous coordinating committee sign-off, §11.2.2), which are strictly above the STRUCTURAL default. The governance tier defaults defined here apply to the standard amendment path (§9.11) only. Emergency amendments are not subject to tier-based quorum defaults — they are subject to §11.2.2 exclusively.
+
+> Implements [issue #209](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/209): governance tier quorum defaults for amendment ceremonies. Defines three governance tiers (BOOTSTRAP, STANDARD, STRUCTURAL) with explicit default quorum thresholds, eliminating the need for out-of-band agreement on amendment quorum requirements. Closes #209.
 
 #### 9.11.4 Amendment Record
 
@@ -7695,7 +7711,7 @@ A ratified amendment ceremony produces an **amendment record** containing:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | proposed_changes | object | Yes | The proposed modifications to the trust annotation enum, with full justification for each change. Includes the demonstrated vocabulary gap (§9.11.1) and the tier classification (§9.11.2). |
-| participant_list | array | Yes | Active implementors at proposal time, with acknowledgment status for each. For Tier 2: quorum (majority) must have acknowledged. For Tier 1: no-objection from active implementors within the 7-day window. |
+| participant_list | array | Yes | Active implementors at proposal time, with acknowledgment status for each. For Tier 2: quorum per the applicable governance tier threshold (§9.11.3 governance tier quorum defaults table) must have acknowledged. For Tier 1: no-objection from active implementors within the 7-day window, with quorum per the applicable governance tier. |
 | deliberation_window_open | timestamp | Yes | ISO 8601 timestamp of when the deliberation window opened (proposal publication time). |
 | deliberation_window_close | timestamp | Yes | ISO 8601 timestamp of when the deliberation window closed (minimum 14 days after open for Tier 2, minimum 7 days for Tier 1). |
 | ratification_timestamp | timestamp | Yes | ISO 8601 timestamp of when the amendment was ratified. Must be after `deliberation_window_close`. |
@@ -8045,7 +8061,7 @@ The committee membership list is derived, not appointed. No party can add or rem
 | Extend the public comment window (§11.4) | Any single committee member | Extension is the conservative action |
 | Shorten the public comment window | **Not permitted** | The 72-hour window is a minimum, not a target |
 
-**Unanimity for ratification is non-negotiable.** A supermajority threshold (e.g., 2/3 or 3/4) creates a viable capture target — an adversary needs to compromise fewer than all committee members. Unanimity means every committee member is a veto point. The cost of a single holdout blocking a legitimate emergency amendment is bounded (the standard amendment path remains available). The cost of a captured supermajority overriding protocol invariants is unbounded.
+**Unanimity for ratification is non-negotiable.** A supermajority threshold (e.g., 2/3 or 3/4) creates a viable capture target — an adversary needs to compromise fewer than all committee members. Unanimity means every committee member is a veto point. The cost of a single holdout blocking a legitimate emergency amendment is bounded (the standard amendment path remains available). The cost of a captured supermajority overriding protocol invariants is unbounded. Note that emergency amendment quorum (unanimous) is strictly above the STRUCTURAL governance tier default (≥66%, §9.11.3 governance tier quorum defaults table), preserving the activation difficulty invariant (§11.4).
 
 **Absent committee members.** A committee member who does not respond within the 72-hour public comment window is treated as a non-ratification. Silence is not consent. An emergency amendment cannot proceed if any committee member is unreachable. This is a deliberate friction point — it ensures that emergency amendments cannot be rushed through during periods when committee members are unavailable.
 
@@ -8133,7 +8149,7 @@ The emergency amendment procedure MUST be strictly harder to satisfy than the pr
 
 | Dimension | Standard amendment (§9.11) | Emergency amendment (§11) |
 |-----------|---------------------------|---------------------------|
-| Quorum | Majority of active implementors | Unanimous coordinating committee (subset of active implementors with genesis standing) |
+| Quorum | Per governance tier: STANDARD >50%, STRUCTURAL ≥66% (§9.11.3) | Unanimous coordinating committee (subset of active implementors with genesis standing) |
 | Minimum timeline | 7 days (Tier 1) or 14 days (Tier 2) | 72 hours comment window + sign-off collection + 30-day rate limit between amendments |
 | Scope restriction | Any protocol section | Only sections containing invariants, and only when a demonstrated defect exists |
 | Session precondition | None | No active sessions in affected scope |
