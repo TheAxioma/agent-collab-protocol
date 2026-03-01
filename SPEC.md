@@ -2106,13 +2106,15 @@ The `divergence_log` entry for an attestation failure MUST include:
 ### 6.5 Delegation Protocol
 
 1. Delegating agent constructs task schema, computes task_hash and intent_hash, sets issued_at
-2. Delegating agent signs the attestation tuple `(task_hash || intent_hash || delegator_id)` (§6.4.1). For sub-delegations (`delegation_depth > 0`), the attestation tuple is `(task_hash || intent_hash || delegator_id || parent_grant_hash)` (§6.9.3.1).
-3. Task transmitted to executing agent via session message format (§4.3), including `delegation_attestation`. Sub-delegations MUST include `parent_grant_hash` and `parent_grant_id` (§6.9.3.1).
-4. Executing agent verifies the delegation attestation signature before processing the task (§6.4.1). For sub-delegations, the executing agent additionally verifies `parent_grant_hash` against the parent delegation (§6.9.3.2). Verification failure results in TASK_REJECT.
-5. Executing agent acknowledges receipt (§7)
-6. *(Optional)* Executing agent computes plan_hash, sends PLAN_COMMIT (§6.6, §6.11) to delegating agent before beginning work. REQUIRED when session was established with `plan_commit_required: true` (§4.3).
-7. Executing agent completes work, populates trace_hash, transmits result
-8. Delegating agent verifies task_hash and intent_hash integrity; optionally validates trace_hash against expected behavior. If PLAN_COMMIT was received, delegating agent verifies plan_hash_ref in the result for three-level alignment (§6.11).
+2. Delegating agent generates a `request_id` (UUID v4) for the delegation-initiation attempt (§6.14). The same `request_id` MUST be used on all retransmissions of this TASK_ASSIGN.
+3. Delegating agent signs the attestation tuple `(task_hash || intent_hash || delegator_id)` (§6.4.1). For sub-delegations (`delegation_depth > 0`), the attestation tuple is `(task_hash || intent_hash || delegator_id || parent_grant_hash)` (§6.9.3.1).
+4. Task transmitted to executing agent via session message format (§4.3), including `delegation_attestation` and `request_id`. Sub-delegations MUST include `parent_grant_hash` and `parent_grant_id` (§6.9.3.1).
+5. Executing agent deduplicates on `request_id` (§6.14). If a TASK_ASSIGN with the same `request_id` was already processed within the idempotency window, the delegatee returns the cached response without re-executing.
+6. Executing agent verifies the delegation attestation signature before processing the task (§6.4.1). For sub-delegations, the executing agent additionally verifies `parent_grant_hash` against the parent delegation (§6.9.3.2). Verification failure results in TASK_REJECT.
+7. Executing agent acknowledges receipt (§7)
+8. *(Optional)* Executing agent computes plan_hash, sends PLAN_COMMIT (§6.6, §6.11) to delegating agent before beginning work. REQUIRED when session was established with `plan_commit_required: true` (§4.3).
+9. Executing agent completes work, populates trace_hash, transmits result
+10. Delegating agent verifies task_hash and intent_hash integrity; optionally validates trace_hash against expected behavior. If PLAN_COMMIT was received, delegating agent verifies plan_hash_ref in the result for three-level alignment (§6.11).
 
 ### 6.6 Delegation Message Types
 
@@ -2127,6 +2129,7 @@ Sent by the delegating agent to initiate delegation.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | task_id | UUID v4 | Yes | Unique task instance identifier (from §6.1) |
+| request_id | UUID v4 | Yes | Stable delegation-initiation identifier for deduplication. Generated once at initiation time, before the first transmission. The same `request_id` MUST be used on all retries for the same delegation attempt. Distinct from `task_id` — `task_id` identifies the task; `request_id` identifies the delivery attempt. See §6.14. |
 | session_id | string | Yes | Active session identifier binding this delegation to a collaboration session |
 | spec | object | Yes | Task specification (see below) |
 | trust_level | enum | Yes | Trust level granted to the delegatee for this task (see §6.8) |
@@ -2170,6 +2173,7 @@ Sent by the delegatee to confirm it will execute the task.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | task_id | UUID v4 | Yes | Echoed from TASK_ASSIGN |
+| request_id | UUID v4 | Yes | Echoed from TASK_ASSIGN. Enables the delegator to correlate the acceptance with the specific delegation-initiation attempt. |
 | session_id | string | Yes | Echoed from TASK_ASSIGN |
 | accepted_at | ISO 8601 | Yes | Timestamp of acceptance |
 
@@ -2307,6 +2311,7 @@ Sent by the delegatee to decline the task.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | task_id | UUID v4 | Yes | Echoed from TASK_ASSIGN |
+| request_id | UUID v4 | Yes | Echoed from TASK_ASSIGN. Enables the delegator to correlate the rejection with the specific delegation-initiation attempt. |
 | session_id | string | Yes | Echoed from TASK_ASSIGN |
 | reason | string | Yes | Why the task was rejected (insufficient capabilities, resource limits, trust level incompatible, etc.) |
 
@@ -3064,13 +3069,77 @@ Explicit revocation introduces two new audit event classes for the evidence laye
 
 > Implements [issue #135](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/135): explicit revocation channel semantics for §6. Defines signed revocation token schema, distribution requirements, receiver validation behavior, audit event classes (EXPLICIT_REVOCATION, REVOCATION_TOKEN_INVALID), and relationship to TTL expiry. TTL and explicit revocation are orthogonal termination conditions — both MUST be checked. Closes #135.
 
-### 6.14 Open Questions
+### 6.14 Delegation-Initiation Idempotency
+
+The protocol addresses idempotency inside step execution (via `idempotency_token` and `retry_semantics` in §6.1) but the delegation-initiation layer — the point where a delegating agent sends TASK_ASSIGN and awaits acknowledgment — has a distinct deduplication problem. When a delegating agent sends TASK_ASSIGN and the ack (TASK_ACCEPT or TASK_REJECT) is lost in transit, it cannot distinguish: (a) ack lost, delegation received and started — retry would double-execute; (b) delegation never received — no retry silently abandons the task. The `request_id` field on TASK_ASSIGN (§6.6) and the deduplication semantics defined in this section resolve this ambiguity.
+
+#### 6.14.1 Request ID Semantics
+
+Each TASK_ASSIGN MUST include a stable `request_id` (UUID v4) generated at initiation time, before the first transmission. The `request_id` identifies the delegation-initiation attempt, not the task itself — `task_id` identifies the task; `request_id` identifies the delivery attempt. The same `request_id` MUST be used on all retries for the same delegation attempt.
+
+**Generation rules:**
+
+- `request_id` MUST be generated once, before the first transmission of the TASK_ASSIGN.
+- `request_id` MUST NOT change across retransmissions of the same TASK_ASSIGN. A TASK_ASSIGN retransmitted due to transport uncertainty MUST carry the same `request_id` as the original.
+- A new delegation attempt to the same or a different agent (e.g., after receiving TASK_REJECT, or after the delegator decides to reassign) MUST use a new `request_id`. The new `request_id` signals that this is a distinct delegation decision, not a retry of a lost transmission.
+
+**Relationship to `task_id`:** A single `task_id` may be associated with multiple `request_id` values over its lifecycle — for example, if the task is rejected by one agent and reassigned to another. Each `request_id` represents a distinct delegation-initiation attempt for the same logical task. Deduplication operates on `request_id`, not `task_id`.
+
+**Relationship to `idempotency_token` (§6.1):** `idempotency_token` in the task schema (§6.1) operates at the task-execution layer — it enables the executing agent to determine whether a task has already been started or completed during compaction recovery. `request_id` operates at the delegation-initiation layer — it enables the delegatee to deduplicate incoming TASK_ASSIGN messages before any execution begins. These are complementary mechanisms at different protocol layers.
+
+#### 6.14.2 Delegatee Deduplication
+
+The delegatee MUST maintain a deduplication index keyed by `request_id` for incoming TASK_ASSIGN messages. The deduplication behavior is:
+
+1. On receiving a TASK_ASSIGN, the delegatee checks whether `request_id` exists in its deduplication index.
+2. If the `request_id` is **not** in the index: this is a new delegation attempt. The delegatee processes the TASK_ASSIGN normally (attestation verification, capability matching, accept/reject decision), records the `request_id` and the response (TASK_ACCEPT or TASK_REJECT) in the deduplication index, and sends the response.
+3. If the `request_id` **is** in the index: this is a duplicate. The delegatee MUST return the cached response (the same TASK_ACCEPT or TASK_REJECT sent for the original) without re-processing or re-executing. The cached response MUST be byte-identical in its semantic fields (`task_id`, `request_id`, `session_id`, `reason` for rejects) — only transport-layer metadata (e.g., transmission timestamp) may differ.
+
+**Deduplication index requirements:**
+
+- The index MUST be persisted to durable storage. A delegatee that crashes and restarts MUST be able to recover its deduplication index to prevent post-crash duplicate processing.
+- Each entry MUST store: `request_id`, `session_id`, the response message type (TASK_ACCEPT or TASK_REJECT), the full cached response, and the entry creation timestamp.
+- Entries MUST be scoped to `session_id` — a `request_id` from one session does not deduplicate against a `request_id` from a different session.
+
+#### 6.14.3 Idempotency Window
+
+Deduplication entries are valid only within an `idempotency_window`. The `idempotency_window` defines the duration for which the delegatee retains deduplication state for a given `request_id`.
+
+**Window constraints:**
+
+- The `idempotency_window` MUST be ≤ the session's `session_ttl` (§4.3). Stale deduplication entries that outlive the session TTL are invalid — the window is effectively bounded by session lifecycle. A deduplication entry for a `request_id` that belongs to an expired session MUST NOT be used for deduplication — it is semantically stale regardless of the window's duration.
+- When `session_ttl` is absent (no protocol-level TTL), the `idempotency_window` defaults to the session's `session_expiry_ms` value. If neither is configured, the `idempotency_window` is deployment-specific.
+- The delegatee MAY evict deduplication entries before the window expires if the session has entered a terminal state (CLOSED, EXPIRED).
+
+**Window expiry behavior:**
+
+- After the `idempotency_window` has elapsed for a given `request_id`, the delegatee MAY evict the deduplication entry.
+- A TASK_ASSIGN received with a `request_id` whose deduplication entry has been evicted is treated as a new delegation attempt — the delegatee processes it from scratch. This is safe: if the window has expired, the original delegation attempt is either completed, failed, or abandoned.
+
+#### 6.14.4 Interaction with Delegation Chains (§6.9)
+
+When an intermediate agent re-delegates a task (§6.9), the sub-delegation TASK_ASSIGN MUST carry its own `request_id` — distinct from the parent delegation's `request_id`. Each hop in the delegation chain has its own delegation-initiation attempt with its own deduplication semantics. The parent's `request_id` is not propagated — it is meaningful only between the parent delegator and the intermediate agent.
+
+A double-executed delegation due to missing initiation-layer deduplication may produce duplicate entries in downstream delegation state. Deduplication at the initiation layer prevents this failure mode by ensuring that retransmitted TASK_ASSIGN messages are recognized as duplicates before they trigger downstream side effects (sub-delegations, capability grants, resource allocation).
+
+#### 6.14.5 Delegator Retry Semantics
+
+The delegating agent SHOULD implement retry logic for TASK_ASSIGN when no response (TASK_ACCEPT or TASK_REJECT) is received within a deployment-specific timeout. Retry behavior:
+
+- Retries MUST use the same `request_id` as the original TASK_ASSIGN.
+- Retries MUST use the same `task_id`, `spec`, `delegation_attestation`, and all other semantic fields. A retransmission that modifies any field other than transport-layer metadata is not a retry — it is a new delegation attempt and MUST use a new `request_id`.
+- The delegator SHOULD implement exponential backoff for retries to avoid overwhelming the delegatee.
+- The delegator MUST NOT retry indefinitely. After a deployment-specific maximum retry count, the delegator SHOULD treat the delegation as failed and MAY reassign the task (with a new `request_id`) to a different agent.
+
+> Implements [issue #130](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/130): delegation-initiation idempotency for §6. Defines `request_id` on TASK_ASSIGN, delegatee deduplication semantics, idempotency window bounded by session TTL (§4.3), interaction with delegation chains (§6.9), and delegator retry semantics. Resolves the ambiguity between lost-ack and lost-delegation scenarios. Closes #130.
+
+### 6.15 Open Questions
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
 1. **~~TASK_CANCEL as a first-class message.~~** Resolved: TASK_CANCEL is now defined as a delegation message type (§6.6). Cancellation uses TASK_CANCEL (delegator → delegatee) with explicit `reason` field. The delegatee responds with TASK_FAIL (error code `cancelled`) or TASK_COMPLETE (if already finished). Session expiry (§4.2 EXPIRED state, §4.5.3) mandates TASK_CANCEL for all in-flight subtasks to prevent phantom completions.
 
-2. **Idempotency of TASK_ASSIGN.** If a delegator retransmits TASK_ASSIGN (e.g., due to transport-layer uncertainty about delivery), should the delegatee treat the duplicate as a new task or deduplicate by `task_id`? Deduplication is safer but requires the delegatee to maintain state about previously seen task_ids.
+2. **~~Idempotency of TASK_ASSIGN.~~** Resolved: TASK_ASSIGN now includes a required `request_id` field (§6.6) for delegation-initiation deduplication. The delegatee deduplicates incoming TASK_ASSIGN messages on `request_id` within an `idempotency_window` bounded by session TTL (§6.14). Duplicate requests within the window return the cached response without re-executing. Deduplication operates on `request_id` (delivery attempt), not `task_id` (task identity) — a single task may have multiple delegation attempts across different agents.
 
 3. **Trust level enumeration.** §6.8 defers trust level values to deployment configuration. Should the protocol define a minimum set of standard trust levels (e.g., `unrestricted`, `standard`, `restricted`, `sandboxed`) for interoperability, or is this purely deployment-specific?
 
