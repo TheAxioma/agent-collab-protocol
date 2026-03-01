@@ -7201,6 +7201,7 @@ The `external_ref` field (§8.10.1) mitigates this limitation by anchoring evide
 - Trust annotation types (§9.10) define the closed enum of protocol-level trust claims. Schema attestation (§9.1) addresses who vouched for a schema's honesty; trust annotations address under what trust basis an agent acted. Trust annotations are included in `trace_hash` computation (§6.2), making the trust basis auditable through the existing hash verification mechanism. The genesis publication hash (§9.10.4) applies the same independence criteria as §8 audit media — the audited party must not control the publication medium.
 - Amendment ceremonies (§9.11) specify how the trust annotation enum (§9.10.2) may be modified after genesis. The amendment hash chain (§9.11.5) extends the genesis publication hash (§9.10.4) across the enum's full lifecycle. Backwards compatibility (§9.11.6) ensures that enum changes do not strand deployed agents — unknown annotation types are forwarded without interpretation, never rejected. Classification dispute resolution (§9.12) ensures that tier classification disputes default to Tier 2 (conservative) and that any participant can escalate a proposed Tier 1 amendment to Tier 2 review.
 - Introduction verification (§8.17.4) specifies that introductions are claims, not trusted facts — C MUST independently verify A's manifest when B introduces A. Introduction omission (§9.13) documents the residual threat that cryptographic verification cannot address: B suppressing the introduction entirely. `canonical_self_url` (§3.1) provides the identity anchor that makes independent verification possible.
+- Governance document lifecycle (§9.14) generalizes §9.10–§9.12 from trust-annotation-specific governance to protocol-wide governance. GovernanceState enum (§9.14.1) provides machine-readable lifecycle states (`PROPOSED`, `ACTIVE`, `SUPERSEDED`, `REVOKED`) for all governance artifacts. Genesis ceremony specification (§9.14.2) documents the bootstrap problem and acknowledges that genesis legitimacy is socially constructed, not cryptographically derived. Publication hash composability (§9.14.3) binds governance document hashes to the spec version hash chain via `SHA-256(prior_hash || governance_content_canonical || spec_version_string)`, ensuring amendments are cryptographically linked to the spec version they govern. The composable hash structure extends the tamper-evidence property of §9.10.4 and §9.11.5 across spec version boundaries (§10).
 
 ### 9.7 Open Questions
 
@@ -7798,6 +7799,135 @@ V2 SHOULD investigate a distributed lookup mechanism for canonical agent identit
 
 The V2 design question is not "should agents be discoverable without introduction?" (yes) but "what is the minimum infrastructure required to make independent discovery reliable without centralizing the discovery mechanism?"
 
+### 9.14 Governance Document Lifecycle
+
+§9.10–§9.12 define governance for a single artifact: the trust annotation enum. The genesis ceremony (§9.10.3), amendment ceremonies (§9.11), and publication hash (§9.10.4) establish lifecycle governance for that artifact specifically. But the protocol contains multiple governance artifacts — the trust annotation enum, amendment records, the spec version itself — and each requires the same three structural properties to be V1-complete: machine-readable lifecycle state, bootstrap legitimacy, and cryptographic binding to the spec version chain.
+
+§9.14 defines the three structural elements that generalize governance across all protocol governance artifacts.
+
+#### 9.14.1 GovernanceState Enum
+
+Governance documents in §9.10–§9.12 use prose descriptions to indicate lifecycle state — "proposed," "ratified," "deprecated." Prose state descriptions are not machine-readable: an automated governance auditor cannot programmatically determine whether a governance document is in effect without parsing natural language. This defeats the auditability property that §9.10.3 and §9.11 are designed to provide.
+
+**GovernanceState** is a fixed, closed enum of lifecycle states for governance documents:
+
+| Value | Description | Transition conditions |
+|-------|-------------|-----------------------|
+| `PROPOSED` | Document has been proposed but not yet ratified. The document exists as a candidate but carries no protocol-level authority. | Initial state. A governance document enters `PROPOSED` when published with a valid trigger condition (§9.11.1 for amendments) or at genesis initiation. |
+| `ACTIVE` | Document has been ratified and is currently in effect. The document carries protocol-level authority and agents MUST honor its contents. | From `PROPOSED`: ratification ceremony completes (genesis ceremony per §9.14.2 or amendment ceremony per §9.11). Only one document per governance scope MAY be `ACTIVE` at a time — ratifying a new document in the same scope transitions the prior `ACTIVE` document to `SUPERSEDED`. |
+| `SUPERSEDED` | Document has been replaced by a newer ratified version. The document is no longer authoritative but remains in the audit trail for chain verification. | From `ACTIVE`: a successor document in the same governance scope reaches `ACTIVE`. The `SUPERSEDED` document's hash remains in the amendment chain (§9.11.5) — it is not deleted, only de-authorized. |
+| `REVOKED` | Document has been explicitly revoked and is no longer valid. Unlike `SUPERSEDED`, revocation indicates that the document is withdrawn without a successor — the governance scope it covered is no longer governed by any document until a new document reaches `ACTIVE`. | From `ACTIVE` or `PROPOSED`: explicit revocation ceremony with the same participant threshold as the document's ratification ceremony. From `SUPERSEDED`: not permitted — a superseded document is already non-authoritative and revocation would be redundant. |
+
+**State transition diagram:**
+
+```
+PROPOSED ──ratification──► ACTIVE ──successor ratified──► SUPERSEDED
+    │                        │
+    │                        │
+    └──revocation──►  REVOKED ◄──revocation──┘
+```
+
+**GovernanceState field schema:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| governance_state | enum | Yes | One of: `PROPOSED`, `ACTIVE`, `SUPERSEDED`, `REVOKED` |
+| state_changed_at | timestamp | Yes | ISO 8601 timestamp of the most recent state transition. |
+| state_changed_by | string | Yes | Identifier of the ceremony or event that triggered the transition. For genesis: the genesis ceremony identifier. For amendments: the amendment record identifier (§9.11.4). For revocations: the revocation ceremony identifier. |
+| predecessor_hash | string | No | Hash of the governance document this document supersedes. Present when `governance_state` is `ACTIVE` and the document supersedes a prior document, or when `governance_state` is `SUPERSEDED` (pointing to the document that was superseded). Absent for the genesis document. |
+
+**Applicability to existing governance artifacts:**
+
+| Artifact | §9.10–§9.12 prose state | GovernanceState equivalent |
+|----------|------------------------|---------------------------|
+| Trust annotation enum at genesis | "defined at spec genesis" (§9.10.3) | `ACTIVE` — ratified by genesis ceremony |
+| Amendment proposal during deliberation | "proposed" (§9.11.1) | `PROPOSED` — published but not yet ratified |
+| Amendment after ratification | "ratified" (§9.11.4) | `ACTIVE` — the amended enum supersedes the prior version |
+| Prior enum version after amendment | Implicit — "the previous state" | `SUPERSEDED` — replaced by the ratified amendment |
+
+**Interaction with amendment hash chain:** The `governance_state` field is included in the `amendment_record_canonical_json` (§9.11.5) for amendment records. This means state transitions are captured in the hash chain — a governance document's lifecycle is tamper-evident from `PROPOSED` through `ACTIVE` to `SUPERSEDED` or `REVOKED`.
+
+#### 9.14.2 Genesis Ceremony Specification
+
+§9.10.3 defines the genesis ceremony for the trust annotation enum. But the genesis ceremony has a structural property that §9.10.3 does not address: **governance bootstraps before any ratified governance body exists.** The trust annotation enum is ratified by a genesis ceremony, but the genesis ceremony itself is not authorized by any prior governance artifact — it cannot be, because no governance artifact exists before genesis. This is the bootstrap problem.
+
+**The bootstrap problem:** Every governance ceremony after genesis derives its legitimacy from the prior ceremony chain — the amendment hash chain (§9.11.5) traces authority from genesis through each subsequent amendment. But genesis itself has no prior link. The genesis ceremony's authority is not derivable from within the protocol. It is grounded in **external social agreement** among the initial participants: the ceremony participants agree, outside the protocol, that this ceremony constitutes the legitimate starting point of governance.
+
+This is not a bug or a gap — it is a structural property of any self-governing system. The protocol makes it explicit rather than leaving it implicit.
+
+**Genesis ceremony steps:**
+
+1. **Participant identification.** The genesis ceremony participants are identified by name, role, and verifiable identity (public key, platform identity handle, or other externally-verifiable identifier). The participant list is fixed at ceremony initiation and recorded in the genesis record.
+
+2. **Artifact definition.** The governance artifact to be ratified (e.g., the trust annotation enum per §9.10.2) is drafted and published to all participants. The artifact content is finalized before the ceremony proceeds — modifications after ceremony initiation require restarting the ceremony.
+
+3. **External social agreement.** Each participant signals agreement to the artifact through an externally-verifiable mechanism: cryptographic signature over the artifact content, public statement on a verifiable platform, or countersignature on the genesis record. The agreement mechanism is not prescribed by the protocol — it is the one element that necessarily exists outside the protocol's authority, because the protocol's authority is what the ceremony establishes.
+
+4. **Genesis record production.** The ceremony produces a **genesis record** containing:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| genesis_id | string | Yes | Unique identifier for this genesis ceremony. |
+| artifact_hash | string | Yes | SHA-256 hash of the canonical artifact content (e.g., `genesis_hash` per §9.10.4 for the trust annotation enum). |
+| spec_version | string | Yes | Protocol spec version at genesis time. |
+| participants | array | Yes | List of participant identifiers with their agreement evidence (signature, public statement reference, or countersignature). |
+| ceremony_timestamp | timestamp | Yes | ISO 8601 timestamp of ceremony completion. |
+| governance_state | enum | Yes | `ACTIVE` — the artifact is ratified upon genesis ceremony completion. |
+| legitimacy_basis | string | Yes | Explicit declaration that the genesis ceremony's authority derives from external social agreement among the listed participants, not from any prior protocol-level governance artifact. This field is a human-readable acknowledgment, not a machine-verifiable claim — its purpose is to prevent future confusion about the source of genesis authority. |
+
+5. **Publication.** The genesis record is published to an external, independently-verifiable medium satisfying the constraints in §9.10.4 (independence, verifiability, immutability, consistency with §8 audit media).
+
+6. **Genesis hash computation.** The genesis publication hash is computed as specified in §9.10.4. The genesis hash is the root of the amendment hash chain (§9.11.5) — all subsequent governance is cryptographically anchored to this value.
+
+**Legitimacy boundary:** The protocol acknowledges that genesis legitimacy is **socially constructed, not cryptographically derived**. The genesis ceremony produces a cryptographic artifact (the genesis hash), but the authority of that artifact rests on the participants' external agreement — not on any protocol mechanism. An adversary who controls all genesis participants can produce a valid genesis ceremony for a malicious governance artifact. The protocol's defense is transparency: the genesis record names the participants and publishes the artifact, making the legitimacy claim auditable by anyone, even after the fact.
+
+**Relationship to §9.10.3:** §9.10.3 is a specific instance of the genesis ceremony for the trust annotation enum. The properties listed in §9.10.3 (bounded, high-scrutiny, auditable) are derived from the general genesis ceremony structure defined here. §9.14.2 generalizes §9.10.3 — any future governance artifact that requires a genesis ceremony follows the same steps.
+
+#### 9.14.3 Publication Hash Composability
+
+§9.10.4 defines the genesis publication hash for the trust annotation enum. §9.11.5 defines the amendment hash chain that extends the genesis hash across amendments. But neither section defines how governance document hashes **bind to the spec version hash chain** — a governance document is ratified in the context of a specific spec version, and that binding must be cryptographically explicit so that amendments are linked to the spec version they govern.
+
+**The binding problem:** A governance document (amendment record, trust annotation enum revision) governs the protocol at a specific spec version. Without cryptographic binding, a governance document ratified for spec version 1.0 could be silently applied to spec version 2.0 — or a governance document could be produced with no spec version binding at all, leaving its applicability ambiguous. The spec version is part of the governance document's meaning: the trust annotation enum defined at spec version 1.0 governs spec version 1.0's semantics, not some other version's.
+
+**Composable hash computation:**
+
+Every governance document hash — whether genesis hash (§9.10.4), amendment hash (§9.11.5), or future governance artifact hash — MUST include the spec version in its hash computation, binding the governance document to the spec version it governs.
+
+The general form:
+
+```
+governance_hash = SHA-256(prior_hash || governance_content_canonical || spec_version_string)
+```
+
+Where:
+- `prior_hash` is the hash of the preceding governance document in the chain. For genesis documents, `prior_hash` is the empty string (zero-length input) — genesis has no predecessor.
+- `governance_content_canonical` is the canonical representation of the governance document content (canonicalization rules per §9.10.4 for text content or §9.11.5 for JSON content).
+- `spec_version_string` is the protocol version identifier (e.g., `"1.0.0"`) at the time of ratification.
+- `||` denotes concatenation.
+
+**Existing hash formulas as instances of the general form:**
+
+| Hash type | §9.10.4 / §9.11.5 formula | Composable form |
+|-----------|--------------------------|-----------------|
+| Genesis hash | `hash(canonical_enum_text + spec_version_string)` | `SHA-256("" \|\| canonical_enum_text \|\| spec_version_string)` — `prior_hash` is empty string |
+| Amendment hash | `SHA-256(prior_state_hash \|\| amendment_record_canonical_json)` | `SHA-256(prior_state_hash \|\| amendment_record_canonical_json \|\| spec_version_string)` — spec version is now explicit |
+
+**Note on amendment hash backward compatibility:** The existing amendment hash formula in §9.11.5 does not include `spec_version_string` as a separate input. For V1 governance documents ratified before §9.14.3, the `spec_version_string` is present implicitly — it is embedded in the `amendment_record_canonical_json` via the amendment record's context. §9.14.3 makes the spec version binding **structurally explicit** in the hash computation for all governance documents going forward. Implementations MUST include `spec_version_string` as a separate hash input for governance documents ratified under spec versions that include §9.14.3. For governance documents ratified before §9.14.3, the existing hash formula (§9.11.5) remains valid — retroactive re-hashing is not required.
+
+**Cross-version governance chain verification:**
+
+When the spec version changes (MAJOR bump per §10.3), the governance hash chain spans spec versions. The `spec_version_string` in each hash computation makes this span explicit:
+
+1. Genesis hash at spec version 1.0.0 binds the initial governance artifact to spec 1.0.
+2. Amendment hash at spec version 1.2.0 includes `spec_version_string = "1.2.0"`, linking the amendment to the spec version under which it was ratified.
+3. A governance document ratified at spec version 2.0.0 includes `spec_version_string = "2.0.0"`. The `prior_hash` still chains to the preceding governance document (which was ratified under 1.x), but the spec version in the hash computation makes the version boundary cryptographically visible.
+
+An auditor traversing the governance hash chain can independently verify which spec version each governance document was ratified under — the spec version is not metadata attached to the document but a cryptographic input to the document's hash.
+
+**Relationship to §10 (Versioning):** The composable hash structure ensures that governance documents and spec versions are coupled in the hash chain but independently identifiable. A spec version bump (§10) does not invalidate prior governance documents — they remain in the chain with their original `spec_version_string`. But a governance document ratified under spec version N cannot be silently applied to spec version N+1 without producing a hash mismatch when the verifier recomputes the hash with the correct spec version string.
+
+> Implements [issue #210](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/210): three structural elements for V1-complete governance in §9. Defines (1) GovernanceState enum with machine-readable lifecycle values (`PROPOSED`, `ACTIVE`, `SUPERSEDED`, `REVOKED`) and state transition rules (§9.14.1); (2) genesis ceremony specification documenting bootstrap steps and acknowledging that initial legitimacy is grounded in external social agreement, not derivable from within the protocol (§9.14.2); (3) publication hash composability defining how governance document content hashes bind to the spec version hash chain via `SHA-256(prior_hash || governance_content_canonical || spec_version_string)` (§9.14.3). These three elements generalize the patterns in §9.10–§9.12 from trust-annotation-specific to protocol-wide governance. Closes #210.
+
 ## 10. Versioning
 
 Version management in a decentralized protocol has a different failure mode than in centralized systems. In a centralized system, incompatible versions produce a clear error at deployment time. In a decentralized protocol, incompatible versions produce silent semantic drift at collaboration time — two agents agree on a task, execute against different protocol semantics, and discover the mismatch only when results diverge. The versioning strategy must make incompatibility loud and early, not quiet and late.
@@ -7982,7 +8112,7 @@ Cross-version delegation chains operate strictly within the same MAJOR version �
 - **§5 (Role Negotiation).** CAPABILITY_MANIFEST carries a `version` field (§5.1) that represents the schema version of the manifest format. §10 defines the operational semantics: minor bumps add optional fields; major bumps may change required fields. Capability declarations in v0.1 do not carry protocol version constraints — an agent's capabilities are independent of the protocol version it implements. This may change in future versions if capabilities become version-specific.
 - **§6 (Task Delegation).** The `version` field in the canonical task schema (§6.1) is a schema version for forward compatibility. §10.3 defines what "forward compatible" means: minor bumps are backward compatible; major bumps may break. The `namespace + alias + version` triple that uniquely identifies a task type (§6.3) uses the schema version axis — protocol version is not part of task type identity. The `protocol_version_chain` field in TASK_ASSIGN (§6.6) and `version_chain_summary` in TASK_COMPLETE/TASK_PROGRESS/TASK_FAIL carry per-hop version information through delegation chains (§6.9.1). §10.7.1 defines the semantic consequences of version degradation across hops — translation contract propagation and result interpretation guidance.
 - **§8 (Error Handling).** PROTOCOL_MISMATCH and SCHEMA_MISMATCH (§10.4) are session-level errors that terminate the session before any task delegation occurs. They are distinct from task-level errors (TASK_FAIL) and session recovery (SESSION_RESUME, §4.8). A version mismatch is not a recoverable error — SESSION_RESUME cannot resolve a fundamental protocol incompatibility.
-- **§9 (Security Considerations).** Schema attestation (§9.1) is version-scoped — see §10.7. The re-attestation requirement on schema MAJOR bumps addresses §9.7 open question #2. Translation boundary risk (§9.3) is compounded by version mismatches: a boundary agent translating between trust domains that use different schema versions must handle both translation and version adaptation, doubling the semantic drift surface.
+- **§9 (Security Considerations).** Schema attestation (§9.1) is version-scoped — see §10.7. The re-attestation requirement on schema MAJOR bumps addresses §9.7 open question #2. Translation boundary risk (§9.3) is compounded by version mismatches: a boundary agent translating between trust domains that use different schema versions must handle both translation and version adaptation, doubling the semantic drift surface. Governance document lifecycle (§9.14) binds governance hashes to spec version strings via publication hash composability (§9.14.3) — the `spec_version_string` is a cryptographic input to every governance hash, making the spec version under which a governance document was ratified independently verifiable from the hash chain.
 
 ### 10.9 Open Questions
 
