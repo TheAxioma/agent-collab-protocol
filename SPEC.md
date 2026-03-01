@@ -3368,6 +3368,59 @@ Where `canonical_serialize` applies NFC normalization followed by RFC 8785 JCS s
 
 `intent_hash` is listed in `EXCLUDED_FIELDS` (§6.4) — it is excluded from `task_hash` computation because it is a commitment *about* the task's purpose, not a component of the task's structural identity.
 
+#### intent_hash Canonicalization
+
+Two spec-compliant implementations using different field ordering, whitespace handling, or character encoding will produce different hashes for semantically identical intents — making hash mismatch indistinguishable from intent deviation. This breaks the core tamper-evidence guarantee of `intent_hash`. Implementors MUST follow the canonicalization rules below when computing `intent_hash`. These rules are self-contained for `intent_hash` computation; they are consistent with §4.10.2 but do not require cross-referencing that section.
+
+**Rule 1 — Serialization format.** The intent context MUST be serialized as JSON. No other serialization format (CBOR, MessagePack, Protobuf, YAML) is permitted for `intent_hash` computation.
+
+**Rule 2 — Key ordering.** All keys MUST be sorted lexicographically (by Unicode code point value) at every level of nesting. This applies recursively: keys within nested objects inside `intent`, `scope`, or `constraints` MUST also be sorted. Sorting is applied before serialization, not as a post-processing step on the serialized output.
+
+**Rule 3 — Encoding.** The serialized JSON output MUST be encoded as UTF-8 (RFC 3629). No byte-order mark (BOM, U+FEFF) is permitted. If a BOM is present in any input string, it MUST be stripped before serialization. UTF-8 is the only permitted encoding for the bytes input to SHA-256.
+
+**Rule 4 — Whitespace.** The JSON serialization MUST be compact: no whitespace between tokens. Specifically: no spaces after colons separating keys from values, no spaces after commas separating elements, no trailing whitespace, no newline characters. The serialized output is a single contiguous line of JSON with no extraneous whitespace.
+
+**Rule 5 — String normalization.** All string values in the intent context — including keys and all nested string values within `intent`, `scope`, and `constraints` — MUST be NFC-normalized (Unicode Canonical Decomposition followed by Canonical Composition, per [Unicode TR15](https://unicode.org/reports/tr15/)) before serialization. NFC normalization MUST be applied before JSON serialization, not after. This closes the cross-runtime Unicode divergence gap: different runtimes may store the same logical string in NFC, NFD, or mixed form internally, producing different byte sequences and therefore different hashes.
+
+**Rule 6 — Field inclusion.** The intent context object MUST include the following fields from the task schema (§6.1): `intent`, `scope`, `constraints`. All three fields are included by default. No other task schema fields are included in the intent context. If future protocol versions add fields to the intent context, they MUST be listed explicitly in this rule and the protocol version in which they were added MUST be noted.
+
+**Rule 7 — Null and absent field handling.** Absent fields — fields not present in the task schema instance — MUST be omitted from the serialized intent context entirely (the key MUST NOT appear in the JSON object). Null fields — fields explicitly set to `null` in the task schema instance — MUST be included in the serialized output with JSON `null` as the value. This distinction is normative: `{"intent":"summarize","scope":null}` and `{"intent":"summarize"}` produce different `intent_hash` values. Implementations MUST NOT conflate absent and null.
+
+**Canonical computation summary:**
+
+```
+1. Collect fields: {intent, scope, constraints} from the task schema instance
+2. Omit absent fields; retain null fields with JSON null
+3. Apply NFC normalization to all string values (keys and values, recursively)
+4. Sort keys lexicographically at every nesting level
+5. Serialize as compact JSON (no whitespace between tokens)
+6. Encode the JSON string as UTF-8 (no BOM)
+7. intent_hash = SHA-256(utf8_bytes)
+```
+
+**Example:**
+
+Given a task with:
+
+```yaml
+intent: "Summarize document"
+scope:
+  include: ["chapters 1-3"]
+  exclude: ["appendix"]
+constraints:
+  timeout_seconds: 300
+```
+
+The canonical serialized intent context is the following single-line JSON string (shown here with the UTF-8 byte sequence as input to SHA-256):
+
+```
+{"constraints":{"timeout_seconds":300},"intent":"Summarize document","scope":{"exclude":["appendix"],"include":["chapters 1-3"]}}
+```
+
+Keys are sorted at every level (`constraints` < `intent` < `scope`; `exclude` < `include`; `timeout_seconds` is the only key in `constraints`). No whitespace between tokens. NFC normalization is a no-op for ASCII strings. The SHA-256 hash of the UTF-8 encoding of this string is the `intent_hash`.
+
+> Addresses [issue #221](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/221): intent_hash canonicalization rules for deterministic hash computation across independent implementations. Closes #221.
+
 #### Per-Hop Attestation
 
 Each delegating node MUST sign the attestation tuple `(task_hash || intent_hash || delegator_id)` before forwarding a delegation. This binds the node's identity to its assertion of both task structure and intent.
