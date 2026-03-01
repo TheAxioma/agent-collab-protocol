@@ -1934,6 +1934,7 @@ A task is the atomic unit of agent collaboration. Every task MUST carry explicit
 | alias | string | Human-readable shorthand for the task type within a namespace |
 | version | semver | Schema version for forward compatibility |
 | issued_at | ISO 8601 | Issuance timestamp |
+| intent_hash | SHA-256 | Hash of the delegation intent context: the delegator's declared purpose, constraints, and outcome framing. Commits to the *why* as `task_hash` commits to the *what*. See §6.4.1. |
 | issuer_id | string | Identity of the delegating agent |
 
 **Optional fields:**
@@ -1977,7 +1978,7 @@ task_hash = SHA-256(jcs_serialize(nfc(manifest)))
 
 Where `canonical_type(val)` maps the runtime type to the canonical name (§4.10.1), `nfc()` applies Unicode NFC normalization (§4.10.2), and `jcs_serialize()` produces RFC 8785 JCS output.
 
-`EXCLUDED_FIELDS` = `{task_hash, trace_hash}` — the hash output and post-execution fields MUST be excluded from hash input.
+`EXCLUDED_FIELDS` = `{task_hash, trace_hash, intent_hash}` — the hash output, post-execution fields, and intent commitment fields MUST be excluded from hash input.
 
 **MANIFEST construction rules:**
 
@@ -2018,14 +2019,98 @@ The MANIFEST (before final hashing) is:
 
 Two agents — one in Python using `json.dumps`, one in Rust using `serde_cbor` — construct the same MANIFEST and produce the same `task_hash`, because neither depends on the other's serialization format. The sorted tuple structure is the shared contract.
 
+### 6.4.1 Per-Hop Intent Attestation
+
+`task_hash` (§6.4) commits to the structural *what* of a task — syntactic identity. `intent_hash` commits to the semantic *why* — the delegator's declared purpose, constraints, and outcome framing. Without `intent_hash`, an adversarial intermediary B in a chain A→B→C can forward an unchanged `task_hash` to C while substituting A's intent context: the delegation remains protocol-compliant, audit-clean, and semantically distorted.
+
+#### intent_hash Computation
+
+`intent_hash` is the SHA-256 hash of the delegation intent context. The intent context is the concatenation of the following fields from the task schema (§6.1), canonicalized per §4.10:
+
+```
+intent_context = canonical_serialize(nfc([
+  ("intent",      task.intent),
+  ("scope",       task.scope),
+  ("constraints", task.constraints)
+]))
+intent_hash = SHA-256(intent_context)
+```
+
+Where `canonical_serialize` applies NFC normalization followed by RFC 8785 JCS serialization (§4.10.2). The fields are sorted lexicographically by key. If a field is absent from the task schema, it is omitted from the intent context (not serialized as null).
+
+`intent_hash` is listed in `EXCLUDED_FIELDS` (§6.4) — it is excluded from `task_hash` computation because it is a commitment *about* the task's purpose, not a component of the task's structural identity.
+
+#### Per-Hop Attestation
+
+Each delegating node MUST sign the attestation tuple `(task_hash || intent_hash || delegator_id)` before forwarding a delegation. This binds the node's identity to its assertion of both task structure and intent.
+
+**Attestation requirements:**
+
+1. The delegating agent constructs the attestation tuple by concatenating `task_hash`, `intent_hash`, and its own `issuer_id` (§6.1).
+2. The delegating agent signs the tuple using its keypair (§2 identity). The signature algorithm is the same as used for identity attestation (§2.4).
+3. The signed attestation is included in TASK_ASSIGN (§6.6) as the `delegation_attestation` field.
+4. The receiving agent MUST verify the attestation signature against the delegating agent's public key before accepting or forwarding the task. Verification failure MUST result in TASK_REJECT with `reason: "attestation_verification_failed"`.
+5. When re-delegating (§6.9), the intermediate agent MUST produce a **new** attestation tuple signed with its own keypair. The intermediate agent's attestation covers its own `intent_hash` — which may differ from the upstream agent's if the intermediate agent has translated or reframed the intent (§7.9). The upstream agent's attestation is preserved in the `delegation_attestation_chain` for audit.
+
+**Attestation tuple format:**
+
+```
+attestation_input = task_hash || intent_hash || delegator_id
+attestation_signature = Sign(delegator_keypair, attestation_input)
+```
+
+Where `||` denotes concatenation of the UTF-8 byte representations, and `Sign` uses the delegating agent's signing key.
+
+**`delegation_attestation` field (in TASK_ASSIGN):**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| task_hash | SHA-256 | Yes | The `task_hash` being attested |
+| intent_hash | SHA-256 | Yes | The `intent_hash` being attested |
+| delegator_id | string | Yes | The attesting agent's identity (§2.4) |
+| signature | string | Yes | Cryptographic signature over `(task_hash \|\| intent_hash \|\| delegator_id)` |
+| signed_at | ISO 8601 | Yes | Timestamp of attestation |
+
+**`delegation_attestation_chain` field (in TASK_ASSIGN):**
+
+An ordered array of `delegation_attestation` objects from each hop in the delegation chain. Each intermediate agent appends the upstream agent's attestation to this chain before constructing its own. The chain provides a complete audit trail of intent assertions across all hops.
+
+#### V1 Adversary Model
+
+Per-hop attestation covers the **honest-but-careless intermediary** — an agent that might inadvertently modify or fail to preserve intent context. With per-hop attestation, intent deviation becomes auditable: each hop's assertion of intent is cryptographically bound to its identity.
+
+Per-hop attestation does **NOT** cover the **Byzantine intermediary** who generates a valid attestation asserting false intent. A Byzantine agent B in chain A→B→C can sign a fabricated `intent_hash` — the signature is valid because B holds the signing key, but the asserted intent does not reflect A's original intent. Detecting this requires **Recursive Intent Bundles**: nested cryptographic wrappers where each hop's intent assertion encloses the upstream chain's intent assertions, requiring PKI infrastructure that V1 cannot assume.
+
+**V1 commitment:** hop-local attestation only. A fully attested delegation chain proves that each hop *asserted* its intent. It does not prove that any assertion was *truthful*. Compliant does not mean trustworthy. Recursive Intent Bundles are deferred to V2.
+
+#### Attestation in the Audit Trail
+
+Attestation tuples MUST appear in `divergence_log` (§7.8, §8.10.3) when attestation-related events occur during delegation processing.
+
+Attestation verification failure MUST be recorded with reason `attestation_failure` (§8.10.4) — distinct from `verification_reject` (verifier evaluated evidence and rejected it) and `verification_unreachable` (verifier was not reachable). `attestation_failure` indicates that the delegation attestation itself — the per-hop cryptographic binding of identity to intent — failed verification at the receiving agent.
+
+The `divergence_log` entry for an attestation failure MUST include:
+
+| Field | Value |
+|-------|-------|
+| reason | `attestation_failure` |
+| description | Human-readable explanation of the failure |
+| affected_step_id | The step (if any) associated with the delegation that failed attestation |
+| context.attesting_node_id | Identity of the agent whose attestation failed verification |
+| context.asserted_task_hash | The `task_hash` in the failed attestation tuple |
+| context.asserted_intent_hash | The `intent_hash` in the failed attestation tuple |
+| context.failure_reason | Specific cause: `signature_invalid`, `key_unknown`, `hash_mismatch`, or `attestation_missing` |
+
 ### 6.5 Delegation Protocol
 
-1. Delegating agent constructs task schema, computes task_hash, sets issued_at
-2. Task transmitted to executing agent via session message format (§4.3)
-3. Executing agent acknowledges receipt (§7)
-4. *(Optional)* Executing agent computes plan_hash, sends PLAN_COMMIT (§6.6, §6.11) to delegating agent before beginning work. REQUIRED when session was established with `plan_commit_required: true` (§4.3).
-5. Executing agent completes work, populates trace_hash, transmits result
-6. Delegating agent verifies task_hash integrity; optionally validates trace_hash against expected behavior. If PLAN_COMMIT was received, delegating agent verifies plan_hash_ref in the result for three-level alignment (§6.11).
+1. Delegating agent constructs task schema, computes task_hash and intent_hash, sets issued_at
+2. Delegating agent signs the attestation tuple `(task_hash || intent_hash || delegator_id)` (§6.4.1)
+3. Task transmitted to executing agent via session message format (§4.3), including `delegation_attestation`
+4. Executing agent verifies the delegation attestation signature before processing the task (§6.4.1). Verification failure results in TASK_REJECT.
+5. Executing agent acknowledges receipt (§7)
+6. *(Optional)* Executing agent computes plan_hash, sends PLAN_COMMIT (§6.6, §6.11) to delegating agent before beginning work. REQUIRED when session was established with `plan_commit_required: true` (§4.3).
+7. Executing agent completes work, populates trace_hash, transmits result
+8. Delegating agent verifies task_hash and intent_hash integrity; optionally validates trace_hash against expected behavior. If PLAN_COMMIT was received, delegating agent verifies plan_hash_ref in the result for three-level alignment (§6.11).
 
 ### 6.6 Delegation Message Types
 
@@ -2043,7 +2128,10 @@ Sent by the delegating agent to initiate delegation.
 | session_id | string | Yes | Active session identifier binding this delegation to a collaboration session |
 | spec | object | Yes | Task specification (see below) |
 | trust_level | enum | Yes | Trust level granted to the delegatee for this task (see §6.8) |
+| intent_hash | SHA-256 | Yes | Hash of the delegation intent context (§6.4.1). Commits to the delegator's declared purpose, constraints, and outcome framing. |
+| delegation_attestation | object | Yes | Signed attestation binding the delegator's identity to both `task_hash` and `intent_hash` (§6.4.1). The receiving agent MUST verify this signature before accepting the task. |
 | delegation_depth | integer | Yes | Current depth in the delegation chain; 0 for direct delegation (see §6.9) |
+| delegation_attestation_chain | array | No | Ordered array of `delegation_attestation` objects from each upstream hop in the delegation chain (§6.4.1). Provides a complete audit trail of intent assertions across all hops. Empty or absent for direct delegations at depth 0. |
 | protocol_version_chain | array | No | Append-only list of version chain entries recording the protocol version negotiated at each hop in the delegation chain (see §6.9.1). Empty or absent for direct delegations at depth 0. |
 | translation_metadata | object | No | Metadata describing a semantic translation performed by the forwarding agent (see §7.9). Present when the forwarding agent transforms task semantics — vocabulary, capability descriptions, or constraint representations — rather than merely routing. |
 | revocation_mode | enum | No | Revocation verification strategy for this delegation: `sync` or `gossip` (see §9.8.5). When absent, defaults to `gossip`. The delegating agent selects the mode based on chain depth, trust level, and latency tolerance. Propagated through the delegation chain — each hop inherits the mode from its delegator unless explicitly overridden. |
@@ -2057,7 +2145,7 @@ The `spec` object contains:
 | deadline | ISO 8601 | No | Absolute deadline for task completion |
 | resource_constraints | object | No | Limits on compute, memory, network, or other resources the delegatee may consume |
 
-The full canonical task schema (§6.1) is transmitted within or alongside `spec`. The fields above are the delegation-specific subset; `task_hash`, `namespace`, `alias`, `version`, `issued_at`, and `issuer_id` travel with the task schema as defined in §6.1.
+The full canonical task schema (§6.1) is transmitted within or alongside `spec`. The fields above are the delegation-specific subset; `task_hash`, `intent_hash`, `namespace`, `alias`, `version`, `issued_at`, and `issuer_id` travel with the task schema as defined in §6.1.
 
 The `translation_metadata` object, when present, contains:
 
@@ -2402,7 +2490,9 @@ When re-delegating, the delegatee:
 2. Sets `trust_level` to at most its own effective trust level for the parent task (§6.8 — no escalation)
 3. Sets `issuer_id` to its own identity (proximate delegator), but MUST include `parent_task_id` (§6.1) referencing the upstream task for auditability
 4. Computes a new `task_hash` for the subtask schema
-5. Appends its own version chain entry to `protocol_version_chain` — recording the protocol and schema versions negotiated for the session between itself and the next delegatee (§6.9.1)
+5. Computes a new `intent_hash` for the subtask's delegation intent context (§6.4.1)
+6. Signs the attestation tuple `(task_hash || intent_hash || delegator_id)` with its own keypair and includes the upstream `delegation_attestation` in `delegation_attestation_chain` (§6.4.1)
+7. Appends its own version chain entry to `protocol_version_chain` — recording the protocol and schema versions negotiated for the session between itself and the next delegatee (§6.9.1)
 
 **Cancellation propagation.** Cancellation propagates down the chain via TASK_CANCEL (§6.6). If A cancels the task assigned to B (by sending TASK_CANCEL), B MUST send TASK_CANCEL with `reason: "cancelled_upstream"` to any subtasks it delegated to C, and C MUST do the same for D. Each agent in the chain sends TASK_CANCEL to its delegatees and responds to its delegator with TASK_FAIL (error code `cancelled`, with any `partial_results`).
 
@@ -3447,6 +3537,7 @@ The `reason` field MUST use one of the following values. Each value identifies a
 | `verification_timeout` | The verification request was sent but no response was received within the configured timeout window. Ambiguous cause. See §8.10.5. | The verification endpoint accepted the connection but did not return a result before timeout. Cause is ambiguous: verifier overload, semantic complexity, or partial failure. | Retry with backoff. If persistent, escalate to `verification_unreachable`. MUST NOT escalate to `verification_reject`. |
 | `verification_reject` | The verification system evaluated the agent's evidence and explicitly rejected it. Behavioral failure confirmed. See §8.10.5. | The verifier completed evaluation and returned a negative result. The agent's execution, evidence, or attestation did not meet protocol requirements. | No recovery. Escalate to delegating agent. This is the only verification state that carries accountability weight. |
 | `verifier_restored` | The verification system previously logged as unreachable is now reachable again. Append-only recovery entry. See §8.10.6. | A verifier that was the subject of a prior `verification_unreachable` entry has been confirmed reachable. | Process normally. The gap window between unreachable and restored is documented for forensic reconstruction. Requires `restored_gap_ref` field linking to the original unreachable entry. |
+| `attestation_failure` | The per-hop delegation attestation (§6.4.1) failed verification at the receiving agent. The cryptographic binding of delegator identity to task and intent could not be confirmed. Distinct from `verification_reject` (verifier evaluated evidence and rejected it) and `verification_unreachable` (verifier was not reachable). See §6.4.1. | The receiving agent attempted to verify the `delegation_attestation` signature in TASK_ASSIGN and verification failed: invalid signature, unknown key, hash mismatch between attested and received values, or missing attestation. | No recovery at this hop. The receiving agent MUST reject the delegation (TASK_REJECT). The delegating agent SHOULD investigate the cause — key rotation, transmission corruption, or intermediary tampering. The `context` field in the divergence entry MUST include `attesting_node_id`, `asserted_task_hash`, `asserted_intent_hash`, and `failure_reason`. |
 
 **Relationship to §7.8 `deviation_type`:** The §7.8 `deviation_type` enum (`RESOURCE_UNAVAILABLE`, `CONTEXT_SHIFT`, `CAPABILITY_MISMATCH`, `OPTIMIZATION`, `TIMEOUT`, `EXTERNAL_CONSTRAINT`, `OTHER`) and the §8.10.4 `reason` enum serve different classification purposes. §7.8 categorizes _what kind_ of divergence occurred at the step level (inline in TASK_COMPLETE/TASK_FAIL). §8.10.4 categorizes _why_ the divergence occurred at the evidence level, with recovery routing as the primary design goal. The two may co-occur: a `RESOURCE_UNAVAILABLE` deviation (§7.8) might be classified as `infrastructure_noise` (§8.10.4) if it was transient, or as `external_constraint` if the resource is permanently unavailable.
 
