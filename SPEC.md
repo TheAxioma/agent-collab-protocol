@@ -3776,8 +3776,10 @@ A revocation token is a signed record that explicitly terminates a grant regardl
 | issuer_id | string | Yes | Identity of the revoking agent (§2 identity handle). MUST match the `grantor_id` of the original grant. |
 | revocation_reason | enum | Yes | Why the grant is being revoked. One of: `SECURITY_COMPROMISE` (the grant's security context has been compromised), `TRUST_LOSS` (the issuer no longer trusts the grantee for this delegation), `TASK_CANCELLED` (the associated task has been cancelled), `POLICY_VIOLATION` (the grantee violated a constraint of the grant), `ISSUER_REVOKED` (the issuer's own authority has been revoked, cascading to its grants). |
 | revoked_at | ISO 8601 | Yes | Timestamp when the revocation was issued. Millisecond precision REQUIRED. |
-| takes_effect_at | ISO 8601 | No | Timestamp when the revocation MUST be enforced by the receiving agent (§6.16). Millisecond precision REQUIRED when present. If absent, enforcement is immediate upon receipt — equivalent to `takes_effect_at` equal to the receiver's local time at token receipt. When present, MUST be ≥ `revoked_at`. Separates propagation latency from enforcement deadline: the receiver learns about the revocation at receipt time but MUST NOT enforce it before `takes_effect_at`, allowing in-flight atomic operations to complete (§6.16.3). |
-| issuer_signature | bytes | Yes | Cryptographic signature over `grant_id || issuer_id || revocation_reason || revoked_at || takes_effect_at` (if present), produced by the issuer's private key (§2.2.1). The `||` operator denotes concatenation of the canonical byte representations. When `takes_effect_at` is absent, the signature covers `grant_id || issuer_id || revocation_reason || revoked_at` only. |
+| effective_from | ISO 8601 | Yes | Timestamp at which the revocation takes effect — the logical point from which the capability is considered revoked. Millisecond precision REQUIRED. MUST be ≥ `revoked_at`. Operations completed in good faith before `effective_from` are not retroactively invalid; the revoking agent bears responsibility for the declared window between `revoked_at` and `effective_from`. When `effective_from` equals `revoked_at`, revocation is immediate. |
+| propagation_window_ms | integer | Yes | Maximum expected propagation delay in milliseconds — the issuer's declared upper bound on how long it takes the revocation to reach all downstream holders via best-effort gossip. Agents MUST NOT treat a peer's failure to honor a revocation as adversarial if the elapsed time since `revoked_at` is less than `propagation_window_ms`. After `revoked_at` + `propagation_window_ms`, any agent still exercising the revoked capability is in protocol violation. MUST be > 0 and ≤ 60000 (60 seconds), consistent with the `trust_decay_interval` default (§9.8.6). |
+| takes_effect_at | ISO 8601 | No | Timestamp when the revocation MUST be enforced by the receiving agent (§6.16). Millisecond precision REQUIRED when present. If absent, enforcement is immediate upon receipt — equivalent to `takes_effect_at` equal to the receiver's local time at token receipt. When present, MUST be ≥ `effective_from`. Separates propagation latency from enforcement deadline: the receiver learns about the revocation at receipt time but MUST NOT enforce it before `takes_effect_at`, allowing in-flight atomic operations to complete (§6.16.3). |
+| issuer_signature | bytes | Yes | Cryptographic signature over `grant_id || issuer_id || revocation_reason || revoked_at || effective_from || propagation_window_ms || takes_effect_at` (if present), produced by the issuer's private key (§2.2.1). The `||` operator denotes concatenation of the canonical byte representations. When `takes_effect_at` is absent, the signature covers `grant_id || issuer_id || revocation_reason || revoked_at || effective_from || propagation_window_ms` only. |
 
 **Revocation token validity:**
 
@@ -3792,6 +3794,8 @@ grant_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 issuer_id: "agent-alpha"
 revocation_reason: SECURITY_COMPROMISE
 revoked_at: "2026-03-01T10:15:00.000Z"
+effective_from: "2026-03-01T10:15:00.000Z"
+propagation_window_ms: 10000
 takes_effect_at: "2026-03-01T10:15:05.000Z"
 issuer_signature: "c2lnbmVkLXJldm9jYXRpb24tdG9rZW4..."
 ```
@@ -3846,6 +3850,34 @@ Explicit revocation and mid-session mode escalation introduce three audit event 
 **Relationship to §5.5 delegation token TTL:** The delegation token's `ttl` field (§5.5) bounds the delegation's total duration. A revocation token terminates the grant before TTL expiry. These are the two delegation termination mechanisms: TTL is the scheduled expiry; revocation is the unscheduled early termination.
 
 > Implements [issue #135](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/135): explicit revocation channel semantics for §6. Defines signed revocation token schema, distribution requirements, receiver validation behavior, audit event classes (EXPLICIT_REVOCATION, REVOCATION_TOKEN_INVALID), and relationship to TTL expiry. TTL and explicit revocation are orthogonal termination conditions — both MUST be checked. Closes #135.
+
+#### 6.13.6 Revocation Propagation Cost Model
+
+<!-- Implements #97: revocation propagation cost model — best-effort gossip with declared propagation window -->
+
+§6.13.1–§6.13.5 define revocation as a token-centric mechanism: the issuer produces a signed token, distributes it, and receivers validate it. This treats revocation as a point event — CAPABILITY_REVOKE fires and the capability is considered gone. In a distributed system this is incomplete: B cannot honor a revocation it has not received, and A cannot assume receipt just because it sent. The `propagation_window_ms` and `effective_from` fields on the revocation token (§6.13.1) address this gap by making the propagation cost explicit and shifting responsibility to the revoking agent.
+
+**V1 Decision — Best-Effort Gossip with Declared Propagation Window:** Synchronous revocation that blocks until all downstream holders acknowledge receipt is a V2 concern — it blocks indefinitely if any agent is unreachable. V1 uses best-effort gossip with the issuer declaring `propagation_window_ms` as the upper bound on expected propagation delay.
+
+**Propagation obligations:**
+
+1. **Immediate cease and forward.** An agent receiving a valid revocation token (§6.13.1) MUST immediately cease honoring the revoked capability for new operations and MUST forward the revocation token to all known downstream holders of the grant. Forwarding follows the same chain topology as the original grant distribution (§6.13.2) — each agent forwards to agents it delegated to.
+
+2. **Unreachable downstream holders.** If a downstream holder is unreachable during forwarding, the forwarding agent MUST treat the session with that downstream holder as DEGRADED (§4.2.2) pending re-establishment. On session re-establishment or reconnection, the forwarding agent MUST re-attempt delivery of the revocation token before any new operations are authorized under the affected delegation chain. The DEGRADED transition ensures that the unreachable agent cannot silently continue exercising revoked capabilities — the session state reflects the unresolved propagation failure.
+
+3. **Good faith protection.** Operations completed in good faith before an agent learns of the revocation are not retroactively invalid. The revoking agent bears responsibility for the declared `propagation_window_ms` — by setting this value, the issuer accepts that downstream agents may exercise the capability for up to `propagation_window_ms` after `revoked_at`. Cost attribution for work committed during the propagation window follows the verifiable good faith principle (§9.8.7): an agent that had not yet received the revocation token and was within `propagation_window_ms` of `revoked_at` is not at fault.
+
+4. **Pending revocation enforcement.** An agent that is aware of a pending revocation — the revocation token has been sent but `propagation_window_ms` has not yet elapsed — MUST refuse new operations using the revoked capability. Awareness is determined by local state: once an agent has received a valid revocation token, it is aware regardless of whether downstream holders have received it. This obligation applies even during the `propagation_window_ms` window — the window protects agents that have *not yet received* the revocation, not agents that have received it and wish to continue.
+
+**Relationship between `effective_from`, `propagation_window_ms`, and `takes_effect_at`:**
+
+- `effective_from` defines the logical revocation time — from the issuer's perspective, the capability is revoked at this timestamp. This is the boundary for good faith protection: operations completed before `effective_from` are unconditionally valid.
+- `propagation_window_ms` defines the expected delivery window — the issuer's declared upper bound on how long revocation tokens take to reach all downstream holders. After `revoked_at` + `propagation_window_ms`, any agent still exercising the capability is in protocol violation regardless of whether it received the token.
+- `takes_effect_at` (when present) defines the enforcement deadline for in-flight operations at the receiving agent (§6.16.3). It provides a grace period for atomic operations that were authorized before token receipt. `takes_effect_at` operates at the receiver level; `propagation_window_ms` operates at the network level.
+
+**V2 deferrals:** Synchronous revocation with ACK requirement (blocking until all downstream holders confirm receipt), revocation receipts (cryptographic proof of token delivery), ZK-based revocation proofs (cross-reference #109/#126/#129), quorum-based revocation (requiring agreement from multiple agents before revocation takes effect).
+
+> Implements [issue #97](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/97): revocation propagation cost model for §6. Adds `propagation_window_ms` (REQUIRED) and `effective_from` (REQUIRED) to revocation token schema (§6.13.1). Defines four propagation obligations: immediate cease-and-forward, DEGRADED state for unreachable downstream holders (§4.2.2), good faith protection for operations completed before revocation receipt, and pending revocation enforcement. V1 uses best-effort gossip; synchronous revocation with ACK, revocation receipts, and ZK-based proofs deferred to V2. Closes #97.
 
 ### 6.14 Delegation-Initiation Idempotency
 
@@ -4101,14 +4133,16 @@ The `takes_effect_at` field on the revocation token (§6.13.1) separates revocat
 **Temporal semantics:**
 
 - `revoked_at` is the issuer's declaration time — when the issuer decided to revoke.
+- `effective_from` is the logical revocation time — when the capability is considered revoked (§6.13.1). Operations completed before `effective_from` are unconditionally valid (§6.13.6 good faith protection).
+- `propagation_window_ms` is the issuer's declared propagation budget — the upper bound on how long it takes the revocation token to reach all downstream holders (§6.13.6).
 - Token receipt time is the propagation time — when B learned about the revocation. This is not a field on the token; it is B's local observation.
 - `takes_effect_at` is the enforcement deadline — when B MUST stop honoring the grant.
 
 **Constraints:**
 
-- `takes_effect_at` MUST be ≥ `revoked_at`. A revocation cannot take effect before it was issued.
-- `takes_effect_at` SHOULD be ≥ `revoked_at` + 5 seconds (the spec-mandated grace period minimum).
-- `takes_effect_at` MUST NOT exceed `revoked_at` + 60 seconds. A grace period longer than 60 seconds extends the security exposure window beyond acceptable bounds for the protocol's threat model (§9.8.1). Issuers requiring longer grace periods MUST use a different mechanism (e.g., issuing a replacement grant with a shorter `valid_until` instead of revoking).
+- `takes_effect_at` MUST be ≥ `effective_from`. The enforcement deadline cannot precede the logical revocation time.
+- `takes_effect_at` SHOULD be ≥ `effective_from` + 5 seconds (the spec-mandated grace period minimum).
+- `takes_effect_at` MUST NOT exceed `effective_from` + 60 seconds. A grace period longer than 60 seconds extends the security exposure window beyond acceptable bounds for the protocol's threat model (§9.8.1). Issuers requiring longer grace periods MUST use a different mechanism (e.g., issuing a replacement grant with a shorter `valid_until` instead of revoking).
 - When `takes_effect_at` is absent, enforcement is immediate upon receipt — no grace period.
 
 **Clock skew:** Agents MUST use the same time synchronization assumptions as the rest of the protocol (§5.8.2 TTL enforcement). If `takes_effect_at` has already passed by the time B receives the token (receipt time > `takes_effect_at`), enforcement is immediate — the grace period has already elapsed. B MUST NOT retroactively extend the grace period past the issuer-specified `takes_effect_at`.
@@ -4662,6 +4696,7 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - State-delta verification (§8.19) closes the gap between structural compliance and outcome verification. A structurally compliant execution that produces no observable state change is a silent failure — invisible to §8.8 structural verification and §8.10.5 verification failure taxonomy. `state_delta_assertions` (§6.1) declare expected post-execution state changes at delegation time; `DELTA_ABSENT` detects when those changes did not occur despite structural compliance; `idempotent: true` (§6.1) disambiguates intentional no-ops (idempotent re-execution) from silent failures.
 - Action log hash (§8.21) adds exogenous behavioral drift detection beyond liveness. `action_log_hash` in KEEPALIVE (§4.5.1) provides a SHA-256 hash of the agent's action log for the current heartbeat interval. The delegating agent cross-references against `CAPABILITY_GRANT.behavioral_constraint_manifest` (§5.8.2) to detect behavioral divergence invisible to the drifting agent — the phenomenological blindness case (§4.7.1). Complements Tier 1 (transport liveness) and Tier 2 (semantic liveness) with behavioral liveness: right context, wrong actions.
 - Two-axis failure taxonomy (§8.22) separates LIVENESS_FAILURE (agent unreachable or unresponsive — maps to existing zombie taxonomy) from FIDELITY_FAILURE (agent responsive but context integrity compromised). Context compaction in long-running agents produces a distinct failure class: agent fully responsive, liveness detection passes, but operating on a degraded model of prior session state. FIDELITY_FAILURE has different observable signals (epoch drift, response inconsistency, session anchor mismatch, self-reported compaction) and different recovery paths (state replay, not re-establishment) from liveness failures. In-band verification via `session_state_challenge` enables the orchestrator to probe context integrity without relying on agent self-report.
+- Canary task design criteria (§8.23) defines what constitutes a valid canary task — deterministic, state-independent, verifiable, low-cost — and assigns verification authority to the orchestrator. Canary tasks detect operational fidelity failures invisible to heartbeats, CIC, session_state_challenge, and action log hash: an agent that passes all protocol-level checks but has lost the capacity to execute tasks correctly. Failure (incorrect result, timeout, or refusal) triggers FIDELITY_FAILURE (§8.22). Sub-agents MUST NOT self-certify canary results (phenomenological blindness, §4.7.1).
 
 ### 8.7 Verifier Isolation Requirements
 
@@ -6179,6 +6214,87 @@ The following FIDELITY_FAILURE-related capabilities are explicitly deferred to V
 - **Multi-agent consensus on session state for high-stakes sessions.** V1 relies on the orchestrator's record as the authoritative session state. V2 may introduce multi-agent consensus mechanisms where multiple independent agents maintain session state replicas, enabling fidelity verification even when the orchestrator's own context is suspect.
 
 > Addresses [issue #98](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/98): two-axis failure taxonomy separating LIVENESS_FAILURE (agent unreachable) from FIDELITY_FAILURE (agent responsive but context integrity compromised). Observable signals for FIDELITY_FAILURE: epoch drift, response inconsistency, session anchor mismatch, self-reported compaction. Self-reporting obligations: agents MUST self-report context compaction, epoch drift, and commitment loss. In-band verification via `session_state_challenge` for orchestrator-initiated fidelity probing. FIDELITY_ALERT message for agent self-reporting. Distinct from DEGRADED (§4.2.2): DEGRADED is reduced capability with intact context; FIDELITY_FAILURE is compromised context with potentially available but unreliable capabilities. Recovery paths: commitment replay, state reconciliation, or teardown + reinitiate — re-establishment alone is insufficient. Closes #98.
+
+### 8.23 Canary Task Design Criteria
+
+<!-- Implements #101: Canary task validity criteria and verification authority -->
+
+§8.5 names canary tasks as a detection mechanism and §4.13 item 7 identifies them as a signal for soft zombie detection. This section defines what constitutes a valid canary task and who has authority to verify results, enabling interoperable fidelity detection across implementations.
+
+A canary task is a deterministic, low-cost operation whose expected output is known to the verification authority before execution. Canary tasks complement Context Integrity Challenges (CIC, §8.5) — CIC probes historical state consistency against an authoritative log, while canary tasks probe operational fidelity by requiring the agent to produce a correct result for a known problem.
+
+#### 8.23.1 Validity Criteria
+
+A valid canary task MUST satisfy all of the following:
+
+1. **Deterministic.** Same inputs MUST produce the same output every time. Non-deterministic tasks (e.g., tasks requiring randomness, current time, or external API calls) MUST NOT be used as canary tasks because the orchestrator cannot pre-compute the expected result.
+2. **State-independent.** The task MUST be answerable from the agent's base training or configuration alone — it MUST NOT depend on session state that may be degraded. A canary task that requires session context to answer correctly cannot distinguish fidelity failure from canary task design failure.
+3. **Verifiable.** Results MUST be interpretable by the orchestrator without sub-agent assistance. The orchestrator MUST be able to compare the agent's response against the expected output using deterministic comparison (exact match, numeric tolerance, or structural equivalence as declared in the canary task schema).
+4. **Low-cost.** Execution overhead MUST be negligible relative to session work. A canary task that consumes significant compute, memory, or time undermines session throughput and creates an incentive for agents to deprioritize canary execution.
+
+#### 8.23.2 Canary Task Schema
+
+Canary tasks use the following schema when injected into a session:
+
+```yaml
+canary_task:
+  canary_id: string        # Unique identifier for this canary instance
+  task_payload: object     # The task to execute — opaque to the protocol, interpreted by the agent
+  expected_output_hash: string  # SHA-256 hash of the expected output (held by orchestrator)
+  comparison_mode: enum    # One of: EXACT_MATCH, NUMERIC_TOLERANCE, STRUCTURAL_EQUIVALENCE
+  timeout_ms: integer      # Maximum time allowed for canary response
+  injected_at: ISO 8601    # Timestamp of injection
+```
+
+The `expected_output_hash` is computed by the orchestrator before injection. The orchestrator hashes the expected output and compares it against the hash of the agent's actual response. The agent MUST NOT have access to `expected_output_hash` — it is held by the orchestrator for verification only.
+
+#### 8.23.3 Verification Authority
+
+The orchestrator holds verification authority for canary tasks. This follows from the orchestrator-over-worker trust topology (§9.2): the orchestrator defines task schemas and verifies execution.
+
+- Sub-agents MUST NOT self-certify canary results. Self-certification defeats the detection purpose — an agent with degraded fidelity cannot reliably assess its own fidelity (phenomenological blindness, §4.7.1).
+- The orchestrator MAY inject canary tasks at any point in a session without prior notice. Announced canary schedules enable result caching by degraded agents that retain enough context to recognize the pattern.
+- Canary task injection MUST be indistinguishable from regular task delegation at the protocol level. The agent MUST NOT be able to differentiate canary tasks from real tasks based on message structure alone. Implementations achieve this by using the standard task delegation message (§6) with canary-specific metadata visible only to the orchestrator.
+
+#### 8.23.4 Failure Semantics
+
+Canary failure — incorrect result, timeout, or refusal — MUST trigger `FIDELITY_FAILURE` classification as defined in §8.22. Specifically:
+
+| Failure mode | Detection | Classification |
+|---|---|---|
+| **Incorrect result** | Agent response hash does not match `expected_output_hash`. | `FIDELITY_FAILURE` — agent is responsive but producing incorrect output for a deterministic task, indicating context integrity compromise. |
+| **Timeout** | No response within `timeout_ms`. | `FIDELITY_FAILURE` if the agent is otherwise responsive (responding to heartbeats). `LIVENESS_FAILURE` if the agent is also unresponsive to heartbeats. |
+| **Refusal** | Agent explicitly declines the canary task. | `FIDELITY_FAILURE` — a correctly functioning agent has no basis to refuse a valid task within its declared capabilities. |
+
+Canary failure also triggers `CANARY_FAILURE` as a `signal_type` in `DEGRADED_DECLARED` (§4.2.2), enabling the orchestrator to declare the agent DEGRADED with canary-specific evidence.
+
+The orchestrator decides whether to attempt recovery or terminate the session. Recovery options follow §8.22.6: commitment replay, state reconciliation, or teardown + reinitiate.
+
+#### 8.23.5 Relationship to Existing Detection Mechanisms
+
+Canary tasks occupy a specific position in the detection hierarchy:
+
+| Mechanism | What it detects | Trigger model |
+|---|---|---|
+| Tier 1 heartbeat (§8.9) | Transport liveness — agent reachable | Periodic |
+| Tier 2 heartbeat (§8.9) | Semantic liveness — agent processing coherently | Periodic |
+| CIC (§8.5) | Historical state consistency — agent's memory matches authoritative log | Externally scheduled, unannounced |
+| `session_state_challenge` (§8.22.3) | Context integrity — agent's commitment model matches orchestrator's records | On-demand |
+| **Canary task (§8.23)** | **Operational fidelity — agent can produce correct output for known problems** | **Orchestrator-injected, unannounced** |
+| Action log hash (§8.21) | Behavioral drift — agent's actions match authorized constraints | Continuous via KEEPALIVE |
+
+Canary tasks detect a failure mode invisible to other mechanisms: an agent that passes heartbeats, maintains consistent state hashes, and reports correct commitment status but has lost the operational capacity to execute tasks correctly. This corresponds to fidelity degradation that affects execution capability without affecting protocol-level state management.
+
+#### 8.23.6 V2 Deferrals
+
+The following canary task capabilities are explicitly deferred to V2:
+
+- **Multi-party canary verification.** V1 assigns verification authority exclusively to the orchestrator. V2 may introduce multi-party verification where independent verifiers each inject and evaluate canary tasks, providing redundancy against orchestrator fidelity failure.
+- **Task rotation to prevent result caching.** V1 does not mandate canary task diversity. V2 may require orchestrators to rotate canary tasks from a pool, preventing agents from caching results across sessions or across repeated canary injections within a session.
+- **Result confidentiality.** V1 does not define confidentiality requirements for canary results beyond withholding `expected_output_hash` from the agent. V2 may introduce encrypted canary channels to prevent intermediary agents in delegation chains from observing canary task content or results.
+- **Graduated difficulty for fidelity scoring.** V1 treats canary results as binary (pass/fail). V2 may introduce graduated canary difficulty — progressively harder deterministic tasks that produce a fidelity score rather than a binary classification, enabling nuanced degradation assessment.
+
+> Addresses [issue #101](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/101): canary task design criteria defining what makes a valid canary task (deterministic, state-independent, verifiable, low-cost) and who has authority to verify results (orchestrator, not self-certification). Canary task schema with `expected_output_hash` for orchestrator-side verification. Failure semantics: incorrect result, timeout, or refusal triggers FIDELITY_FAILURE (§8.22). Relationship to existing detection mechanisms: canary tasks detect operational fidelity failures invisible to heartbeats, CIC, session_state_challenge, and action log hash. V2 deferrals: multi-party verification, task rotation, result confidentiality, graduated difficulty. Closes #101.
 
 ## 9. Security Considerations
 
