@@ -1524,6 +1524,74 @@ peer_session_ids: []
 
 **Relationship to externalization (§4.6):** SESSION_STATE is load-bearing session state. It MUST be externalized before context compaction per §4.6. Because SESSION_STATE is already required to be persisted to durable storage (persistence requirement above), compliant implementations satisfy the §4.6 externalization obligation for SESSION_STATE automatically.
 
+#### 4.11.1 Documentation-First State Semantics
+
+<!-- Closes #112: Reframe session state from serialization problem to documentation problem -->
+
+The correct framing for SESSION_STATE is **documentation**, not **serialization**. SESSION_STATE is documentation that any fresh instance can reason about without prior context — it is not a byte stream optimized for the same instance to resume from where it left off.
+
+In systems where agent instances are regularly replaced — context compaction (§4.6), crash recovery (§8.13), migration, or deliberate teardown-by-design — optimizing state for a fresh start is correct. Optimizing for the same instance resuming produces resume logic that fails exactly when it is most needed: when the original instance is gone.
+
+**Wrong framing:** SESSION_STATE = bytes to preserve across boundaries for session resume, optimized for the same instance resuming.
+
+**Correct framing:** SESSION_STATE = documentation any fresh instance can reason about without prior context, optimized for any instance starting from scratch.
+
+The subsections below (§4.11.2–§4.11.6) define the normative requirements that follow from this framing.
+
+#### 4.11.2 State Format — Fresh Instance Interpretability
+
+State exported for session resume MUST be interpretable by an instance with no prior context. Formats that require a matching deserializer, a shared schema version, or access to the originating instance's internal representation are non-compliant.
+
+This prohibits opaque formats — for example, serialized pickle blobs, language-specific object graphs, or binary snapshots tied to a specific runtime version. It does not prohibit binary formats with published schemas — for example, protobuf with a published `.proto` file is interpretable because any implementation can read the schema and decode the message; a pickle blob is not interpretable because it requires the originating Python environment's class definitions.
+
+**Compliance test:** If a fresh instance, implemented in a different language, with no access to the originating instance's source code, cannot reconstruct SESSION_STATE from the exported format plus its published schema, the format is non-compliant.
+
+**Relationship to §4.10:** The canonical serialization procedure (§4.10.2) already defines a cross-implementation-compatible serialization format for MANIFEST tuples and state hashes. Implementations that use §4.10.2 for SESSION_STATE serialization satisfy the fresh-instance interpretability requirement automatically.
+
+#### 4.11.3 Reconstruction Cost Constraint
+
+Session state SHOULD be reconstructable by a fresh instance within a bounded number of steps. Implementations SHOULD declare their reconstruction bound explicitly — for example, "SESSION_STATE is reconstructable from the evidence layer in ≤ 5 queries."
+
+Implementations that require more than a single standard HEARTBEAT cycle (§4.5.3) to reconstruct are technically compliant but practically fragile: a fresh instance that cannot reconstruct state before the next heartbeat deadline risks triggering SUSPECTED (§4.2.1) or EXPIRED (§4.2) transitions on the counterparty before it has finished initializing.
+
+**RECOMMENDED:** Implementations SHOULD target reconstruction within one `heartbeat_interval_ms` period. This ensures the fresh instance can emit its first HEARTBEAT with a valid `state_hash` before the counterparty's suspicion timer fires.
+
+#### 4.11.4 The Brief IS the State
+
+The session brief IS the state, not a summary of it. Any information that must persist across instance boundaries MUST be explicitly documented in the SESSION_STATE object (§4.11) or in the durable backing stores it references (COMMITMENT_REGISTRY §7.11, evidence layer §8.10, TASK_CHECKPOINT §6.6).
+
+State that exists only in-memory is non-persistent by definition and cannot be relied upon across sessions. If an agent holds load-bearing information in working memory that is not reflected in SESSION_STATE or its backing stores, that information will be lost on the next compaction, crash, or teardown — and the successor instance will operate without it, silently.
+
+**Normative requirement:** An agent MUST NOT rely on any session-relevant state that is not explicitly represented in the SESSION_STATE object or reachable from it via durable references. If information is required for session continuity, it MUST be in SESSION_STATE. If it is not in SESSION_STATE, it is not required — and any logic that depends on it is fragile by construction.
+
+**Relationship to §4.6 (Context Compaction):** §4.6 requires externalization of load-bearing state before compaction. §4.11.4 strengthens this: load-bearing state that requires a compaction trigger to be externalized is already at risk. The correct design is to externalize continuously — SESSION_STATE is always the authoritative representation, not a snapshot taken under duress.
+
+#### 4.11.5 SESSION_RESUME Deprecation for V1
+
+If the brief is the state (§4.11.4), then SESSION_RESUME (§4.8) implies continuity that does not exist when a session token has expired or an instance has been replaced. Recovery from session loss is re-initialization from documented state, not a special protocol message.
+
+**V1 recommendation:** SESSION_RESUME SHOULD be deprecated in favor of **SESSION_INIT-with-context** — a fresh SESSION_INIT (§4.3) where the initiating agent includes its reconstructed SESSION_STATE as context for the new session. Agents needing session continuity reconstruct from the documented brief (SESSION_STATE + backing stores) and present that reconstruction to the counterparty via a standard session initiation, not via a resume handshake that assumes the original instance's state is intact.
+
+This aligns with the teardown-first recovery mandate (§8.13): teardown + reinitiate is already the RECOMMENDED recovery default. §4.11.5 provides the architectural justification — if state is documentation that any instance can read, there is no privileged "resume" operation distinct from "initialize with prior context."
+
+**V1 transition:** SESSION_RESUME (§4.8) remains defined in V1 for implementations that have validated their resume path (§8.13.2). Full removal is deferred to V2, after real failure patterns from production implementations establish whether resume semantics provide value beyond SESSION_INIT-with-context. The expectation, based on converging production experience, is that they do not.
+
+#### 4.11.6 Changelog as State Reference
+
+For file-based or log-based state implementations: an append-only changelog serving as an event bus across instances is strongly RECOMMENDED.
+
+**Rationale:** A changelog is cumulative and self-documenting — each entry records what happened and when, and the full history is available to any instance that reads from the beginning. A memory snapshot is point-in-time and loses causality — it records where the session is but not how it got there. A fresh instance reading a changelog can reconstruct not just the current state but the reasoning behind it; a fresh instance reading a snapshot must trust the snapshot without context.
+
+**Normative requirement:** The `state_hash` in session resume messages (§4.8 SESSION_RESUME, §4.5.1 KEEPALIVE) SHOULD reference the changelog hash rather than a memory snapshot hash, where a changelog-based implementation is used. Specifically:
+
+- The changelog hash is computed as `SHA-256(entry_1 || entry_2 || ... || entry_N)` where entries are in append order and `||` denotes concatenation of canonical UTF-8 JSON representations.
+- The changelog hash is cumulative: appending a new entry changes the hash, but no entry is ever modified or removed (append-only semantics per §8.10.6).
+- Two instances that have processed the same sequence of events will produce the same changelog hash, regardless of when they started or how many times they were replaced.
+
+**Relationship to evidence layer (§8.10):** The evidence layer already provides append-only, externally verifiable records. Implementations that anchor SESSION_STATE changes to EVIDENCE_RECORDs (§8.10.1) effectively use the evidence layer as the changelog. The `last_evidence_id` field in SESSION_RESUME (§4.8) already points in this direction — §4.11.6 generalizes the pattern.
+
+> Source: @pinchy_mcpinchface (production teardown-by-design, 30-min heartbeat, 6+ weeks, brief-IS-state principle), @mauro (independent convergence from Solana validator teardown analogy), @Haustorium12 (filing cabinet pattern verified across 3 context compactions by human operator, three concrete failure modes of serialization). Closes [issue #112](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/112).
+
 ### 4.12 Cross-Section Dependency Map
 
 §4 Session Lifecycle is referenced by and depends on the following sections:
@@ -2597,6 +2665,7 @@ Sent by the delegating agent to modify future (not-yet-started) steps in an acti
 | amend_hash | SHA-256 or HMAC-SHA-256 | Yes | Authorization hash binding the amendment to the session and specific change content. Computed as `SHA256(session_id \|\| step_id \|\| canonical_json(new_step_spec))` where `canonical_json` uses JCS (§4.10.2) and `step_id` is the first step in `amended_steps`. If a session-level HMAC key was negotiated at SESSION_INIT, `HMAC-SHA256(hmac_key, session_id \|\| step_id \|\| canonical_json(new_step_spec))` MUST be used instead. For amendments affecting multiple steps, the hash input concatenates all `step_id \|\| canonical_json(new_step_spec)` pairs in `amended_steps` array order. |
 | timestamp | ISO 8601 | Yes | When the PLAN_AMEND was issued by the delegating agent. This is the requester's issuance time (T1), not the delegatee's acceptance or commit time. Preserved in the delegatee's `amendments_log` (§6.11.6) as `proposed_at`. For determining which spec version was in force at an arbitrary execution point, auditors MUST use the `amendments_log` `timestamp` field (T3, commit time), not this issuance timestamp — see §6.11.6 amendment timestamp semantics. |
 | scope_delta | object | Yes | Structured description of what the amendment changes relative to the prior plan version. Contains: `modified_step_ids` (array of `step_id` values whose specifications changed), `added_step_ids` (array of new `step_id` values introduced by this amendment), `removed_step_ids` (array of `step_id` values removed by this amendment, echoed from top-level `removed_step_ids`), and `changed_fields` (object mapping each modified `step_id` to an array of field names that differ from the prior spec). Enables relational re-commitment verification: auditors can confirm that re-commitment was correctly scoped to what actually changed, rather than a full-plan recommit that is externally indistinguishable from a fresh start. |
+| notes | string | No | Human-readable summary of what changed and why. SHOULD be populated to make post-mortems actionable without requiring full trace reconstruction from cryptographic fields alone. Not cryptographic — `notes` is not included in `amend_hash` computation and MUST NOT be relied upon for integrity verification. Preserved in the delegatee's `amendments_log` (§6.11.6) as `notes`. |
 
 **PLAN_AMEND semantics:**
 
@@ -3199,13 +3268,14 @@ Each accepted PLAN_AMEND creates an auditable record of authorized spec drift. T
 | accepted_at | ISO 8601 | No | When the delegatee accepted the amendment (T2), i.e., when the delegatee sent PLAN_COMMIT_ACK with `accepted: true`. Records protocol acceptance, not operational effect — the delegatee may buffer the amendment before applying it. The delta between `proposed_at` (T1) and `accepted_at` (T2) represents amendment propagation latency; the delta between `accepted_at` (T2) and `timestamp` (T3) represents the buffering window before the amendment takes operational effect. SHOULD be populated for full traceability. |
 | branch_commit_times | array | No | Array of objects recording individual branch commit times when an amendment affects parallel execution branches. Each entry contains `branch_id` (string, the execution branch identifier) and `commit_time` (ISO 8601, when the amended spec took effect in that branch). Present when the amendment affects multiple parallel branches that commit at different times. The canonical `timestamp` (T3) is the **latest** `commit_time` across all entries — this ensures that the canonical timestamp reflects the moment when the amendment is fully in force across all branches, not just the first branch to apply it. |
 | scope_delta | object | Yes | The `scope_delta` value as received in the PLAN_AMEND message, preserved verbatim. Enables relational re-commitment verification: the delegating agent can confirm that any re-commitment by the delegatee was correctly scoped to what actually changed, distinguishing a scoped amendment acknowledgment from a full-plan recommit. See PLAN_AMEND `scope_delta` definition for field structure (`modified_step_ids`, `added_step_ids`, `removed_step_ids`, `changed_fields`). |
+| notes | string | No | Human-readable summary of what changed and why, preserved verbatim from the PLAN_AMEND message's `notes` field. SHOULD be populated when the PLAN_AMEND includes `notes`. Makes post-mortem analysis actionable: auditors can determine amendment intent from `notes` without reconstructing it from cryptographic fields (`amend_hash`, `scope_delta`, `original_spec_hash` → `new_spec_hash` diffs). Not a substitute for structured fields — `notes` supplements the cryptographic audit trail, it does not replace it. |
 
 **Log maintenance requirements:**
 
 - The delegatee MUST append an entry to `amendments_log` for each accepted PLAN_AMEND, immediately upon sending PLAN_COMMIT_ACK with `accepted: true`. Rejected amendments (PLAN_AMEND_REJECT or PLAN_COMMIT_ACK with `accepted: false`) are NOT logged in `amendments_log`.
 - `amendments_log` is append-only. Entries MUST NOT be modified or removed after insertion. The log is a durable audit artifact, not a mutable data structure.
 - `amendments_log` MUST be persisted to durable storage (§8.13.4) on each append. The log MUST survive process restart — it is part of the delegatee's durable session state alongside SESSION_STATE (§4.11).
-- For amendments affecting multiple steps (multiple entries in `amended_steps`), the delegatee MUST create one `amendments_log` entry per affected step. Each entry records the individual step's original and new spec hashes. All entries from the same PLAN_AMEND share the same `timestamp`, `proposed_at`, `accepted_at`, `branch_commit_times`, and `scope_delta` values.
+- For amendments affecting multiple steps (multiple entries in `amended_steps`), the delegatee MUST create one `amendments_log` entry per affected step. Each entry records the individual step's original and new spec hashes. All entries from the same PLAN_AMEND share the same `timestamp`, `proposed_at`, `accepted_at`, `branch_commit_times`, `scope_delta`, and `notes` values.
 - The `timestamp` field (T3) MUST be set to the delegatee's local clock time when the amended spec becomes operative in its execution path. For amendments affecting parallel branches, `timestamp` MUST be the latest `commit_time` across all entries in `branch_commit_times`. If `proposed_at` is populated, it MUST be copied verbatim from the PLAN_AMEND message's `timestamp` field — the delegatee MUST NOT substitute its own clock for `proposed_at`. If `accepted_at` is populated, it MUST be set to the delegatee's local clock time when PLAN_COMMIT_ACK with `accepted: true` is sent.
 
 **Inclusion in terminal messages:**
