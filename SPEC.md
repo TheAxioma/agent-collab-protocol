@@ -3542,6 +3542,7 @@ The `reason` field MUST use one of the following values. Each value identifies a
 | `verifier_restored` | The verification system previously logged as unreachable is now reachable again. Append-only recovery entry. See §8.10.6. | A verifier that was the subject of a prior `verification_unreachable` entry has been confirmed reachable. | Process normally. The gap window between unreachable and restored is documented for forensic reconstruction. Requires `restored_gap_ref` field linking to the original unreachable entry. |
 | `attestation_failure` | The per-hop delegation attestation (§6.4.1) failed verification at the receiving agent. The cryptographic binding of delegator identity to task and intent could not be confirmed. Distinct from `verification_reject` (verifier evaluated evidence and rejected it) and `verification_unreachable` (verifier was not reachable). See §6.4.1. | The receiving agent attempted to verify the `delegation_attestation` signature in TASK_ASSIGN and verification failed: invalid signature, unknown key, hash mismatch between attested and received values, or missing attestation. | No recovery at this hop. The receiving agent MUST reject the delegation (TASK_REJECT). The delegating agent SHOULD investigate the cause — key rotation, transmission corruption, or intermediary tampering. The `context` field in the divergence entry MUST include `attesting_node_id`, `asserted_task_hash`, `asserted_intent_hash`, and `failure_reason`. |
 | `delta_absent` | Expected state change did not occur despite structural compliance — silent failure detected. The task's `state_delta_assertions` (§6.1) were checked post-execution and the expected observable delta was not found. See §8.19. | The task specification included `state_delta_assertions`, the agent reported structural completion (TASK_COMPLETE), verification of structural compliance passed, but one or more declared state-delta assertions were not confirmed. If the task declares `idempotent: true` (§6.1), `delta_absent` is expected behavior and MUST NOT be logged as a failure. | Investigate root cause. The agent executed structurally but produced no observable outcome. Possible causes: incorrect task parameters, target system state already satisfied, agent execution was a no-op despite reporting completion. Retry MAY succeed if the cause was transient. Re-planning is required if the task specification was incorrect. |
+| `assignment_integrity_failure` | The verifier assignment record is missing, was not pre-committed before task execution, or the `selection_rationale` was annotated post-hoc rather than declared at assignment time. See §8.20. | A verifier's `selection_rationale` was not present in the signed assignment record at assignment time, or no pre-committed assignment record exists for a verification event. Post-hoc rationale annotation — where the rationale appears only after verification completes — is indistinguishable from a constructed justification and triggers this reason. Also applies when a verifier substitution occurred without a corresponding VERIFIER_REASSIGNMENT event (§8.20.4). | Audit investigation required. The assignment integrity violation invalidates the independence guarantee of the verification. Results from the affected verifier SHOULD be treated as unanchored — structurally present but not independently auditable. If the violation is due to missing pre-commitment, the assigning party's process requires remediation. If due to undocumented substitution, investigate whether the substitution was an operational necessity or an attempt to select a favorable verifier post-hoc. |
 
 **Relationship to §7.8 `deviation_type`:** The §7.8 `deviation_type` enum (`RESOURCE_UNAVAILABLE`, `CONTEXT_SHIFT`, `CAPABILITY_MISMATCH`, `OPTIMIZATION`, `TIMEOUT`, `EXTERNAL_CONSTRAINT`, `OTHER`) and the §8.10.4 `reason` enum serve different classification purposes. §7.8 categorizes _what kind_ of divergence occurred at the step level (inline in TASK_COMPLETE/TASK_FAIL). §8.10.4 categorizes _why_ the divergence occurred at the evidence level, with recovery routing as the primary design goal. The two may co-occur: a `RESOURCE_UNAVAILABLE` deviation (§7.8) might be classified as `infrastructure_noise` (§8.10.4) if it was transient, or as `external_constraint` if the resource is permanently unavailable.
 
@@ -4374,6 +4375,136 @@ Tasks MAY declare `idempotent: true` (§6.1) when repeated execution by design p
 
 > Addresses [issue #141](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/141): state-delta verification gap — silent failures that pass structural verification without producing expected state changes are now detectable as a distinct failure class (`DELTA_ABSENT`) with explicit audit trail semantics. Extends task specification (§6.1) with `state_delta_assertions` and `idempotent` fields, adds four verification result states (`DELTA_CONFIRMED`, `DELTA_ABSENT`, `DELTA_UNVERIFIABLE`, structural-only), and introduces `delta_absent` to the §8.10.4 divergence reason enum for forensic reconstruction.
 
+### 8.20 Verifier Pre-Commitment
+
+The `selection_rationale` field documents why a particular verifier was chosen for a verification task. Without a pre-commitment requirement, this field is annotatable post-verification — a verifier completing execution can observe the outcome and write a rationale explaining it. Post-hoc rationale is cryptographically defeatable: it can always be crafted to justify any actual result, making it useless as an audit mechanism. Pre-commitment converts `selection_rationale` from a narrative artifact into an auditable claim. A rationale declared before execution and signed by the assigning party can be evaluated against the actual verification outcome. A rationale declared after execution cannot be distinguished from a constructed justification. The entire audit value of `selection_rationale` depends on pre-commitment.
+
+#### 8.20.1 Pre-Commitment Requirement
+
+`selection_rationale` MUST be declared at verifier assignment time, before task execution begins. The rationale is part of the signed assignment record (§8.20.3) and MUST appear in the audit log at assignment time — not at verification completion time.
+
+**Timing constraint:** The `selection_rationale` timestamp MUST precede the task execution start timestamp. Implementations that detect a `selection_rationale` with a timestamp at or after execution start MUST treat this as an `assignment_integrity_failure` (§8.10.4) and log it accordingly.
+
+**Signing requirement:** The `selection_rationale` MUST be signed by the assigning party (the agent or coordinator that selected the verifier) as part of the assignment record. The signature binds the rationale to the assigning party's identity and to the specific task-verifier pairing, preventing post-hoc rationale substitution.
+
+#### 8.20.2 Selection Basis Taxonomy
+
+Free-text rationale cannot be mechanically audited. The `selection_basis` field uses a closed enum of selection basis types that enable structured audit of verifier selection decisions.
+
+**Selection basis values:**
+
+| selection_basis | Description | When it applies |
+|-----------------|-------------|-----------------|
+| `random` | Verifier selected by random assignment from the eligible pool. | The assigning party used a randomized selection mechanism (e.g., round-robin, weighted random, cryptographic lottery) to choose among eligible verifiers. The selection is not based on any verifier-specific attribute. |
+| `role_based` | Verifier selected based on declared role or credential. | The verifier holds a specific role (e.g., `security-auditor`, `compliance-reviewer`) or credential that qualifies it for this verification task. The role or credential is declared in the verifier's CAPABILITY_MANIFEST (§5). |
+| `capability_based` | Verifier selected based on demonstrated capability. | The verifier has demonstrated proficiency in the specific verification domain — e.g., prior successful verifications of similar task types, specialized tooling, or domain expertise declared in its manifest. |
+| `proximity_based` | Verifier selected based on network proximity or latency optimization. | The verifier was chosen for operational reasons — lower latency, same availability zone, or network topology considerations. Selection is based on infrastructure characteristics, not verifier-specific trust or capability attributes. |
+| `explicit_nomination` | Verifier explicitly named by the delegating agent. | The delegating agent (the party that originated the task) specified a particular verifier by identity. The assigning party honored the nomination. This basis has the highest attribution clarity — the nominating party is explicitly identified. |
+
+**Structured basis + detail:** The `selection_basis` enum provides the machine-readable classification; the optional `selection_detail` field provides human-readable context. For example, `selection_basis: role_based` with `selection_detail: "Verifier holds cap:security.audit@2.0 credential, required for tasks in the com.example.security namespace"`. The basis is auditable; the detail provides investigative context.
+
+**Extension mechanism:** Implementations MAY extend this enum with deployment-specific values prefixed by `x-` (e.g., `x-geographic-compliance`, `x-regulatory-mandate`). Standard selection basis values MUST NOT be prefixed. Receiving agents that encounter an unrecognized `selection_basis` MUST treat it as opaque — log it, surface it to operators, but do not treat it as a protocol error.
+
+#### 8.20.3 Verifier Assignment Record
+
+The verifier assignment record is the signed, pre-committed structure that binds a verifier to a task before execution begins. It is the cryptographic anchor for verifier selection audit.
+
+**VERIFIER_ASSIGNMENT fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| assignment_id | UUID v4 | Yes | Unique identifier for this assignment record. |
+| task_hash | SHA-256 | Yes | Hash of the task specification (§6.1) for which the verifier is being assigned. Binds the assignment to a specific task. |
+| verifier_id | string | Yes | §2 identity handle of the assigned verifier. |
+| selection_basis | enum | Yes | Machine-readable classification of why this verifier was selected. See §8.20.2 for the enum values. |
+| selection_detail | string | No | Human-readable elaboration on the selection basis. Provides investigative context that the enum alone cannot convey. |
+| assigning_agent_id | string | Yes | §2 identity handle of the agent that selected the verifier. This is the party whose signature authenticates the assignment. |
+| assignment_signature | string | Yes | Cryptographic signature over the tuple `(task_hash ‖ verifier_id ‖ selection_basis ‖ selection_detail ‖ assigning_agent_id)`. Computed using the assigning agent's signing key. Ensures the assignment record cannot be fabricated or altered after commitment. |
+| timestamp | ISO 8601 | Yes | When the assignment was committed. Millisecond precision REQUIRED. MUST precede the task execution start timestamp. |
+
+**Semantics:**
+
+- The VERIFIER_ASSIGNMENT record MUST be committed to the evidence layer (§8.10) before task execution begins. A task whose execution starts without a corresponding VERIFIER_ASSIGNMENT in the evidence layer is executing without pre-committed verification — any subsequent verification result is unanchored from an assignment audit perspective.
+- The `assignment_signature` field binds the assigning agent's identity to the specific task-verifier-rationale triple. External auditors can verify the signature to confirm that the stated assigning agent actually made this selection with this rationale, and that the record was not constructed after the fact.
+- A verifier MUST NOT be substituted after commitment without an explicit VERIFIER_REASSIGNMENT event (§8.20.4). If a verification result arrives from a `verifier_id` that does not match the pre-committed VERIFIER_ASSIGNMENT for that `task_hash`, the result MUST be flagged as an `assignment_integrity_failure` (§8.10.4).
+
+**Example VERIFIER_ASSIGNMENT:**
+
+```yaml
+assignment_id: "c3d4e5f6-a7b8-9012-cdef-345678901234"
+task_hash: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+verifier_id: "verifier-gamma"
+selection_basis: role_based
+selection_detail: "Verifier holds cap:security.audit@2.0 credential, required for tasks in the com.example.security namespace."
+assigning_agent_id: "coordinator-prime"
+assignment_signature: "ed25519:a1b2c3d4e5f6..."
+timestamp: "2026-02-27T14:25:00.100Z"
+```
+
+#### 8.20.4 Verifier Reassignment
+
+If a verifier must be replaced after pre-commitment — due to verifier unavailability, capability mismatch discovered after assignment, or operational necessity — a VERIFIER_REASSIGNMENT event MUST be generated. Reassignment without an explicit event is an audit violation: it makes verifier substitution invisible in the audit trail, defeating the independence guarantee that pre-commitment establishes.
+
+**VERIFIER_REASSIGNMENT fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| reassignment_id | UUID v4 | Yes | Unique identifier for this reassignment event. |
+| original_assignment_id | UUID v4 | Yes | Reference to the `assignment_id` of the VERIFIER_ASSIGNMENT being superseded. Links the reassignment to the original pre-commitment. |
+| original_commitment_hash | SHA-256 | Yes | Hash of the original VERIFIER_ASSIGNMENT record. Enables integrity verification — the original assignment has not been tampered with since commitment. |
+| new_verifier_id | string | Yes | §2 identity handle of the replacement verifier. |
+| new_selection_basis | enum | Yes | Selection basis for the replacement verifier. Same enum as §8.20.2. |
+| new_selection_detail | string | No | Human-readable elaboration on why the replacement verifier was selected. |
+| reassignment_reason | string | Yes | Stated reason for the reassignment. MUST describe why the original verifier was replaced — e.g., "Original verifier unreachable (ref: dl-004)", "Capability mismatch discovered after assignment", "Operational load balancing". |
+| assigning_agent_id | string | Yes | §2 identity handle of the agent authorizing the reassignment. May differ from the original assigning agent if delegation authority has shifted. |
+| reassignment_signature | string | Yes | Cryptographic signature over the reassignment record, computed using the assigning agent's signing key. |
+| timestamp | ISO 8601 | Yes | When the reassignment was committed. Millisecond precision REQUIRED. |
+
+**Semantics:**
+
+- VERIFIER_REASSIGNMENT MUST be appended to the evidence layer (§8.10) before the replacement verifier begins verification. The same pre-execution timing constraint that applies to VERIFIER_ASSIGNMENT (§8.20.3) applies to reassignment.
+- The `original_commitment_hash` field enables auditors to verify that the original assignment record was not altered between commitment and reassignment. If the hash does not match the stored VERIFIER_ASSIGNMENT, the reassignment is suspect.
+- Multiple reassignments for the same task are permitted. Each reassignment references the immediately preceding assignment or reassignment via `original_assignment_id`, forming an auditable chain.
+- A verification result from a verifier that does not match the most recent VERIFIER_ASSIGNMENT or VERIFIER_REASSIGNMENT for that task MUST be flagged as an `assignment_integrity_failure` (§8.10.4).
+
+**Example VERIFIER_REASSIGNMENT:**
+
+```yaml
+reassignment_id: "d4e5f6a7-b8c9-0123-def0-456789012345"
+original_assignment_id: "c3d4e5f6-a7b8-9012-cdef-345678901234"
+original_commitment_hash: "sha256:f6a7b8c9d0e1..."
+new_verifier_id: "verifier-delta"
+new_selection_basis: capability_based
+new_selection_detail: "Replacement verifier with demonstrated proficiency in API compliance verification."
+reassignment_reason: "Original verifier (verifier-gamma) unreachable — connection refused at verification endpoint. 3 retries exhausted."
+assigning_agent_id: "coordinator-prime"
+reassignment_signature: "ed25519:b2c3d4e5f6a7..."
+timestamp: "2026-02-27T14:35:00.200Z"
+```
+
+#### 8.20.5 Audit Consequences
+
+Post-hoc rationale annotation without a pre-committed record MUST be treated as an audit violation. The `assignment_integrity_failure` reason (§8.10.4) handles this — distinct from `verification_reject` (the verifier evaluated evidence and rejected it) and `attestation_failure` (the delegation attestation signature could not be confirmed).
+
+**Conditions that constitute `assignment_integrity_failure`:**
+
+1. **Missing pre-commitment.** A verification result exists but no VERIFIER_ASSIGNMENT record with a matching `task_hash` and `verifier_id` is present in the evidence layer at a timestamp preceding execution start.
+2. **Post-hoc rationale.** A VERIFIER_ASSIGNMENT record exists but its `timestamp` is at or after the task execution start timestamp. The rationale was declared after the verifier could observe execution, defeating pre-commitment.
+3. **Undocumented substitution.** A verification result arrives from a `verifier_id` that does not match the pre-committed VERIFIER_ASSIGNMENT (or the most recent VERIFIER_REASSIGNMENT) for that `task_hash`, and no VERIFIER_REASSIGNMENT event bridges the gap.
+4. **Signature failure.** The `assignment_signature` on a VERIFIER_ASSIGNMENT or `reassignment_signature` on a VERIFIER_REASSIGNMENT cannot be verified against the stated `assigning_agent_id`'s public key. The record may have been fabricated or tampered with.
+
+**Trust implications:** A verification result associated with an `assignment_integrity_failure` is structurally present but not independently auditable. External auditors SHOULD treat such results with the same suspicion as unanchored evidence (§8.10.1) — the result may be correct, but the assignment process that produced it cannot be verified.
+
+#### 8.20.6 Relationship to Other Sections
+
+- **§8.7 (Verifier Isolation Requirements):** Verifier isolation (§8.7) addresses _where_ the verifier runs — process-level, host-level, or out-of-band isolation. Verifier pre-commitment (§8.20) addresses _why_ a particular verifier was selected and ensures the selection rationale is auditable. Both are necessary for verification independence: isolation prevents correlated failures; pre-commitment prevents post-hoc verifier shopping.
+- **§8.10 (Evidence Layer Architecture):** VERIFIER_ASSIGNMENT and VERIFIER_REASSIGNMENT records are appended to the evidence layer (§8.10.1) and follow the same append-only semantics (§8.10.6). They are EVIDENCE_RECORDs for the assignment process itself — ground truth for who selected which verifier and why.
+- **§8.10.4 (Divergence Reason Enum):** `assignment_integrity_failure` is added to the reason enum for logging pre-commitment violations in `divergence_log`. It is distinct from all existing reasons — it indicates a failure in the verifier assignment process, not in task execution, verification infrastructure, or delegation attestation.
+- **§8.10.5 (Verification Failure Taxonomy):** The verification failure taxonomy classifies outcomes of the verification process itself (`VERIFIER_UNREACHABLE`, `VERIFICATION_TIMEOUT`, `VERIFICATION_REJECT`). Pre-commitment violations are upstream of verification — they concern the assignment that preceded the verification, not the verification outcome. Both may appear in the same session's audit trail: a task may have both an `assignment_integrity_failure` (verifier was not properly pre-committed) and a `verification_reject` (the improperly assigned verifier also rejected the evidence).
+- **§6.4.1 (Delegation Attestation):** Delegation attestation binds a delegator's identity to a task and intent hash. Verifier pre-commitment binds an assigning agent's identity to a verifier selection and rationale. Both use signed records to create auditable commitment chains — delegation attestation for task assignment, verifier pre-commitment for verification assignment.
+
+> Addresses [issue #140](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/140): `selection_rationale` is now a pre-committed, signed claim rather than a post-hoc annotation. Verifier assignment records (VERIFIER_ASSIGNMENT) MUST be committed before task execution with a structured `selection_basis` taxonomy (`random`, `role_based`, `capability_based`, `proximity_based`, `explicit_nomination`). Verifier substitution after pre-commitment requires an explicit VERIFIER_REASSIGNMENT event. Post-hoc rationale annotation without pre-commitment is an audit violation logged as `assignment_integrity_failure` in the §8.10.4 divergence reason enum.
+
 ## 9. Security Considerations
 
 The core threat is compliance-with-wrong-spec. `trace_hash` (§6.2) confirms that an agent executed according to a given specification — it cannot confirm that the specification was honest. An orchestrator can delegate a task with a schema that syntactically matches what was agreed but semantically misrepresents intent. Execution succeeds, hashes verify, and the deception is invisible to any participant that trusts the schema at face value.
@@ -4466,7 +4597,7 @@ The `external_ref` field (§8.10.1) mitigates this limitation by anchoring evide
 
 - `trace_hash` (§6.2) verifies execution-matches-spec. §9 addresses whether the spec was honest.
 - Merkle tree divergence (§7) localizes where execution diverged from plan. Divergence annotation (§7.8) explains why — but is self-reported and therefore not a security primitive. §9 addresses whether the plan was honestly constructed.
-- Zombie state detection (§8.1–§8.14) handles cooperative failure (liveness-failure path). REVOKED state (§8.15–§8.18) handles protocol-level adversarial behavior (adversarial-behavior path). State-delta verification (§8.19) handles silent failure — structurally compliant execution that produces no observable outcome. §9 handles schema-level adversarial deception — honest-looking schemas with dishonest intent. See §8.15.3 for the layer distinction.
+- Zombie state detection (§8.1–§8.14) handles cooperative failure (liveness-failure path). REVOKED state (§8.15–§8.18) handles protocol-level adversarial behavior (adversarial-behavior path). State-delta verification (§8.19) handles silent failure — structurally compliant execution that produces no observable outcome. Verifier pre-commitment (§8.20) handles verifier assignment integrity — ensuring selection rationale is auditable and not constructed post-hoc. §9 handles schema-level adversarial deception — honest-looking schemas with dishonest intent. See §8.15.3 for the layer distinction.
 - TEE attestation boundary (§8.3) proves where execution occurred. Schema attestation (§9.1) proves who vouched for what was executed. These are complementary, not overlapping.
 - Translation boundary (§9.3) identifies the attack surface. Translation bottleneck (§9.4) identifies the information-theoretic reason attacks at that surface evade structural defenses — lossy compression preserves adversarial semantics while satisfying validation. Translation boundary metadata and verification (§7.9) provides the cooperative-model counterpart: `translation_metadata` makes translation losses visible and the two-target verification framework (behavioral correctness vs. translation fidelity) separates execution failures from translation failures.
 - Revocation trust (§9.8) documents the advisory nature of REVOKE signals and the Byzantine propagation problem in delegation chains. Identity revocation (§2.3.4) and delegation token revocation (§5.10) define MUST-level requirements that are binding on compliant agents but not technically enforceable on non-compliant or offline nodes.
