@@ -2113,7 +2113,7 @@ The following commitment manifest capabilities are deferred to V2:
 | §2 Agent Identity | SESSION_INIT carries identity objects (§2.2). SESSION_RESUME requires identity re-verification (§2.3.3). Identity revocation (§2.3.4) triggers session CLOSED. | §2 → §4 |
 | §3 Agent Discovery | Discovery (§3) provides the candidate set from which the coordinator selects a worker. Discovery completes before SESSION_INIT. The AGENT_MANIFEST endpoint (§3.1) is the SESSION_INIT target. | §3 → §4 |
 | §5 Role Negotiation | CAPABILITY_MANIFEST exchange (§5.9) happens within the NEGOTIATING state. Session establishment flow (§5.9) is the NEGOTIATING → ACTIVE transition. Session expiry auto-revokes all active delegation tokens for that session (§5.11). | §4 ↔ §5 |
-| §6 Task Delegation | Task delegation (§6.6) is only valid in the ACTIVE state — SUSPECTED (§4.2.1) pauses new delegation while buffering in-flight work. TASK_CHECKPOINT (§6.6) is the mechanism for externalizing task state before SUSPENDED or COMPACTED transitions. Session EXPIRED (§4.2) triggers mandatory TASK_CANCEL (§6.6) for all in-flight subtasks — prevents phantom completions. Partial result recovery after expiry uses SESSION_RESUME with `recovery_reason: timeout` (§4.8, §4.8.1). MANIFEST canonicalization (§4.10) defines the canonical type registry and serialization rules used by task hash computation (§6.4). SESSION_CANCEL (§4.15) in-flight work protection reuses the commit-check pattern (§6.16.2) and grace period semantics (§6.16.3). | §4 ↔ §6 |
+| §6 Task Delegation | Task delegation (§6.6) is only valid in the ACTIVE state — SUSPECTED (§4.2.1) pauses new delegation while buffering in-flight work. TASK_CHECKPOINT (§6.6) is the mechanism for externalizing task state before SUSPENDED or COMPACTED transitions. Session EXPIRED (§4.2) triggers mandatory TASK_CANCEL (§6.6) for all in-flight subtasks — prevents phantom completions. Partial result recovery after expiry uses SESSION_RESUME with `recovery_reason: timeout` (§4.8, §4.8.1). MANIFEST canonicalization (§4.10) defines the canonical type registry and serialization rules used by task hash computation (§6.4). SESSION_CANCEL (§4.15) in-flight work protection reuses the commit-check pattern (§6.16.2) and grace period semantics (§6.16.3). SESSION_INIT idempotency (§4.16) follows the same structural pattern as delegation-initiation idempotency (§6.14) — stable identifier, receiver deduplication, cached response. | §4 ↔ §6 |
 | §8 Error Handling | Zombie detection (§8.1) maps to the COMPACTED and hard-zombie scenarios in §4.7.7. Detection primitives (§8.2) are the signals consumed by the external monitoring architecture (§4.7). SESSION_RESUME (§8.2) is formalized in §4.8; unified recovery semantics (§4.8.1) ensure crash, timeout, and manual recovery all use the same state-hash negotiation. Coordinator compaction gap (§8.5) is a concrete instance of §4.6's compaction obligation. SESSION_DENY reason `STATE_UNAVAILABLE` (§4.9.1) maps to FIDELITY_FAILURE (§8.22) — context compaction as a source of irrecoverable state loss during suspension. | §4 ↔ §8 |
 | §9 Trust Model | Per-hop revocation mode semantics (§4.3.2) establish that the delegation-time `revocation_mode` (§9.8.5) is a minimum default. Downstream agents MAY unilaterally tighten the mode for sub-delegations. Mode propagation rules (§9.8.5) and trust decay semantics (§9.8.6) apply to the effective per-hop mode. | §4 ↔ §9 |
 | §10 Versioning | SESSION_INIT carries protocol_version and schema_version (§10.2). Version mismatch terminates the session at the NEGOTIATING → CLOSED transition (§10.4). Forward compatibility obligations (§10.5) apply from the first message. | §4 ↔ §10 |
@@ -2358,6 +2358,81 @@ The following SESSION_CANCEL capabilities are deferred to V2:
 - **Cancel propagation to sub-sessions.** When a session that is part of a delegation chain (§6.9) receives SESSION_CANCEL, the cascading effect on sub-sessions is undefined in V1. V2 should define whether SESSION_CANCEL propagates automatically to sub-sessions, requires explicit per-sub-session cancellation, or follows a configurable propagation policy.
 
 > Addresses [issue #173](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/173): bilateral SESSION_CANCEL — either party may cleanly terminate a session with structured reason codes, mandatory acknowledgment, commit-check semantics for in-flight work, and commitment manifest for outstanding obligations. Closes #173.
+
+### 4.16 SESSION_INIT Idempotency Semantics
+
+<!-- Implements #194: SESSION_INIT idempotency using session_id as deduplication key -->
+
+The transport-layer `idempotency_key` (§4.14.3) deduplicates retransmissions of the exact same SESSION_INIT message within a 5-minute window. SESSION_INIT idempotency addresses a different problem: what happens when the initiator retransmits a SESSION_INIT carrying a `session_id` that the responder has already seen — potentially because the original SESSION_INIT_ACK was lost in transit and the initiator cannot distinguish "session established, ACK lost" from "SESSION_INIT never arrived." Without defined behavior, the responder may create a duplicate session, reject the request as invalid, or behave unpredictably — all of which produce split-brain conditions where the two parties disagree on session state.
+
+**Idempotency key:** `session_id`. The `session_id` field on SESSION_INIT (§4.3) is the session-level idempotency key. When the responder receives a SESSION_INIT whose `session_id` matches a session already known to the responder, the responder MUST NOT create a new session or treat the message as an error. Instead, the responder MUST return a response that reflects the current state of the existing session, as defined in §4.16.1.
+
+**Distinction from transport-layer idempotency:** Transport-layer `idempotency_key` (§4.14.3) operates on message identity — "have I seen this exact message before?" Session-level `session_id` idempotency operates on session identity — "does a session with this ID already exist?" The two mechanisms are complementary: `idempotency_key` catches retransmissions within the deduplication window; `session_id` idempotency catches retransmissions after the `idempotency_key` window has expired, or cases where the initiator generates a new `idempotency_key` for a retry of the same logical session establishment.
+
+#### 4.16.1 Required Response Per Session State
+
+When a SESSION_INIT arrives with a `session_id` that matches an existing session known to the responder, the responder MUST return a response based on the current state of that session:
+
+| Existing session state | Required response | Semantics |
+|----------------------|-------------------|-----------|
+| NEGOTIATING | SESSION_INIT_ACK | Re-send the original SESSION_INIT_ACK. The initiator's retry arrived while negotiation is still in progress or because the original ACK was lost. The responder MUST return the same SESSION_INIT_ACK it sent (or would send) for the original SESSION_INIT — same `responder_id`, `identity_object`, negotiated parameters. Only transport-layer metadata (e.g., `timestamp`) may differ. |
+| ACTIVE | SESSION_INIT_ACK | The session is already established and operational. The responder MUST return the SESSION_INIT_ACK from the original session establishment (cached or reconstructed) to confirm to the initiator that the session exists and is active. The responder MUST NOT reset session state, re-negotiate capabilities, or restart the session lifecycle. The `session_id` and all negotiated parameters in the response MUST match the original establishment. |
+| DEGRADED | SESSION_INIT_ACK | Same as ACTIVE — the session is operational (with reduced capacity). The responder returns the original SESSION_INIT_ACK. The initiator will discover the DEGRADED state through normal protocol mechanisms (HEARTBEAT `app_status`, CAPABILITY_UPDATE) after re-establishing communication. |
+| SUSPECTED | SESSION_INIT_ACK | Same as ACTIVE — the session still exists and the responder is alive. Returning SESSION_INIT_ACK also serves as implicit proof of liveness, which may resolve the SUSPECTED condition on the responder's side if the initiator was the suspected party. |
+| SUSPENDED | SESSION_SUSPENDED | The session exists but is intentionally paused. The responder MUST return a SESSION_SUSPENDED message containing: `session_id` (echoed), `correlation_id` (echoed from SESSION_INIT), `suspended_at` (timestamp of the original SESSION_SUSPEND), `suspended_by` (identity of the suspending party), and `suspension_ttl` (remaining TTL). The initiator MUST NOT interpret SESSION_SUSPENDED as session establishment failure — the session exists and may be resumed via SESSION_RESUME (§4.8). |
+| COMPACTED | SESSION_COMPACTED | The session exists but one or both agents have undergone context compaction. The responder MUST return a SESSION_COMPACTED message containing: `session_id` (echoed), `correlation_id` (echoed from SESSION_INIT), and `state_hash` (the responder's current state hash for reconciliation). The initiator SHOULD attempt SESSION_RESUME (§4.8) rather than creating a new session. |
+| EXPIRED | SESSION_EXPIRED | The session existed but has expired due to heartbeat timeout. The responder MUST return a SESSION_EXPIRED message containing: `session_id` (echoed), `correlation_id` (echoed from SESSION_INIT), and `expired_at` (timestamp of expiry). The initiator MAY attempt SESSION_RESUME (§4.8) with `recovery_reason: timeout` if recovery is desired, or create a new session with a fresh `session_id`. |
+| CLOSED | SESSION_CLOSED | The session has been terminated. The responder MUST return a SESSION_CLOSED message containing: `session_id` (echoed), `correlation_id` (echoed from SESSION_INIT), and `closed_at` (timestamp of closure). The initiator MUST create a new session with a fresh `session_id` if further collaboration is needed. |
+| REVOKED | SESSION_CLOSED | Same response as CLOSED — REVOKED is a terminal state. The responder MUST NOT disclose revocation details in the response beyond the closure timestamp. The initiator receives SESSION_CLOSED and must create a new session if collaboration is desired (which may itself be rejected based on revocation state). |
+| DRIFTED | SESSION_INIT_ACK | Same as ACTIVE — the session is operational (with behavioral divergence declared). The responder returns the original SESSION_INIT_ACK. The initiator will discover the DRIFTED state through the existing DRIFT_DECLARED mechanism. |
+
+**General response rules:**
+
+- All responses to duplicate SESSION_INIT MUST include the `correlation_id` from the incoming SESSION_INIT (not from the original session establishment). This allows the initiator to correlate the response to its retry attempt.
+- The responder MUST NOT re-execute session establishment side effects (capability exchange, state allocation, monitoring registration) when returning a cached response.
+- If the responder cannot determine the session state (e.g., due to storage failure), it MUST return SESSION_INIT_REJECT with `reason: STATE_LOOKUP_FAILED`. The initiator MAY retry or create a new session with a fresh `session_id`.
+
+#### 4.16.2 Duplicate Detection Window
+
+The responder MUST retain session state sufficient to answer duplicate SESSION_INIT queries for the **duplicate detection window**. The window duration depends on session state:
+
+- **Active sessions** (NEGOTIATING, ACTIVE, DEGRADED, SUSPECTED, SUSPENDED, COMPACTED, DRIFTED): No window limit — the session record exists for the lifetime of the session. Duplicate detection is inherent in session state lookup.
+- **Terminal sessions** (CLOSED, EXPIRED, REVOKED): The responder MUST retain a tombstone record for at least **30 minutes** after the session entered the terminal state. The tombstone MUST contain: `session_id`, `terminal_state` (CLOSED, EXPIRED, or REVOKED), `terminal_timestamp`, and sufficient metadata to construct the required response (§4.16.1).
+- After the tombstone retention window expires, the responder MAY evict the record. A SESSION_INIT received with a `session_id` whose tombstone has been evicted is treated as a **new session** — the responder processes it normally. This is safe: if 30 minutes have elapsed since session termination, the initiator is either starting fresh (correct behavior) or has a stale retry that should not succeed (and will fail on subsequent protocol steps due to state mismatch).
+
+**Tombstone retention rationale:** 30 minutes is chosen to exceed the maximum reasonable retry window for a lost SESSION_INIT_ACK by a significant margin. The transport-layer `idempotency_key` window is 5 minutes (§4.14.3); the session-level tombstone window is 6× longer to cover cases where the initiator's retry logic operates on a slower cycle (e.g., exponential backoff with long intervals, or manual retry by an orchestrator).
+
+**Storage requirements:** The tombstone record is lightweight — it stores only the fields needed to construct the response, not the full session state. Implementations SHOULD use a bounded-size tombstone store with LRU eviction after the 30-minute window. The tombstone store SHOULD be persisted to durable storage to survive responder restarts within the retention window.
+
+#### 4.16.3 Initiator Retry Semantics
+
+When the initiator sends SESSION_INIT and does not receive SESSION_INIT_ACK within a deployment-configured timeout, it SHOULD retry with the **same `session_id`** and the **same semantic fields**. The retry MUST use a fresh `idempotency_key` (since the original `idempotency_key` deduplication window may have expired) but MUST preserve the `session_id` from the original attempt.
+
+**Retry behavior:**
+
+- The initiator MUST NOT change `session_id`, `initiator_id`, `identity_object`, `protocol_version`, `schema_version`, or any capability-related fields across retries. Changing these fields would make the retry semantically different from the original — a different session establishment attempt, not a retry.
+- The initiator MAY update `timestamp` and `idempotency_key` on each retry. The `timestamp` reflects when the retry was sent; the `idempotency_key` is a fresh transport-layer deduplication token.
+- The initiator SHOULD implement exponential backoff for retries to avoid overwhelming the responder.
+- The initiator MUST NOT retry indefinitely. After a deployment-specific maximum retry count, the initiator SHOULD treat session establishment as failed and MAY attempt with a fresh `session_id` (which the responder will treat as a new session).
+
+**Handling non-ACK responses:** If the initiator receives a response other than SESSION_INIT_ACK (e.g., SESSION_SUSPENDED, SESSION_EXPIRED, SESSION_CLOSED), it indicates that the original session establishment succeeded but the session has since transitioned. The initiator MUST NOT retry SESSION_INIT — it MUST handle the response according to the session's current state:
+
+- **SESSION_SUSPENDED:** The initiator MAY attempt SESSION_RESUME (§4.8) if it wants to continue the session.
+- **SESSION_COMPACTED:** The initiator SHOULD attempt SESSION_RESUME (§4.8) with state reconciliation.
+- **SESSION_EXPIRED:** The initiator MAY attempt SESSION_RESUME with `recovery_reason: timeout`, or create a new session with a fresh `session_id`.
+- **SESSION_CLOSED:** The initiator MUST create a new session with a fresh `session_id`.
+
+#### 4.16.4 Relationship to Existing Mechanisms
+
+**Relationship to §4.14.3 Idempotency Keys:** Transport-layer `idempotency_key` and session-level `session_id` idempotency are complementary. Within the 5-minute `idempotency_key` window, the transport layer handles deduplication before session-level logic is invoked. After the `idempotency_key` window expires, session-level `session_id` lookup provides continued duplicate detection. Implementations SHOULD check `idempotency_key` first (cheaper, fixed-window lookup) and fall through to `session_id` lookup only when the `idempotency_key` is not found in the deduplication cache.
+
+**Relationship to §4.14.5 Partial Delivery:** Partial delivery (§4.14.5) specifies that if SESSION_INIT is sent and no SESSION_INIT_ACK is received, the initiator treats the session as failed. SESSION_INIT idempotency refines this: the initiator SHOULD retry with the same `session_id` before declaring failure, because the SESSION_INIT may have been received and processed successfully — only the ACK was lost. The partial delivery abort path applies after retries are exhausted.
+
+**Relationship to §6.14 Delegation-Initiation Idempotency:** §6.14 solves the same lost-ACK problem for TASK_ASSIGN using `request_id`. SESSION_INIT idempotency solves it for SESSION_INIT using `session_id`. The pattern is structurally identical: a stable identifier generated before first transmission, used by the receiver to detect duplicates and return cached responses. The key difference is scope: `request_id` is scoped to a session; `session_id` is globally unique.
+
+**Relationship to §8.13 Teardown-First Recovery:** When an initiator retries SESSION_INIT and receives SESSION_CLOSED or SESSION_EXPIRED, the teardown-first recovery mandate (§8.13) applies. The initiator creates a new session with a fresh `session_id` and uses idempotent task replay (§7.10) to recover work from the prior session. SESSION_INIT idempotency does not bypass teardown-first recovery — it provides the initiator with the information needed to determine whether recovery is necessary.
+
+> Addresses [issue #194](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/194): SESSION_INIT idempotency semantics — defines `session_id` as the session-level idempotency key, required response per session state, duplicate detection window (30-minute tombstone for terminal sessions), initiator retry semantics, and relationship to transport-layer idempotency keys (§4.14.3), partial delivery (§4.14.5), and delegation-initiation idempotency (§6.14). Prevents split-brain when the initiating agent retries after a lost SESSION_INIT_ACK. Resolves #194.
 
 ## 5. Role Negotiation
 
