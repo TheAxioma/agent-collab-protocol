@@ -5285,6 +5285,98 @@ Together, these three artifacts provide a complete picture on recovery: what was
 
 > COMMITMENT_REGISTRY formalized from [issue #64](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/64). The core insight: session management is identity management. Every unresolved commitment is a promise that a future instance must keep or explicitly refuse. The COMMITMENT_REGISTRY makes this obligation landscape durable and protocol-visible, completing the triad alongside `amendments_log` and `crossed_steps`.
 
+### 7.12 Sub-Grant Chain Integrity
+
+When an agent (B) delegates subtasks to a downstream agent (C) within the progress reporting context (§7.5), the sub-grant authorizing C's execution MUST include `parent_grant_hash` to cryptographically bind the sub-grant to B's original grant from A. This is the V1 hop-local chain integrity primitive — it enables C to verify that B holds valid authority from A at the single-hop level without requiring zero-knowledge infrastructure (deferred to V2, issues #126, #129, #109).
+
+Without `parent_grant_hash`, C must trust B's assertion that it holds valid authority from A. A compromised or malicious B could claim derived authority it does not hold, and C would have no mechanism to detect the fabrication. `parent_grant_hash` converts this trust-based assertion into a cryptographically verifiable binding: C can independently confirm that B's sub-grant references a specific, unmodified parent grant.
+
+#### 7.12.1 Sub-Grant Schema
+
+The sub-grant schema extends the grant fields defined in §6 (delegation grant schema, §6.6) and §5.8.2 (CAPABILITY_GRANT) with the following chain integrity field:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| parent_grant_hash | string | Conditional | SHA-256 hex digest of the canonical JSON serialization of the immediate parent grant. REQUIRED for sub-grants — grants issued by an agent that itself received a grant from an upstream delegator. MUST be omitted for root grants. |
+
+**Root grant rule:** Root grants — those issued directly by the session initiator at `delegation_depth: 0` with no parent delegation — MUST NOT include `parent_grant_hash`. A grant that claims to be a root grant but includes `parent_grant_hash` is malformed and MUST be rejected by the receiving agent. See §6.9.3.4 for root grant authority semantics and §5.8.2 for root CAPABILITY_GRANT identification.
+
+**Hashing algorithm (V1):** `parent_grant_hash` is computed as the SHA-256 hash of the canonical JSON serialization of the immediate parent grant. Canonical serialization follows the rules defined in §6.4 and §4.10.2: NFC normalization followed by RFC 8785 JCS serialization (RFC 8785). The hash is encoded as a lowercase hex string prefixed with `sha256:`. SHA-256 is the V1 hashing algorithm for all chain integrity fields — the same algorithm used for `task_hash` (§6.4), `intent_hash` (§6.4.1), and the merkle tree levels (§7.1).
+
+#### 7.12.2 Validation Rule
+
+When processing a further-delegated sub-grant, the receiving agent MUST verify `parent_grant_hash` before accepting the sub-grant for execution or progress reporting:
+
+1. **Retrieve parent grant.** Using the parent grant identifier — `parent_grant_id` for CAPABILITY_GRANT sub-grants (§5.8.2), or the parent `task_id` via `parent_grant_id` for delegation sub-grants (§6.9.3) — retrieve the parent grant.
+2. **Compute hash.** Compute the SHA-256 hash of the parent grant's canonical JSON serialization (§6.4, §4.10.2).
+3. **Compare hash.** Compare the computed hash against the `parent_grant_hash` in the sub-grant.
+4. **Accept or reject.** If the hashes match, the sub-grant's claimed parent binding is verified — proceed with acceptance. If the hashes do not match, reject the sub-grant. For delegation sub-grants, use TASK_REJECT with `reason: "invalid_parent_grant_hash"` (§6.9.3.1). For capability sub-grants, reject with `reason: "parent_grant_hash_mismatch"` and emit DIVERGENCE_REPORT with `reason_code: chain_integrity_failure` (§5.8.2).
+
+A sub-grant received without `parent_grant_hash` when the grant is not a root grant (i.e., `delegation_depth > 0` or `parent_grant_id` is present) MUST be rejected with `reason: "missing_parent_grant_hash"`.
+
+**Scope:** This validation rule provides V1 hop-local verification — each agent verifies only the immediate parent link. Full delegation chain traversal (all hops from leaf to root) is specified in §6.9.3.2 (delegation chains) and §5.8.2 (CAPABILITY_GRANT chains). Zero-knowledge proof-based chain verification is deferred to V2 (issues #126, #129, #109).
+
+#### 7.12.3 Delegation Handshake Example
+
+The following example shows a delegation handshake where A delegates to B, and B further sub-delegates to C with `parent_grant_hash` binding C's sub-grant to B's original grant from A. Progress reporting (§7.1–§7.5) proceeds after chain verification.
+
+```yaml
+# Step 1: A delegates to B (root grant — parent_grant_hash omitted)
+message_type: TASK_ASSIGN
+task_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+session_id: "session-A-B-001"
+spec:
+  description: "Analyze document corpus"
+  expected_output_format: { type: "json", schema: "analysis-v2" }
+trust_level: "standard"
+intent_hash: "sha256:b2c3d4e5..."
+delegation_attestation:
+  signed_tuple: "sha256(task_hash || intent_hash || agent-A)"
+  signature: "base64url:..."
+  signer_id: "agent-A"
+delegation_depth: 0
+max_delegation_depth: 3
+# parent_grant_hash: omitted — root grant (§7.12.1)
+# parent_grant_id: omitted — root grant
+
+# Step 2: B accepts, acknowledges receipt, reports progress (§7)
+
+# Step 3: B sub-delegates to C (sub-grant — parent_grant_hash REQUIRED)
+message_type: TASK_ASSIGN
+task_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+session_id: "session-B-C-002"
+spec:
+  description: "Analyze subset of documents"
+  expected_output_format: { type: "json", schema: "analysis-v2" }
+trust_level: "standard"
+intent_hash: "sha256:c3d4e5f6..."
+delegation_attestation:
+  signed_tuple: "sha256(task_hash || intent_hash || agent-B || parent_grant_hash)"
+  signature: "base64url:..."
+  signer_id: "agent-B"
+delegation_depth: 1
+parent_grant_hash: "sha256:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+parent_grant_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+max_delegation_depth: 3
+
+# Step 4: C verifies parent_grant_hash (§7.12.2)
+#   C retrieves B's parent grant (task_id: a1b2c3d4-e5f6-7890-abcd-ef1234567890)
+#   C computes: expected_hash = SHA-256(canonical_json(parent_grant))
+#   C compares: expected_hash == parent_grant_hash
+#   Verification passes → C accepts the sub-delegation
+#   C proceeds with execution and progress reporting via merkle tree (§7.1–§7.5)
+```
+
+**Verification flow:** C receives the sub-grant from B, retrieves the parent grant identified by `parent_grant_id`, computes its SHA-256 canonical JSON hash, and compares it against `parent_grant_hash`. If the hashes match, C accepts the sub-delegation and proceeds with execution and progress reporting. If they do not match, C rejects the sub-delegation with TASK_REJECT (`reason: "invalid_parent_grant_hash"`) — B's claimed authority from A is not verifiable at the hop-local level.
+
+**Subtask merkle root composition:** After verification, C's progress reporting follows the standard subtask composition rules (§7.5). C's subtask merkle root is included in B's L3 computation. The `parent_grant_hash` verification ensures that C's progress reports are authorized by a verifiable delegation chain — not merely asserted by B.
+
+#### 7.12.4 Relationship to §6
+
+The sub-grant schema and validation rules in this section are consistent with and cross-reference the delegation chain integrity model in §6.9.3 (TASK_ASSIGN parent-grant hash embedding, chain traversal semantics, delegation depth limits, root grant authority) and the CAPABILITY_GRANT chain integrity model in §5.8.2 (parent_grant_hash and parent_grant_id fields, presentation-time verification, chain splicing prevention). The canonical JSON serialization definition is specified in §6.4 and §4.10.2 (NFC normalization, RFC 8785 JCS). This section provides the consolidated §7 view of sub-grant chain integrity as it applies to progress reporting sub-delegations — connecting the structural chain integrity primitives of §6 with the verification and composition model of §7.
+
+> V1 hop-local chain integrity primitive for §7 progress reporting sub-delegations. Full ZK proof-based chain verification (issues #126, #129, #109) is deferred to V2. Addresses [issue #93](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/93).
+
 ## 8. Error Handling
 
 ### 8.1 Zombie State Definition
