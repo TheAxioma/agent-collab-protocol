@@ -4936,6 +4936,75 @@ This is a resolved design decision, not an open question. V1 defines the boundar
 
 > Implements [issue #185](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/185): V1 design decision — revocation acknowledgment (confirmed enforcement) is application-layer in V1. Defines TTL-based enforcement as the V1 mechanism providing eventual consistency by construction (capability expires at or before `valid_until`). Documents CAPABILITY_REVOKED as fire-and-forget at the protocol layer — revoker cannot distinguish enforcement success, network loss, or deliberate evasion. Scopes REVOCATION_ACK and CAPABILITY_STATE_QUERY as V2 candidates with round-trip failure modes (ACK lost/forged/delayed; query requires state query mechanism not in spec). Framed as a resolved design decision: V1 defines the boundary, V2 extends it. Closes #185.
 
+#### 6.16.8 Revocation Acknowledgment Scope Statement
+
+<!-- Implements #219: revocation acknowledgment scope statement — unilateral REVOKED declaration, non-receipt security advisory, V2 N-of-M acknowledgment -->
+
+§6.16.7 establishes the V1 design decision: revocation acknowledgment is not a protocol-layer concern. This subsection makes the scope boundary explicit by defining the V1 state transition semantics for revocation completion, documenting the adversarial non-receipt threat, and specifying the V2 acknowledgment-threshold model that addresses it.
+
+**V1 Position — Unilateral Revocation Completion**
+
+In V1, REVOKED is declared unilaterally by the revoking agent. The state transition from REVOKE_PENDING (the interval between the revoker issuing CAPABILITY_REVOKED and the grace window expiring) to REVOKED does not require confirmed enforcement from any downstream agent. The revoker transitions the revocation to REVOKED when the grace window expires (`takes_effect_at`, §6.16.4) or, if no grace window was specified, immediately upon issuing the revocation token.
+
+Enforcement is assumed at TTL — every grant carries a `valid_until` field (§6.17.1) with a maximum TTL of 24 hours (§5.8.2), guaranteeing that the capability ceases to be exercisable regardless of downstream behavior. Acknowledgment from downstream agents is advisory: if a downstream agent sends an application-layer acknowledgment confirming enforcement, the revoker MAY record it for observability purposes, but the revoker MUST NOT gate the REVOKE_PENDING → REVOKED transition on receipt of such acknowledgment. The transition is time-driven, not acknowledgment-driven.
+
+**Formal state transition:**
+
+```
+REVOKE_PENDING:
+  Entry: revoker issues CAPABILITY_REVOKED token (§6.13)
+  Duration: from revoked_at to takes_effect_at (or instant if takes_effect_at absent)
+  Exit condition: current_time ≥ takes_effect_at (or immediate if absent)
+  → REVOKED
+
+REVOKED:
+  Entry: grace window expired OR no grace window specified
+  Requirement: NONE — no downstream acknowledgment required
+  The capability is considered revoked by the revoker regardless of
+  downstream enforcement status. TTL expiry (valid_until) provides
+  the hard enforcement backstop.
+```
+
+**Security Advisory — Non-Receipt Evasion in Adversarial Contexts**
+
+In adversarial contexts, a downstream agent could claim non-receipt of the revocation token while continuing to exercise the revoked capability within the TTL window. This attack exploits the observability gap documented in §6.16.7 (outcome 2 vs. outcome 3): the revoker cannot distinguish, at the protocol layer, between a revocation token lost in transit and a revocation token deliberately ignored.
+
+The non-receipt evasion threat has the following properties:
+
+| Property | Description |
+|----------|-------------|
+| **Attack surface** | Any downstream agent holding a valid (non-expired) grant that receives a CAPABILITY_REVOKED token via gossip (§9.8.5) or sync delivery |
+| **Attack mechanism** | The downstream agent receives the revocation token, does not enforce it, and claims non-receipt if challenged. The agent continues exercising the capability until `valid_until` expiry. |
+| **Exposure window** | From `revoked_at` to `valid_until` — bounded by the 24-hour maximum TTL (§5.8.2). The explicit revocation signal was intended to close this window early; the evasion negates that acceleration. |
+| **Protocol-layer detectability** | Not detectable in V1. The protocol defines no mechanism for the revoker to distinguish non-receipt from deliberate evasion. CAPABILITY_REVOKED is fire-and-forget (§6.16.7). |
+| **Out-of-band detectability** | Detectable via behavioral signals: the downstream agent continues producing outputs, consuming resources, or invoking APIs under the revoked capability after the revoker's `revoked_at` timestamp. Detection requires monitoring infrastructure outside the protocol boundary — audit log correlation (§8.16), resource usage anomalies (§8.22), or platform-level enforcement. |
+| **Mitigation** | TTL expiry is the hard backstop — the capability self-expires at `valid_until` regardless of downstream behavior. For high-value capabilities where the exposure window is unacceptable, issuers SHOULD use short TTLs (minutes, not hours) and frequent renewal (§6.17.3) to minimize the window. |
+
+This threat is accepted as a known limitation of V1's fire-and-forget revocation model. The revoker's recourse is TTL expiry (passive) and out-of-band detection (active). Protocol-layer detection requires the acknowledgment mechanisms deferred to V2 (below).
+
+**V2 Note — N-of-M Acknowledgment Threshold**
+
+V2 introduces an N-of-M acknowledgment metric that closes the non-receipt evasion gap at the protocol layer. After issuing a revocation, the revoking agent waits for REVOCATION_ACK (§6.16.7) from downstream agents before considering revocation complete. The completion threshold is M-of-N, where N is the total number of downstream agents holding grants derived from the revoked capability, and M is the required acknowledgment count.
+
+Below the M-of-N threshold, the revocation status is `PENDING_ACK`, not `REVOKED`:
+
+| Revocation status | Condition | Meaning |
+|-------------------|-----------|---------|
+| `REVOKE_PENDING` | Revocation token issued, grace window not yet expired | Revocation is in the propagation and grace period. No enforcement expected yet. |
+| `PENDING_ACK` | Grace window expired, fewer than M-of-N acknowledgments received | Revocation is past the enforcement deadline but the revoker has not received sufficient confirmation of downstream enforcement. The capability may still be exercised by non-acknowledging agents (within TTL). |
+| `REVOKED` | M-of-N acknowledgments received, OR `valid_until` expired (TTL backstop) | Revocation is confirmed — either enough downstream agents have acknowledged enforcement, or the TTL has expired making enforcement moot. |
+
+*V2 design considerations:*
+
+- **Threshold selection.** M and N are determined by the revocation context. For single-grantee capabilities (N=1), M=1 — full confirmation is required. For multi-hop delegation chains (§6.9), N includes all transitive grantees, and M is a policy decision balancing confirmation confidence against availability (requiring M=N is strict but blocks on the slowest or most adversarial agent).
+- **PENDING_ACK timeout.** The `PENDING_ACK` state MUST have a bounded duration. If the M-of-N threshold is not reached within a configurable timeout, the revocation transitions to `REVOKED` via the TTL backstop (`valid_until` expiry). `PENDING_ACK` does not block indefinitely.
+- **Interaction with TTL backstop.** The TTL backstop (§6.17) remains the hard guarantee in V2. N-of-M acknowledgment provides *faster confirmation* of enforcement — it does not replace TTL expiry as the eventual consistency mechanism. When `valid_until` expires, the revocation transitions to `REVOKED` regardless of acknowledgment count.
+- **Non-acknowledging agent handling.** Agents that do not acknowledge within the `PENDING_ACK` timeout are flagged for out-of-band investigation. V2 must define whether non-acknowledgment triggers automatic trust degradation (§4.2.2), session revocation (§8.15), or is purely informational.
+
+This is a V2-scoped mechanism. V1 implementations MUST NOT implement `PENDING_ACK` as a protocol-layer state or gate revocation completion on downstream acknowledgment. Application-layer implementations MAY track acknowledgments outside the protocol boundary for observability purposes, provided they do not alter the V1 state transition semantics (REVOKE_PENDING → REVOKED is time-driven, not acknowledgment-driven).
+
+> Implements [issue #219](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/219): revocation acknowledgment scope statement. V1 position: REVOKED is declared unilaterally after grace window expiry — the REVOKE_PENDING → REVOKED transition is time-driven, not acknowledgment-driven; downstream enforcement is assumed at TTL. Security advisory: non-receipt evasion (downstream agent claims non-receipt while continuing to exercise revoked capability) is not detectable at protocol level in V1 — detectable only out-of-band via audit log correlation and behavioral signals. V2 note: N-of-M acknowledgment threshold — revoker waits for M-of-N REVOCATION_ACKs before transitioning to REVOKED; below threshold the status is PENDING_ACK; TTL backstop remains the hard guarantee. Closes #219.
+
 ### 6.17 Time-Bounded Capability Grants
 
 <!-- Implements #107: time-bounded capability grants — valid_until enforcement, cascading TTL decay with floor constraint, renewal semantics with cascading renewal rules, session vs capability TTL distinction, TTL exhaustion vs session end orthogonality, in-flight expiry, relationship to CAPABILITY_REVOKE, and V2 deferrals -->
