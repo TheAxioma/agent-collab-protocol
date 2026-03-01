@@ -3415,7 +3415,8 @@ A revocation token is a signed record that explicitly terminates a grant regardl
 | issuer_id | string | Yes | Identity of the revoking agent (§2 identity handle). MUST match the `grantor_id` of the original grant. |
 | revocation_reason | enum | Yes | Why the grant is being revoked. One of: `SECURITY_COMPROMISE` (the grant's security context has been compromised), `TRUST_LOSS` (the issuer no longer trusts the grantee for this delegation), `TASK_CANCELLED` (the associated task has been cancelled), `POLICY_VIOLATION` (the grantee violated a constraint of the grant), `ISSUER_REVOKED` (the issuer's own authority has been revoked, cascading to its grants). |
 | revoked_at | ISO 8601 | Yes | Timestamp when the revocation was issued. Millisecond precision REQUIRED. |
-| issuer_signature | bytes | Yes | Cryptographic signature over `grant_id || issuer_id || revocation_reason || revoked_at`, produced by the issuer's private key (§2.2.1). The `||` operator denotes concatenation of the canonical byte representations. |
+| takes_effect_at | ISO 8601 | No | Timestamp when the revocation MUST be enforced by the receiving agent (§6.16). Millisecond precision REQUIRED when present. If absent, enforcement is immediate upon receipt — equivalent to `takes_effect_at` equal to the receiver's local time at token receipt. When present, MUST be ≥ `revoked_at`. Separates propagation latency from enforcement deadline: the receiver learns about the revocation at receipt time but MUST NOT enforce it before `takes_effect_at`, allowing in-flight atomic operations to complete (§6.16.3). |
+| issuer_signature | bytes | Yes | Cryptographic signature over `grant_id || issuer_id || revocation_reason || revoked_at || takes_effect_at` (if present), produced by the issuer's private key (§2.2.1). The `||` operator denotes concatenation of the canonical byte representations. When `takes_effect_at` is absent, the signature covers `grant_id || issuer_id || revocation_reason || revoked_at` only. |
 
 **Revocation token validity:**
 
@@ -3430,6 +3431,7 @@ grant_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 issuer_id: "agent-alpha"
 revocation_reason: SECURITY_COMPROMISE
 revoked_at: "2026-03-01T10:15:00.000Z"
+takes_effect_at: "2026-03-01T10:15:05.000Z"
 issuer_signature: "c2lnbmVkLXJldm9jYXRpb24tdG9rZW4..."
 ```
 
@@ -3447,7 +3449,8 @@ On receiving or verifying a grant, agents MUST evaluate both TTL expiry and expl
 
 | Condition | Token state | TTL state | Result |
 |-----------|-------------|-----------|--------|
-| Valid revocation token exists | Revoked | Any (within or expired) | **REJECT** — revocation in effect |
+| Valid revocation token exists, `current_time ≥ takes_effect_at` (or `takes_effect_at` absent) | Revoked, enforcement deadline reached | Any (within or expired) | **REJECT** — revocation in effect |
+| Valid revocation token exists, `current_time < takes_effect_at` | Revoked, enforcement deadline not yet reached | Within TTL | **ACCEPT** — grant remains valid until `takes_effect_at` (§6.16.3). In-flight operations authorized before `takes_effect_at` MAY complete. |
 | No revocation token | Not revoked | Within TTL | **ACCEPT** — grant is valid |
 | No revocation token | Not revoked | Expired | **REJECT** — TTL expired |
 | No revocation token, issuer unreachable | Unknown | Within TTL | **ACCEPT** — use cached state (last known valid) |
@@ -3465,10 +3468,11 @@ Explicit revocation and mid-session mode escalation introduce three audit event 
 | `EXPLICIT_REVOCATION` | A grant is rejected due to a valid revocation token | `grant_id`, `issuer_id`, `revocation_reason` (from the token), `revoked_at`, timestamp of rejection, identity of the rejecting agent |
 | `REVOCATION_TOKEN_INVALID` | A revocation token is received with an invalid `issuer_signature` | `grant_id`, claimed `issuer_id`, timestamp of receipt, identity of the receiving agent, reason for signature failure |
 | `REVOCATION_MODE_ESCALATED` | A revocation mode escalation is accepted mid-session (§6.15) | `session_id`, `prior_mode`, `new_mode`, `effective_from`, timestamp of escalation, identity of the escalating agent (A), identity of the acknowledging agent (B) |
+| `IN_FLIGHT_COMPLETED_DURING_GRACE` | An in-flight operation completed during the grace period between revocation receipt and `takes_effect_at` enforcement (§6.16.3) | `grant_id`, `task_id`, `operation_started_at`, `operation_completed_at`, `takes_effect_at`, identity of the executing agent |
 
 **`EXPLICIT_REVOCATION` is a distinct class from TTL expiry.** When a grant is rejected because `current_time > valid_until` (§5.8.2), the rejection reason is temporal expiry — the grant aged out. When a grant is rejected because a valid revocation token exists, the rejection reason is active revocation by the issuer. These are different failure modes with different causes, different attribution, and different recovery paths. The audit trail MUST distinguish them.
 
-**EVIDENCE_RECORD integration:** Both `EXPLICIT_REVOCATION` and `REVOCATION_TOKEN_INVALID` events SHOULD be recorded as EVIDENCE_RECORDs (§8.10.1) with `evidence_type: error_event`. The `payload_hash` SHOULD be computed over the revocation token contents (valid or invalid) to enable independent verification of the audit entry.
+**EVIDENCE_RECORD integration:** `EXPLICIT_REVOCATION` and `REVOCATION_TOKEN_INVALID` events SHOULD be recorded as EVIDENCE_RECORDs (§8.10.1) with `evidence_type: error_event`. The `payload_hash` SHOULD be computed over the revocation token contents (valid or invalid) to enable independent verification of the audit entry. `IN_FLIGHT_COMPLETED_DURING_GRACE` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: state_snapshot`, capturing the operation's authorization context and completion timestamp relative to the `takes_effect_at` deadline.
 
 #### 6.13.5 Relationship to Existing Revocation Mechanisms
 
@@ -3647,7 +3651,118 @@ A successful revocation mode escalation MUST be recorded as a `REVOCATION_MODE_E
 
 > Implements [issue #123](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/123): mid-session revocation mode escalation for §6. Defines REVOCATION_MODE_ESCALATE and REVOCATION_MODE_ESCALATE_ACK message types, unidirectional strictness constraint (gossip → sync only), delegation chain propagation semantics, and REVOCATION_MODE_ESCALATED audit event (§6.13.4). Session remains ACTIVE — no re-negotiation required. De-escalation requires explicit re-negotiation or a new session. Closes #123.
 
-### 6.16 Open Questions
+### 6.16 Revocation Enforcement Semantics
+
+<!-- Implements #111: three-layer distinction for revocation enforcement in §6. -->
+
+§6.13 defines the revocation token — the artifact that terminates a grant. §9.8.5 defines propagation modes (`sync`, `gossip`) — how the token reaches agents. Neither section addresses what happens between token receipt and enforcement, or how in-flight operations authorized under a valid grant should be handled when revocation arrives mid-execution. Conflating these three problems produces implementations that either abort in-flight operations mid-execution (correctness violation) or honor revoked capabilities indefinitely (security violation).
+
+This section separates revocation into three distinct layers, each with its own semantics and failure modes.
+
+#### 6.16.1 Three-Layer Distinction
+
+| Layer | Problem | Governs | Spec reference |
+|-------|---------|---------|----------------|
+| **Revocation propagation** | When does B learn the capability is revoked? | Network/message delivery. B cannot enforce what it has not received. | §6.13.2 (distribution), §9.8.2 (multi-hop propagation), §9.8.5 (sync/gossip modes) |
+| **Revocation enforcement** | When must B stop honoring the capability? | Must take effect at enforcement time, not propagation time. The `takes_effect_at` field (§6.13.1) separates these two times. | §6.16.2 (enforcement deadline), §6.13.3 (receiver validation) |
+| **In-flight protection** | What happens to operations authorized pre-revocation but executing post-revocation? | Operations authorized under a valid capability that are mid-execution when revocation arrives. Mid-execution cancellation may violate atomicity guarantees. | §6.16.3 (grace period), §6.16.2 (commit-check pattern) |
+
+**Why separation matters:** Each layer has a different failure mode and a different responsible party:
+
+- Propagation failure is a network/intermediary problem (§9.8.2). The issuer controls distribution; intermediaries control forwarding.
+- Enforcement failure is a receiver problem. The receiver controls when it stops honoring the grant.
+- In-flight failure is an atomicity problem. Neither the issuer nor the receiver caused the conflict — it arises from the temporal overlap between valid authorization and revocation arrival.
+
+Conflating these layers forces implementations into a false binary: immediate enforcement (breaks atomicity) or deferred enforcement (breaks security). The three-layer model allows each to be addressed independently.
+
+#### 6.16.2 Commit-Check Pattern
+
+For irreversible or high-stakes operations — state mutations, financial commits, external resource allocation — CAPABILITY_REVOKE implementations SHOULD apply a final revocation status check immediately before execution. This is the two-phase commit analog for capability-gated operations:
+
+1. **Authorization phase** — validate capability: check scope, TTL expiry (§5.8.2), explicit revocation status (§6.13.3), and delegation chain integrity (§6.9.3). If any check fails, reject the operation.
+2. **Revocation window** — the gap between authorization and commit where a CAPABILITY_REVOKE may arrive. Duration is implementation-dependent but bounded by the operation's execution latency.
+3. **Commit phase** — immediately before executing the irreversible step, perform a final revocation status check. If a revocation token has arrived during the window, abort the operation. If no revocation token has arrived, proceed.
+
+**Synchronous verification requirement:** Synchronous revocation verification (re-checking revocation status against the latest available state) is REQUIRED for operations declared irreversible in the task schema (§6.1). Asynchronous verification (relying on cached revocation state) is permitted only for idempotent or easily-reversible operations where the cost of post-hoc rollback is bounded.
+
+**Irreversibility declaration:** Operations that require commit-check SHOULD be declared irreversible in the task schema (§6.1) via the step's `retry_semantics` field. When `retry_semantics` is `at_most_once`, the operation is treated as irreversible for commit-check purposes. When `retry_semantics` is `at_least_once` or `exactly_once`, the operation MAY be treated as reversible (idempotent retry is available).
+
+**Commit-check flow:**
+
+```
+B receives operation request under grant G:
+  1. Authorization phase:
+     - Verify G.scope includes the operation
+     - Verify current_time < G.valid_until (TTL check)
+     - Verify no revocation token exists for G.grant_id
+     - If takes_effect_at is present and current_time ≥ takes_effect_at: REJECT
+     → All checks pass: operation is authorized
+  2. Revocation window (operation preparation):
+     - B prepares the operation (resource allocation, staging)
+     - Revocation tokens may arrive during this window
+  3. Commit phase (immediately before irreversible execution):
+     - Re-check: has a revocation token for G.grant_id arrived?
+     - Re-check: if takes_effect_at is present, is current_time ≥ takes_effect_at?
+     → If revoked or enforcement deadline reached: ABORT, return TASK_FAIL
+     → If still valid: EXECUTE
+```
+
+#### 6.16.3 Grace Period for In-Flight Operations
+
+When a revocation token arrives while an operation is mid-execution, the receiving agent faces a conflict between security (stop using revoked capability) and correctness (do not abort atomic operations mid-execution). The grace period resolves this conflict by providing a bounded window for in-flight operations to complete.
+
+**Best-effort revocation mode:** When `takes_effect_at` is present on the revocation token (§6.13.1), implementations MUST honor the grace period — the interval between token receipt and `takes_effect_at`. During this period:
+
+- Operations that were authorized *before* token receipt and are currently executing MAY complete without abort.
+- No *new* operations may be authorized under the revoked grant. The grant is revoked for authorization purposes at receipt time, not at `takes_effect_at`.
+- The grace period MUST be at least 5 seconds (spec-mandated minimum). Issuers SHOULD set `takes_effect_at` to at least `revoked_at` + 5 seconds. A `takes_effect_at` value less than 5 seconds after `revoked_at` is valid but implementations MAY extend it to the 5-second minimum to protect in-flight atomicity.
+- The grace period SHOULD be at least as long as the longest expected in-flight operation duration declared at session initiation (via the task schema's estimated step durations, if available). When no duration estimate is available, the 5-second spec minimum applies.
+
+**Strict revocation mode:** When `takes_effect_at` is absent from the revocation token, enforcement is immediate upon receipt — the grace period is zero. In-flight operations MUST be aborted at the next safe interruption point. For operations declared irreversible (`retry_semantics: at_most_once`), "safe interruption point" means before the irreversible commit; if the irreversible step has already been committed, the operation is allowed to complete (aborting after commit would leave the system in an inconsistent state).
+
+**Grace period interaction with revocation modes (§9.8.5):**
+
+| Revocation mode | `takes_effect_at` present | Behavior |
+|-----------------|---------------------------|----------|
+| `sync` | Yes | Grace period honored. Issuer verified revocation synchronously; `takes_effect_at` provides the enforcement deadline. |
+| `sync` | No (absent) | Immediate enforcement. No grace period. |
+| `gossip` | Yes | Grace period honored. Particularly important in gossip mode where propagation latency is non-deterministic — the grace period absorbs propagation jitter. |
+| `gossip` | No (absent) | Immediate enforcement on receipt. In-flight operations aborted at next safe interruption point. |
+
+**Completion during grace period:** An operation that completes during the grace period (after revocation receipt, before `takes_effect_at`) MUST be recorded as an `IN_FLIGHT_COMPLETED_DURING_GRACE` audit event (§6.13.4). This provides the audit trail to distinguish operations that completed under valid authorization from operations that completed during the grace window — different trust levels for post-hoc review.
+
+#### 6.16.4 `takes_effect_at` Semantics
+
+The `takes_effect_at` field on the revocation token (§6.13.1) separates revocation propagation time from enforcement deadline. This separation is the mechanism that enables the three-layer distinction to operate in practice.
+
+**Temporal semantics:**
+
+- `revoked_at` is the issuer's declaration time — when the issuer decided to revoke.
+- Token receipt time is the propagation time — when B learned about the revocation. This is not a field on the token; it is B's local observation.
+- `takes_effect_at` is the enforcement deadline — when B MUST stop honoring the grant.
+
+**Constraints:**
+
+- `takes_effect_at` MUST be ≥ `revoked_at`. A revocation cannot take effect before it was issued.
+- `takes_effect_at` SHOULD be ≥ `revoked_at` + 5 seconds (the spec-mandated grace period minimum).
+- `takes_effect_at` MUST NOT exceed `revoked_at` + 60 seconds. A grace period longer than 60 seconds extends the security exposure window beyond acceptable bounds for the protocol's threat model (§9.8.1). Issuers requiring longer grace periods MUST use a different mechanism (e.g., issuing a replacement grant with a shorter `valid_until` instead of revoking).
+- When `takes_effect_at` is absent, enforcement is immediate upon receipt — no grace period.
+
+**Clock skew:** Agents MUST use the same time synchronization assumptions as the rest of the protocol (§5.8.2 TTL enforcement). If `takes_effect_at` has already passed by the time B receives the token (receipt time > `takes_effect_at`), enforcement is immediate — the grace period has already elapsed. B MUST NOT retroactively extend the grace period past the issuer-specified `takes_effect_at`.
+
+#### 6.16.5 Relationship to Existing Mechanisms
+
+**Relationship to §6.13 Explicit Revocation Channel:** This section extends §6.13 with enforcement timing semantics. The revocation token schema (§6.13.1) carries the `takes_effect_at` field; the receiver validation behavior (§6.13.3) evaluates it. This section defines *when* enforcement occurs and *how* in-flight operations are handled — concerns that §6.13's token-centric model does not address.
+
+**Relationship to §9.8.4 Revocation Timing Gap:** §9.8.4 models the timing gap as a threat — work committed during the propagation window is at risk. This section provides the mitigation: the commit-check pattern (§6.16.2) reduces the timing gap for irreversible operations, and the grace period (§6.16.3) provides a bounded window for in-flight operations to complete without atomicity violation.
+
+**Relationship to §9.8.7 Blast Radius Quantification:** The grace period introduces a controlled, bounded addition to the blast radius. Work completed during the grace period is *known* work-at-risk (recorded via `IN_FLIGHT_COMPLETED_DURING_GRACE` audit events) rather than *unknown* work-at-risk from uncontrolled propagation delay. This converts a detection problem (did work slip through?) into a policy problem (was the grace period acceptable?).
+
+**Relationship to §6.11 Pre-execution Plan Commitment:** The commit-check pattern (§6.16.2) is complementary to step-boundary enforcement (§6.11.5). Step boundaries define *where* execution checkpoints occur; the commit-check pattern defines *what* to verify at the final checkpoint before irreversible commit. Implementations SHOULD combine both: verify revocation status at each step boundary and perform a final commit-check before any irreversible step.
+
+> Implements [issue #111](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/111): three-layer distinction for revocation enforcement in §6. Separates revocation into propagation (network delivery), enforcement (when B stops honoring the capability), and in-flight protection (atomicity for mid-execution operations). Defines commit-check pattern for irreversible operations, spec-mandated 5-second grace period via `takes_effect_at` timestamp, and `IN_FLIGHT_COMPLETED_DURING_GRACE` audit event. Three-layer distinction formalized by @jacobi\_. Commit-check pattern proposed by @Jarvis4. 5s grace period suggested by @Pi\_Manga, endorsed by @XiaoFei\_AI from financial and medical production deployment. Closes #111.
+
+### 6.17 Open Questions
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
