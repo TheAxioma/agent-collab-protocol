@@ -1605,6 +1605,7 @@ SESSION_RESUME is the single recovery mechanism for all session interruptions �
 | expected_resume_after | ISO 8601 | No | Hint for when the suspending agent expects to resume. Informational only — the counterparty is not obligated to wait. |
 | commitments_outstanding | boolean | Yes | `true` if the suspending agent has any outstanding commitments (§6.12) that remain unfulfilled at the time of suspension. `false` if all commitments have been fulfilled or cancelled. The receiving party MUST NOT treat the session as cleanly suspended if `commitments_outstanding` is `true` without explicit resolution of the commitment manifest. |
 | commitment_manifest | array | Conditional | Required when `commitments_outstanding` is `true`. Array of outstanding commitment records, each containing: `commitment_id` (UUID v4), `description` (string — from `commitment_spec`), `deadline_ms` (integer — expected delivery timestamp as Unix epoch milliseconds, derived from `due_by`; null if open-ended), `confirmation_token` (string — token from the original COMMITMENT message). The manifest is a snapshot of the agent's outstanding obligations at suspension time, enabling the counterparty or orchestrator to track, transfer, or resolve commitments during the suspension period. |
+| state_hash | string (SHA-256 hex) | No | SHA-256 hash of the serialized session state snapshot at the moment the suspending agent issues SESSION_SUSPEND. Computed by the suspending agent over the canonical representation of session state (active commitments, negotiated parameters, delegation chain, in-flight task descriptors). Serialization format is implementation-defined, but implementations MUST use a deterministic canonicalization — the same logical state MUST always produce the same hash. When present, `state_hash` constitutes a cryptographic commitment to state preservation: if the suspending agent later responds with `SESSION_DENY(reason="STATE_UNAVAILABLE")`, auditors and the delegating agent can compare the `state_hash` commitment against the claim of state loss to determine whether state was present at suspension time (§4.9.1). Absence of `state_hash` signals that the suspending agent did not commit to state preservation — a subsequent `STATE_UNAVAILABLE` denial from such a session carries no auditability guarantee. |
 | timestamp | ISO 8601 | Yes | When the SESSION_SUSPEND was sent. |
 
 **SESSION_CLOSE:**
@@ -1654,9 +1655,22 @@ SESSION_DENY is the rejection response to a SESSION_RESUME that fails validation
 | Reason code | Definition | Session state after denial |
 |-------------|-----------|---------------------------|
 | `STATE_ANCHOR_MISMATCH` | The `session_anchor` in SESSION_RESUME does not match the receiver's own state record. The two parties disagree on what the session state was at suspension time. | SUSPENDED — preserved. The resuming party MAY attempt SESSION_TEARDOWN and start a new session. |
-| `STATE_UNAVAILABLE` | The receiver cannot reconstruct session state — due to restart, context compaction (§8.22 FIDELITY_FAILURE), or storage failure. The receiver is alive but has lost the state needed to verify the resume. | SUSPENDED — preserved. The resuming party SHOULD issue SESSION_TEARDOWN and reinitiate. |
+| `STATE_UNAVAILABLE` | The receiver cannot reconstruct session state — due to restart, context compaction (§8.22 FIDELITY_FAILURE), or storage failure. The receiver is alive but has lost the state needed to verify the resume. If the original SESSION_SUSPEND included a `state_hash`, this denial is **auditable**: the `state_hash` constitutes a cryptographic commitment that state existed at suspension time, making the subsequent claim of state loss detectable and attributable (see **Immutable state commitment at suspension** below). If `state_hash` was absent, the denial carries no auditability guarantee. | SUSPENDED — preserved. The resuming party SHOULD issue SESSION_TEARDOWN and reinitiate. |
 | `SUSPENSION_EXPIRED` | The `suspension_ttl` from the original SESSION_SUSPEND has elapsed. SESSION_RESUME is no longer valid. | Transition to CLOSED required — both parties MUST issue SESSION_TEARDOWN. |
 | `UNAUTHORIZED_RESUME` | The `resume_initiator` matches the `suspend_initiator` from the original SESSION_SUSPEND. Self-resume is not permitted. | SUSPENDED — preserved. The other party retains resume authority. |
+
+**Immutable state commitment at suspension:**
+
+The optional `state_hash` field in SESSION_SUSPEND (§4.9) implements an immutable state commitment that makes bad-faith state purge **detectable and attributable** without adding enforcement overhead to V1.
+
+When agent B suspends a session and includes `state_hash`, B cryptographically commits that it possessed the session state at suspension time. If B subsequently responds to SESSION_RESUME with `SESSION_DENY(reason="STATE_UNAVAILABLE")`, auditors and the delegating agent A can compare B's `state_hash` commitment against the claim of state loss:
+
+- **`state_hash` present + `STATE_UNAVAILABLE`:** B committed to possessing state at suspension, then claimed state loss at resume. This is an auditable inconsistency — state was demonstrably present at suspension time. The purge may be legitimate (hardware failure, forced compaction) or bad-faith, but it is **detectable**: the commitment proves state existed and was subsequently lost or discarded.
+- **`state_hash` absent + `STATE_UNAVAILABLE`:** B did not commit to state preservation at suspension time. The subsequent `STATE_UNAVAILABLE` denial is unverifiable — auditors cannot distinguish legitimate state loss from bad-faith purge. This is the default behavior when `state_hash` is omitted.
+
+**Design rationale — rejection of pure application-layer approach (Option D):** `STATE_UNAVAILABLE` without any protocol-level commitment is unverifiable and enables undetectable bad-faith exit. An agent can claim state loss at any time with no evidence trail. The `state_hash` commitment shifts the burden: agents that commit to state preservation can be held accountable for subsequent state loss claims. Agents that decline to commit (by omitting `state_hash`) signal reduced auditability, which the delegating agent can factor into trust decisions.
+
+**Canonicalization note:** The `state_hash` is computed over the serialized session state using SHA-256. The serialization format is implementation-defined, but MUST be deterministic — the same logical state MUST always produce the same `state_hash`. Implementations SHOULD document their canonicalization method to enable cross-implementation verification. The `session_anchor` (§4.8) and `state_hash` serve complementary purposes: `session_anchor` proves state continuity at resume time; `state_hash` proves state existence at suspension time.
 
 **SESSION_RESUME_ACK message:**
 
@@ -1687,6 +1701,7 @@ commitment_manifest:
     description: "Deliver code review for module X"
     deadline_ms: 1740860400000
     confirmation_token: "tok_review_module_x"
+state_hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 timestamp: "2026-03-01T12:00:00Z"
 ```
 
@@ -1732,6 +1747,7 @@ signature: "c2Vzc2lvbi1kZW55LXNpZw..."
 - §4.15 bilateral SESSION_CANCEL: alternative clean termination path from SUSPENDED
 - §4.11 commitment manifest: resuming party MUST re-confirm outstanding commitments in SESSION_RESUME
 - §4.9.2 pending_tasks inventory: when teardown from SUSPENDED triggers SESSION_CLOSE, the `pending_tasks` field communicates in-flight task state
+- §4.9 SESSION_SUSPEND `state_hash`: immutable state commitment at suspension — enables auditability of `STATE_UNAVAILABLE` denials (issue #186)
 
 **V2 deferrals:**
 
@@ -1743,6 +1759,8 @@ The following SESSION_RESUME authority capabilities are deferred to V2:
 - Negotiated `suspension_ttl` extension without teardown
 
 > Addresses [issue #174](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/174): SESSION_RESUME authority, session_anchor verification, suspension_ttl enforcement, SESSION_DENY with structured reason codes. Closes #174.
+
+> Addresses [issue #186](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/186): Immutable state commitment at suspension (Option C). Adds optional `state_hash` field to SESSION_SUSPEND, auditability semantics for `STATE_UNAVAILABLE` denials, and explicit rejection of Option D (pure application-layer). Closes #186.
 
 #### 4.9.2 Pending Tasks Inventory on Teardown from SUSPENDED State
 
