@@ -4734,6 +4734,70 @@ B discovers irrevocable work committed after effective_from:
 >
 > Implements [issue #192](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/192): changes `compensation_policy` from freeform string to a bounded protocol-level enum with exactly four values (`best_effort`, `rollback`, `idempotent_retry`, `none`). Adds mandatory parse-error rejection for unknown values — silent ignore or silent default is not permitted. Adds `compensation_policy` to CAPABILITY_MANIFEST capability type entries (§5.1) and to the `COMPENSATION_REQUIRED` audit event (§6.13.4). Closes #192.
 
+#### 6.16.7 Revocation Acknowledgment — V1 Design Decision
+
+<!-- Implements #185: V1 design decision — revocation acknowledgment (confirmed enforcement) is application-layer in V1 -->
+
+§6.16.1–§6.16.6 define revocation propagation, enforcement, and in-flight protection. A fourth question naturally follows: how does the revoker *confirm* that the revokee has enforced the revocation? This section documents the resolved V1 design decision: confirmed enforcement is not a protocol-layer concern in V1. TTL-based enforcement provides eventual consistency by construction, and CAPABILITY_REVOKED is fire-and-forget at the protocol layer.
+
+**V1 Mechanism — TTL-Based Enforcement as Eventual Consistency Guarantee**
+
+V1 relies on TTL-based enforcement (§6.17) as the foundational revocation guarantee. Every CAPABILITY_GRANT carries a REQUIRED `valid_until` field (§6.17.1) with a maximum TTL of 24 hours (§5.8.2). This creates a hard upper bound on how long any capability can remain exercisable regardless of whether explicit revocation succeeds:
+
+- If CAPABILITY_REVOKED is received and processed: the capability is terminated immediately (or at `takes_effect_at`, per §6.16.3).
+- If CAPABILITY_REVOKED is lost, delayed, or ignored: the capability self-expires at `valid_until`. No action from any party is required for termination to occur.
+
+Revocation acknowledgment is therefore *eventually consistent by construction* — the capability is guaranteed to cease being valid at or before `valid_until`, bounded by the 24-hour maximum TTL. The revoker does not need confirmation that the revokee enforced the revocation because the TTL enforces it regardless. The explicit CAPABILITY_REVOKED signal (§6.13) accelerates termination for the pre-expiry compromise case; TTL is the backstop that makes acknowledgment unnecessary for correctness.
+
+**CAPABILITY_REVOKED Is Fire-and-Forget in V1**
+
+At the protocol layer, CAPABILITY_REVOKED (§6.13) is a unidirectional signal: the revoker issues a signed revocation token and distributes it via best-effort gossip (§6.13.6) or synchronous delivery (§9.8.5). The protocol defines no response message. The revoker cannot distinguish, at the protocol layer, between three outcomes:
+
+1. **Enforcement success.** The revokee received the token, validated the signature, and ceased exercising the capability.
+2. **Network loss.** The revocation token was lost in transit. The revokee continues exercising the capability in good faith (§6.13.6) until TTL expiry.
+3. **Deliberate evasion.** The revokee received the token and chose to ignore it, continuing to exercise the capability until TTL expiry or detection via other means (§8.16, §8.22).
+
+All three outcomes converge at the same point: the capability expires at `valid_until`. The difference between them is *attribution* (who is at fault) and *exposure window* (how long the capability remains exercisable after the revoker's intent), not *eventual state* (the capability terminates in all cases). V1 accepts this convergence as sufficient. The `propagation_window_ms` field (§6.13.1) bounds the acceptable attribution ambiguity: after `revoked_at + propagation_window_ms`, continued exercise is a protocol violation (§6.13.1) regardless of whether it results from network loss or deliberate evasion.
+
+**V2 Candidates — REVOCATION_ACK and CAPABILITY_STATE_QUERY**
+
+Two mechanisms would extend the revocation model with confirmed enforcement. Both are explicitly scoped as V2 candidates — they are not part of V1 and MUST NOT be implemented as protocol-layer extensions in V1 deployments. Application-layer implementations MAY provide equivalent functionality outside the protocol boundary.
+
+**1. REVOCATION_ACK — Acknowledgment of Revocation Enforcement**
+
+A response message from the revokee confirming that it has processed a revocation token and ceased exercising the capability. This would close the observability gap between outcomes (1), (2), and (3) above by providing positive confirmation of enforcement.
+
+*Round-trip failure modes that V2 must address:*
+
+| Failure mode | Description | Consequence |
+|--------------|-------------|-------------|
+| ACK lost | Revokee enforced the revocation and sent REVOCATION_ACK, but the ACK was lost in transit | Revoker falsely concludes enforcement failed. May trigger unnecessary escalation (session termination, trust downgrade) against a compliant revokee. |
+| ACK forged | A third party or compromised intermediary forges a REVOCATION_ACK on behalf of the revokee | Revoker falsely concludes enforcement succeeded. The actual revokee may still be exercising the revoked capability. Requires cryptographic binding of ACK to revokee identity (§2.2.1) and to the specific revocation token. |
+| ACK delayed | Revokee enforced the revocation but the ACK arrives after the revoker's timeout | Semantically equivalent to ACK lost from the revoker's perspective. Revoker must define an ACK timeout and a policy for late ACKs — accept as confirmation, or treat as enforcement failure. |
+
+*Design note:* REVOCATION_ACK introduces a two-phase protocol where V1 uses a one-phase protocol. The additional round-trip creates a new class of partial-failure states (revocation sent, ACK pending) that V1 avoids entirely. Any V2 design must define the state machine for these intermediate states without regressing the TTL-based eventual consistency guarantee.
+
+**2. CAPABILITY_STATE_QUERY — On-Demand Capability Status Inquiry**
+
+A query mechanism enabling the revoker (or any authorized party) to ask the revokee whether a specific capability is currently being exercised, has been revoked, or has expired. This would provide point-in-time observability into the revokee's capability state.
+
+*Round-trip failure modes that V2 must address:*
+
+| Failure mode | Description | Consequence |
+|--------------|-------------|-------------|
+| Query lost | The query never reaches the revokee | Revoker receives no response. Indistinguishable from a revokee that is offline, partitioned, or deliberately non-responsive. |
+| Response forged | A compromised agent returns a false capability state | Revoker makes decisions based on inaccurate state. Requires cryptographic attestation of the response, binding it to the revokee's identity and to a specific point in time. |
+| Response stale | The revokee's state changes between response generation and revoker receipt | The response is accurate at generation time but outdated at receipt time. The revoker acts on stale state. Bounded by network latency but not eliminable. |
+| State query mechanism not in spec | V1 defines no general-purpose state query primitive | CAPABILITY_STATE_QUERY requires a request-response pattern that the V1 protocol does not provide for capability state. V2 must define the query schema, response schema, authorization model (who may query), and rate-limiting semantics. |
+
+*Design note:* CAPABILITY_STATE_QUERY requires the revokee to maintain and expose queryable capability state — a runtime obligation that V1 does not impose. V1 revocation is token-centric (§6.13): the revocation token is the artifact, and enforcement is local. A state query model shifts from artifact-centric to state-centric revocation, which has different consistency, availability, and partition-tolerance tradeoffs.
+
+**Boundary Statement**
+
+This is a resolved design decision, not an open question. V1 defines the boundary: TTL-based enforcement provides the eventual consistency guarantee; CAPABILITY_REVOKED is fire-and-forget; the revoker's recourse for enforcement uncertainty is TTL expiry (passive) and detection signals (§8.16, §8.22) (active). V2 extends this boundary with confirmed enforcement via REVOCATION_ACK and on-demand observability via CAPABILITY_STATE_QUERY, accepting the round-trip failure modes documented above as the cost of stronger enforcement guarantees.
+
+> Implements [issue #185](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/185): V1 design decision — revocation acknowledgment (confirmed enforcement) is application-layer in V1. Defines TTL-based enforcement as the V1 mechanism providing eventual consistency by construction (capability expires at or before `valid_until`). Documents CAPABILITY_REVOKED as fire-and-forget at the protocol layer — revoker cannot distinguish enforcement success, network loss, or deliberate evasion. Scopes REVOCATION_ACK and CAPABILITY_STATE_QUERY as V2 candidates with round-trip failure modes (ACK lost/forged/delayed; query requires state query mechanism not in spec). Framed as a resolved design decision: V1 defines the boundary, V2 extends it. Closes #185.
+
 ### 6.17 Time-Bounded Capability Grants
 
 <!-- Implements #107: time-bounded capability grants — valid_until enforcement, cascading TTL decay with floor constraint, renewal semantics with cascading renewal rules, session vs capability TTL distinction, TTL exhaustion vs session end orthogonality, in-flight expiry, relationship to CAPABILITY_REVOKE, and V2 deferrals -->
