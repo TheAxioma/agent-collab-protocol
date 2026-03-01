@@ -4603,6 +4603,7 @@ The `external_ref` field (§8.10.1) mitigates this limitation by anchoring evide
 - Revocation trust (§9.8) documents the advisory nature of REVOKE signals and the Byzantine propagation problem in delegation chains. Identity revocation (§2.3.4) and delegation token revocation (§5.10) define MUST-level requirements that are binding on compliant agents but not technically enforceable on non-compliant or offline nodes.
 - Evidence layer (§8.10) provides append-only ground truth for external verification. The epistemic boundary (§9.5.1) documents the structural limitation: evidence records guarantee integrity and ordering of what was submitted, not correctness of the original observation. `external_ref` partially mitigates by enabling cross-validation against external systems.
 - Trust annotation types (§9.10) define the closed enum of protocol-level trust claims. Schema attestation (§9.1) addresses who vouched for a schema's honesty; trust annotations address under what trust basis an agent acted. Trust annotations are included in `trace_hash` computation (§6.2), making the trust basis auditable through the existing hash verification mechanism. The genesis publication hash (§9.10.4) applies the same independence criteria as §8 audit media — the audited party must not control the publication medium.
+- Amendment ceremonies (§9.11) specify how the trust annotation enum (§9.10.2) may be modified after genesis. The amendment hash chain (§9.11.5) extends the genesis publication hash (§9.10.4) across the enum's full lifecycle. Backwards compatibility (§9.11.6) ensures that enum changes do not strand deployed agents — unknown annotation types are forwarded without interpretation, never rejected.
 
 ### 9.7 Open Questions
 
@@ -4995,6 +4996,89 @@ An agent verifying the trust annotation enum performs the following steps:
 **Tamper-evidence, not tamper-prevention:** The genesis publication hash makes silent enum modification detectable. It does not prevent modification — an authority that controls the spec can still change the enum and publish a new hash. What the hash prevents is _undetected_ modification: any change to the enum after genesis produces a hash mismatch that any verifying agent can independently discover. Authority over schema updates becomes detectable rather than merely prohibited.
 
 > Implements [issue #133](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/133) and [issue #134](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/134): fixed enum of trust annotation types with genesis ceremony and publication hash. Defines four canonical trust annotation types (`DELEGATION`, `ASSUMES_AUTHENTICATED_SOURCE`, `ASSUMES_SCHEMA_VERSION`, `OPERATOR_ASSERTED`) as a closed enum at spec genesis, governance ceremony with bounded/auditable/high-scrutiny properties, modification policy requiring major version increment, and SHA-256 genesis publication hash for tamper-evident verification. Closes #133, closes #134.
+
+### 9.11 Amendment Ceremonies
+
+The genesis ceremony (§9.10.3) defines the trust annotation enum at spec publication time. §9.10.3 specifies that modifications require a major version increment, but does not specify _how_ a modification is proposed, deliberated, or ratified. Without an explicit amendment path, modification governance defaults to whoever can update the document — runtime authority without acknowledgment. This is precisely the failure mode the genesis ceremony was designed to prevent: low-visibility, uncoordinated authority over the trust annotation vocabulary. An implicit amendment path is harder to audit than any explicit one, even a weak one.
+
+§9.11 specifies the amendment ceremony: the procedure by which the trust annotation enum may be modified after genesis. Amendment ceremonies are structurally lighter than the genesis ceremony but explicitly specified — proportional governance with full auditability.
+
+#### 9.11.1 Trigger Conditions
+
+A valid amendment proposal requires a **demonstrated vocabulary gap**: a coordination use case that is not expressible using the current trust annotation enum, with documented adoption evidence. The adoption evidence requirement prevents speculative additions — a proposed annotation type must correspond to an observed coordination pattern, not a hypothetical one.
+
+Proposals without a demonstrated vocabulary gap are not valid amendment triggers. An annotation type that _might be useful someday_ does not meet the threshold. The trigger is reactive (demonstrated gap) rather than scheduled (periodic review window). Scheduled review windows create artificial constraints on urgent changes and generate noise during empty review periods.
+
+Once a valid proposal is published, a **minimum deliberation window of 14 days** must elapse before ratification consideration begins. The deliberation window is the anti-gaming mechanism — it ensures that amendments cannot be rushed through before affected parties can evaluate them. The window is mandatory regardless of perceived urgency.
+
+#### 9.11.2 Legitimacy Tiering
+
+Not all modifications to the trust annotation enum are equivalent. A typo correction and a new annotation type have categorically different impacts on protocol semantics. Conflating both under a single ceremony either makes cosmetic corrections prohibitively expensive or makes semantic changes too cheap.
+
+**Tier 1 — Cosmetic changes:**
+
+Typos, non-semantic language corrections, editorial improvements with no behavioral effect. A change is cosmetic if and only if: (a) the `annotation_type` enum values are unchanged, (b) the verification behavior for every annotation type is unchanged, and (c) the `genesis_hash` or current terminal `amendment_hash` would change only due to whitespace or wording, not due to semantic content.
+
+Tier 1 process: documented proposal published with justification, followed by a **no-objection window of 7 days** from active implementors (§9.11.3). If no objections are raised within the window, the change is ratified. No full ceremony is required.
+
+**Tier 2 — Semantic changes:**
+
+New annotation type, modified verification behavior, deprecated annotation type, changed enum semantics. Any change that alters what the enum _means_ — not just how it reads — is Tier 2.
+
+Tier 2 process: full amendment ceremony required, with rigor comparable to genesis. The minimum 14-day deliberation window (§9.11.1) applies. The participant threshold (§9.11.3) must be met. The amendment record (§9.11.4) must be produced. Tier 2 amendments continue to require a major version increment per §9.10.3.
+
+#### 9.11.3 Participant Threshold
+
+**Active implementors** are agents or implementations with demonstrated protocol execution. Qualification as an active implementor requires documented protocol implementation with evidence — deployment logs, public implementation repositories, or other verifiable artifacts demonstrating that the implementation executes against the trust annotation enum.
+
+**Genesis ceremony participants** (§9.10.3) have permanent standing as active implementors. Their standing does not expire and does not require re-qualification. This ensures that the original ceremony participants retain governance authority over the artifact they defined.
+
+**Quorum** for Tier 2 amendment ceremonies = majority of active implementors recorded on the amendment record at proposal time. The active implementor list is fixed at proposal time to prevent quorum manipulation during the deliberation window — adding or removing implementors after a proposal is published does not change the quorum requirement for that proposal.
+
+#### 9.11.4 Amendment Record
+
+A ratified amendment ceremony produces an **amendment record** containing:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| proposed_changes | object | Yes | The proposed modifications to the trust annotation enum, with full justification for each change. Includes the demonstrated vocabulary gap (§9.11.1) and the tier classification (§9.11.2). |
+| participant_list | array | Yes | Active implementors at proposal time, with acknowledgment status for each. For Tier 2: quorum (majority) must have acknowledged. For Tier 1: no-objection from active implementors within the 7-day window. |
+| deliberation_window_open | timestamp | Yes | ISO 8601 timestamp of when the deliberation window opened (proposal publication time). |
+| deliberation_window_close | timestamp | Yes | ISO 8601 timestamp of when the deliberation window closed (minimum 14 days after open for Tier 2, minimum 7 days for Tier 1). |
+| ratification_timestamp | timestamp | Yes | ISO 8601 timestamp of when the amendment was ratified. Must be after `deliberation_window_close`. |
+| amendment_hash | string | Yes | SHA-256 hash computed as specified in §9.11.5. |
+
+#### 9.11.5 Amendment Hash Chain
+
+Each amendment produces a hash that chains to the previous state, extending the tamper-evidence property of the genesis publication hash (§9.10.4) to cover the full lifecycle of the trust annotation enum.
+
+**Amendment hash computation:**
+
+```
+amendment_hash = SHA-256(prior_state_hash || amendment_record_canonical_json)
+```
+
+Where:
+- `prior_state_hash` is the `genesis_hash` (§9.10.4) for the first amendment, or the `amendment_hash` of the immediately preceding amendment for subsequent amendments.
+- `amendment_record_canonical_json` is the JSON serialization of the amendment record (§9.11.4) with keys sorted lexicographically, no optional whitespace, and UTF-8 encoding.
+- `||` denotes concatenation.
+
+**Amendment chain:** The full lineage from `genesis_hash` through each `amendment_hash` to the current terminal node is independently verifiable. The current spec version's trust annotation enum is authoritative if and only if the amendment chain can be verified from a trusted `genesis_hash` to the terminal `amendment_hash`.
+
+Implementations MUST verify the amendment chain from a trusted genesis hash before accepting a trust annotation enum as authoritative. A trust annotation enum that cannot be traced back to a verified genesis hash through a valid amendment chain has no protocol-level authority.
+
+The amendment chain is the tamper-evidence mechanism for protocol evolution — it applies the same principle as the genesis publication hash (§9.10.4) but extends it across the enum's full lifecycle rather than anchoring it to a single point in time.
+
+#### 9.11.6 Backwards Compatibility
+
+Agents MUST treat unknown trust annotation types as unknown-but-harmless. Specifically:
+
+- Unknown annotation types MUST be forwarded without interpretation. An agent that receives a message with a `trust_annotations` entry containing an `annotation_type` value it does not recognize MUST forward the annotation intact if the message is relayed to another agent. The forwarding agent MUST NOT strip, modify, or reinterpret the unknown annotation.
+- Rejection of unknown annotation types is a protocol violation. An agent MUST NOT reject a message solely because it contains an unrecognized `annotation_type` value. The message is valid; the annotation is unrecognized.
+- This requirement applies symmetrically: old agents receiving new annotation types added by amendment, and new agents receiving annotation types deprecated by amendment. Deprecation removes an annotation type from the canonical enum; it does not make the annotation type invalid in messages that were produced before deprecation.
+- This requirement is non-negotiable and applies regardless of agent implementation version. It is the mechanism that prevents amendment-induced fragmentation — without it, each enum change would strand deployed agents that do not yet recognize the new types.
+
+> Implements [issue #149](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/149): amendment ceremony procedures for the trust annotation enum. Specifies trigger conditions (demonstrated vocabulary gap, minimum deliberation window), legitimacy tiering (Tier 1 cosmetic with 7-day no-objection window, Tier 2 semantic with full ceremony), participant threshold (active implementors with genesis participant permanent standing), amendment record schema, SHA-256 amendment hash chaining from genesis hash, and backwards compatibility requirements (unknown-but-harmless forwarding). Closes #149.
 
 ## 10. Versioning
 
