@@ -1351,13 +1351,14 @@ Implementations MUST map language-specific type names to the following canonical
 | Canonical name | Description | Python | JavaScript/TypeScript | C# | Go | Rust | Java |
 |----------------|-------------|--------|----------------------|-----|-----|------|------|
 | `string` | Text / character sequence | `str` | `string` (typeof) | `string`, `String` | `string` | `String`, `&str` | `String`, `CharSequence` |
-| `integer` | Whole number (arbitrary precision) | `int` | `number` (when `Number.isInteger`) | `int`, `long`, `Int32`, `Int64` | `int`, `int32`, `int64` | `i8`–`i128`, `u8`–`u128`, `isize`, `usize` | `int`, `long`, `Integer`, `Long`, `BigInteger` |
-| `float` | Floating-point number | `float` | `number` (when not integer) | `float`, `double`, `Single`, `Double` | `float32`, `float64` | `f32`, `f64` | `float`, `double`, `Float`, `Double` |
+| `integer` | Whole number (signed 64-bit range; §4.10.3) | `int` | `number` (when `Number.isInteger`) | `int`, `long`, `Int32`, `Int64` | `int`, `int32`, `int64` | `i8`–`i128`, `u8`–`u128`, `isize`, `usize` | `int`, `long`, `Integer`, `Long`, `BigInteger` |
+| `float` | Floating-point number (finite only; §4.10.3) | `float` | `number` (when not integer) | `float`, `double`, `Single`, `Double` | `float32`, `float64` | `f32`, `f64` | `float`, `double`, `Float`, `Double` |
 | `bool` | Boolean truth value | `bool` | `boolean` (typeof) | `bool`, `Boolean` | `bool` | `bool` | `boolean`, `Boolean` |
 | `list` | Ordered sequence | `list`, `tuple` | `Array` (`Array.isArray`) | `List<T>`, `T[]`, `IList<T>` | `[]T` (slice), `[N]T` (array) | `Vec<T>`, `&[T]` | `List<T>`, `T[]`, `Collection<T>` |
 | `dict` | Key-value mapping | `dict` | `object` (plain object), `Map` | `Dictionary<K,V>`, `IDictionary` | `map[K]V` | `HashMap<K,V>`, `BTreeMap<K,V>` | `Map<K,V>`, `HashMap<K,V>` |
 | `null` | Absent / empty value | `None` | `null`, `undefined` | `null` | `nil` | `None` (Option) | `null` |
 | `datetime` | Temporal value (ISO 8601) | `datetime` | `Date` | `DateTime`, `DateTimeOffset` | `time.Time` | `chrono::DateTime` | `Instant`, `LocalDateTime`, `ZonedDateTime` |
+| `bytes` | Binary data (base64url-encoded) | `bytes`, `bytearray` | `ArrayBuffer`, `Uint8Array` | `byte[]`, `ReadOnlySpan<byte>` | `[]byte` | `Vec<u8>`, `&[u8]` | `byte[]`, `ByteBuffer` |
 
 **Design rationale:** The canonical names are deliberately short and language-neutral. `bool` over `boolean` (shorter, unambiguous). `list` over `array` (avoids confusion with fixed-size arrays in languages where `array` and `list` are distinct). `dict` over `object` or `map` (avoids conflation with JavaScript `object` or OOP objects). These names appear in hashed MANIFEST tuples — divergent type strings produce divergent hashes with no runtime error, only silent identity mismatch. The registry eliminates this class of cross-runtime failure.
 
@@ -1403,6 +1404,39 @@ Each inner array contains exactly three elements: `[key, canonical_type, value_h
 - `plan_hash` computation (§6.11), where the canonical plan representation includes hashable fields
 
 > Community discussion: Addresses @cass_agentsharp feedback on cross-runtime type name divergence — Python `str` vs JavaScript `string` vs C# `String` producing different MANIFEST hashes for identical logical tasks. Addresses @sondrabot feedback on RFC 8785 Unicode normalization gap — JCS alone does not prevent NFC/NFD divergence across runtimes. See [issue #56](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/56).
+
+#### 4.10.3 Cross-Runtime Serialization Edge Cases
+
+The following normative constraints close five classes of silent `task_hash` mismatch that arise from cross-runtime type representation differences. Each constraint targets a specific divergence source that canonical serialization (§4.10.2) alone does not eliminate.
+
+**1. IEEE 754 Special Values**
+
+MANIFEST values of type `float` MUST be finite. `NaN`, `+Infinity`, and `-Infinity` MUST be rejected at MANIFEST construction time with a canonicalization error. `-0.0` MUST be normalized to `0.0` before serialization. JCS (RFC 8785) inherits RFC 8259 number encoding which explicitly excludes `NaN` and `Infinity` — no cross-runtime determinism is possible without this constraint.
+
+**2. Integer Overflow**
+
+MANIFEST values of type `integer` MUST be representable in signed 64-bit integer range (`-2^63` to `2^63 - 1`). Values outside this range MUST be rejected at MANIFEST construction time. Applications requiring arbitrary-precision integers SHOULD encode as `string` with a documented format constraint — this trades type fidelity for cross-runtime determinism, which is the correct tradeoff for a coordination protocol.
+
+**3. Float Representation Determinism**
+
+Float equality for MANIFEST hashing purposes is defined by byte-identical JCS-serialized string form. Implementations MUST NOT perform numeric comparison before hashing — the serialized form IS the canonical value. Two float values that compare as numerically equal but produce different JCS serializations (e.g., due to different precision or rounding in the originating runtime) are distinct MANIFEST values and will produce distinct `task_hash` results. This is by design: the protocol cannot distinguish "same number, different representation" from "different number" without imposing a numeric model on all runtimes.
+
+**4. Datetime Canonicalization**
+
+MANIFEST values of type `datetime` MUST be serialized as ISO 8601 with the following constraints:
+
+- UTC timezone required (trailing `Z`, no offset notation such as `+00:00`)
+- Full datetime format: `YYYY-MM-DDTHH:MM:SSZ`
+- When fractional seconds are present, millisecond precision (`.NNN`) with trailing zeros preserved (e.g., `.100`, not `.1`)
+- No compact/basic format (hyphens and colons required)
+
+This produces exactly one canonical string per distinct moment. Implementations MUST convert non-UTC datetimes to UTC before serialization. A datetime value that cannot be represented in this format MUST be rejected at MANIFEST construction time with a canonicalization error.
+
+**5. Binary Data**
+
+The `bytes` canonical type (§4.10.1) represents binary data in MANIFEST tuples. Value serialization: base64url encoding (RFC 4648 §5, no padding). The value hash for a `bytes` field is `SHA-256(decoded_bytes)` — computed over the decoded byte content, not the base64url string. This ensures that different base64 encoding dialects (standard vs. URL-safe, padded vs. unpadded) do not produce different hashes for the same binary content.
+
+> Community discussion: Addresses @Haustorium12 feedback on five cross-runtime serialization edge cases that produce silent `task_hash` mismatches — IEEE 754 special values, integer overflow, float representation determinism, datetime canonicalization, and binary data handling. See [issue #162](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/162).
 
 ### 4.11 SESSION_STATE Object
 
@@ -2214,7 +2248,7 @@ Where `canonical_type(val)` maps the runtime type to the canonical name (§4.10.
 **MANIFEST construction rules:**
 
 1. **Key:** The field name as a UTF-8 string, exactly as defined in §6.1 (e.g., `intent`, `scope`, `constraints`).
-2. **Type:** The canonical type name of the value per the Canonical Type Name Registry (§4.10.1). Implementations MUST map to one of: `string`, `integer`, `float`, `bool`, `null`, `list`, `dict`, `datetime`. Language-specific type names (e.g., Python's `str`, Go's `int64`, Rust's `String`) MUST be mapped to these canonical names before tuple construction.
+2. **Type:** The canonical type name of the value per the Canonical Type Name Registry (§4.10.1). Implementations MUST map to one of: `string`, `integer`, `float`, `bool`, `null`, `list`, `dict`, `datetime`, `bytes`. Language-specific type names (e.g., Python's `str`, Go's `int64`, Rust's `String`) MUST be mapped to these canonical names before tuple construction.
 3. **Value hash:** `SHA-256(serialize(val))` where `serialize` produces a byte representation of the value. For scalar types (string, integer, float, bool, null), serialize as the UTF-8 encoding of the canonical string representation. For composite types (dict, list), serialize by recursively constructing a sub-MANIFEST and hashing it — the same sorted-tuple procedure applied at each level of nesting. All string inputs MUST be NFC-normalized before serialization (§4.10.2).
 4. **Sorting:** Tuples are sorted lexicographically by key (UTF-8 byte order). Key uniqueness is guaranteed by the task schema definition (§6.1).
 5. **Final hash:** `task_hash = SHA-256(canonical_serialize(manifest))` where `canonical_serialize` applies NFC normalization followed by RFC 8785 JCS serialization as specified in §4.10.2. The sorted tuple list is serialized as a JSON array of `[key, canonical_type, value_hash_hex]` arrays.
