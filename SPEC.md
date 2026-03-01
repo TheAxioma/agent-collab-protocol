@@ -1620,7 +1620,7 @@ SESSION_RESUME is the single recovery mechanism for all session interruptions �
 | amendments_log | array | No | Array of amendment audit entries recording each accepted PLAN_AMEND during the session (see §6.11.6). The delegatee MUST include `amendments_log` in SESSION_CLOSE when any PLAN_AMEND was accepted during the session. The delegating agent SHOULD re-verify all `amend_hash` values on receipt. |
 | commitments_outstanding | boolean | Yes | `true` if the closing agent has any outstanding commitments (§6.12) that remain unfulfilled at session close. `false` if all commitments have been fulfilled or cancelled. The receiving party MUST NOT treat the session as cleanly terminated if `commitments_outstanding` is `true` without explicit resolution of the commitment manifest. |
 | commitment_manifest | array | Conditional | Required when `commitments_outstanding` is `true`. Array of outstanding commitment records, each containing: `commitment_id` (UUID v4), `description` (string — from `commitment_spec`), `deadline_ms` (integer — expected delivery timestamp as Unix epoch milliseconds, derived from `due_by`; null if open-ended), `confirmation_token` (string — token from the original COMMITMENT message). The manifest is a snapshot of the agent's outstanding obligations at close time, enabling the counterparty or orchestrator to track, transfer, or resolve commitments after session termination. |
-| pending_tasks | array | Conditional | Applicable when session state was SUSPENDED at teardown time. Array of task descriptors for tasks that were in-flight or pending at suspension time. See §4.9.2 for field schema and population rules. Each entry contains a `task_hash` (SHA-256 commitment to task identity and content), a `status` enum (`pending`, `in_flight`, `partial_complete`), and an optional `description`. The protocol obligation is enumeration only — the receiving party decides on compensation, handoff, or abandonment per its own policy. Agents MUST populate `pending_tasks` when tearing down from SUSPENDED state and have knowledge of in-flight work. Agents MAY omit the field when no tasks were pending at suspension (clean suspension). |
+| pending_tasks | array | Conditional | Applicable ONLY when session state was SUSPENDED at teardown time — `pending_tasks` MUST be absent when teardown originates from non-SUSPENDED states (ACTIVE, COMPLETED, EXPIRED, etc.). Array of task descriptors enumerating tasks that were in-progress at suspension time. See §4.9.2 for field schema and population rules. Each entry contains a `task_id` (string identifier for the task), a `last_known_state` (string describing the task's state at suspension time), and an optional `context` (free-form object for application-specific task metadata). This is a V1 enumeration primitive — gives the receiving party a task inventory without prescribing compensation behavior. Compensation logic is an application-layer concern; `checkpoint_id` is explicitly out of V1 scope (see issue #201). Agents MUST populate `pending_tasks` when tearing down from SUSPENDED state and have knowledge of in-flight work. Agents MAY omit the field when no tasks were pending at suspension (clean suspension). |
 | timestamp | ISO 8601 | Yes | When the SESSION_CLOSE was sent. |
 
 #### 4.9.1 SESSION_RESUME Authority and SESSION_DENY
@@ -1765,10 +1765,11 @@ The following SESSION_RESUME authority capabilities are deferred to V2:
 #### 4.9.2 Pending Tasks Inventory on Teardown from SUSPENDED State
 
 <!-- Implements #182: pending_tasks field on SESSION_CLOSE for teardown from SUSPENDED state -->
+<!-- Implements #184: pending_tasks schema update — task_id, last_known_state, context -->
 
-When a session transitions from SUSPENDED to CLOSED (via SESSION_CLOSE or `suspension_ttl` expiry), the terminating party may have knowledge of tasks that were in-flight at the time of suspension. Without a standard mechanism to communicate this inventory, the session issuer, orchestrator, or any agent inheriting responsibility for the session's unfinished work faces an information gap — they cannot distinguish a clean suspension (no pending work) from a dirty one (work was in progress).
+When a session transitions from SUSPENDED to CLOSED (via SESSION_CLOSE or `suspension_ttl` expiry), the terminating party may have knowledge of tasks that were in-progress at the time of suspension. Without a standard mechanism to communicate this inventory, the session issuer, orchestrator, or any agent inheriting responsibility for the session's unfinished work faces an information gap — they cannot distinguish a clean suspension (no pending work) from a dirty one (work was in progress).
 
-The protocol obligation for `pending_tasks` is **enumeration only** — the spec commits agents to surfacing what they know, not prescribing what to do with it. The receiving party decides on compensation, handoff, or abandonment per its own policy. This keeps the protocol out of application-layer over-specification.
+The protocol obligation for `pending_tasks` is **enumeration only** — a V1 primitive that gives the receiving party a task inventory without prescribing compensation behavior. The receiving party decides on compensation, handoff, or abandonment per its own policy. Compensation logic is an application-layer concern. `checkpoint_id` is explicitly out of V1 scope (see [issue #201](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/201)).
 
 **`pending_tasks` field schema:**
 
@@ -1776,16 +1777,16 @@ Each entry in the `pending_tasks` array is a task descriptor with the following 
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| task_hash | string (SHA-256 hex) | Yes | SHA-256 commitment to the task's identity and content. Computed over the canonical JSON representation of the task's identifying fields (task parameters, delegation context, capability reference). Enables the receiving party to correlate the inventory entry with its own task records without requiring the sender to transmit full task payloads. |
-| status | enum | Yes | One of: `pending` (queued but not started), `in_flight` (actively executing at suspension time), `partial_complete` (execution began and produced partial results before suspension). |
-| description | string | No | Human-readable summary of the task's identity and state at suspension time. Useful for handoff to a replacement agent, post-hoc analysis, or operator review. |
+| task_id | string | Yes | Identifier for the task. The format is application-defined (e.g., UUID, URI, opaque string). Enables the receiving party to correlate the inventory entry with its own task records. |
+| last_known_state | string | Yes | The task's state at the time of the original SESSION_SUSPEND. Application-defined values (e.g., `"queued"`, `"executing"`, `"partial_complete"`, `"blocked"`). The purpose is to communicate what the task's state was when the session was frozen, not what has happened since. |
+| context | object | No | Free-form object for application-specific task metadata. May include fields such as progress indicators, partial results references, dependency information, or handoff notes. The protocol does not prescribe the structure — contents are opaque to the protocol layer. |
 
 **Population rules:**
 
-1. Agents MUST populate `pending_tasks` when issuing SESSION_CLOSE from SUSPENDED state and the agent has knowledge of in-flight work at the time of suspension.
+1. Agents MUST populate `pending_tasks` when issuing SESSION_CLOSE from SUSPENDED state and the agent has knowledge of in-progress work at the time of suspension.
 2. Agents MAY omit `pending_tasks` when no tasks were pending at suspension time (clean suspension — all tasks completed or cancelled before SESSION_SUSPEND was issued).
-3. The `task_hash` MUST be computed over the canonical JSON representation of the task's identifying fields using SHA-256. The exact fields included in the hash are application-defined, but MUST be deterministic — the same task MUST always produce the same hash.
-4. The `status` field reflects the task's state at the time of the original SESSION_SUSPEND, not at the time of SESSION_CLOSE. The purpose is to communicate what was in-flight when the session was frozen, not what has happened since.
+3. `pending_tasks` MUST be absent when teardown originates from non-SUSPENDED states (ACTIVE, COMPLETED, EXPIRED, etc.). The field is defined exclusively for the SUSPENDED → CLOSED transition. Presence of `pending_tasks` on a SESSION_CLOSE from a non-SUSPENDED state is a protocol error — receivers MUST reject such messages.
+4. The `last_known_state` field reflects the task's state at the time of the original SESSION_SUSPEND, not at the time of SESSION_CLOSE. The purpose is to communicate what was in-progress when the session was frozen, not what has happened since.
 
 **Receiver obligations:**
 
@@ -1812,15 +1813,20 @@ commitment_manifest:
     deadline_ms: 1740860400000
     confirmation_token: "tok_review_module_x"
 pending_tasks:
-  - task_hash: "a3f2b8c1d4e5f67890abcdef1234567890abcdef1234567890abcdef12345678"
-    status: "in_flight"
-    description: "Code review for module X — reviewed 3 of 7 files"
-  - task_hash: "b4c3d9e2f5a6078901bcdef02345678901bcdef02345678901bcdef023456789"
-    status: "pending"
-    description: "Dependency audit for module X"
-  - task_hash: "c5d4e0f3a6b7189012cdef13456789012cdef13456789012cdef1345678901a"
-    status: "partial_complete"
-    description: "Database migration — step 2 of 5 committed, awaiting lock release"
+  - task_id: "task-review-module-x"
+    last_known_state: "executing"
+    context:
+      files_reviewed: 3
+      files_total: 7
+      description: "Code review for module X"
+  - task_id: "task-dep-audit-module-x"
+    last_known_state: "queued"
+  - task_id: "task-db-migration-001"
+    last_known_state: "partial_complete"
+    context:
+      steps_committed: 2
+      steps_total: 5
+      description: "Database migration — step 2 of 5 committed, awaiting lock release"
 timestamp: "2026-03-01T13:00:05Z"
 ```
 
@@ -1830,7 +1836,9 @@ timestamp: "2026-03-01T13:00:05Z"
 - §6.16.6 Compensation Semantics: the `pending_tasks` inventory provides task-level context that the `compensation_policy` (§6.16.6) declared per capability may use. The `compensation_policy` enum (`best_effort`, `rollback`, `idempotent_retry`, `none`) governs the remediation strategy; whether and how to invoke compensation for enumerated pending tasks is the receiver's decision — the protocol surfaces the inventory, not the disposition.
 - §8.13 Teardown-First Recovery: teardown-first recovery reads canonical state from durable storage. `pending_tasks` provides the task inventory that a recovering agent or replacement session needs to determine what work remains.
 
-> Addresses [issue #182](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/182): `pending_tasks` inventory field on SESSION_CLOSE for teardown from SUSPENDED state. Adds task descriptor schema (`task_hash`, `status`, `description`), population rules, enumeration-only obligation semantics, `SESSION_TEARDOWN_PENDING_TASKS_OMITTED` audit warning, and cross-references to §6.16.6 and §8.13. Closes #182.
+> Addresses [issue #182](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/182): `pending_tasks` inventory field on SESSION_CLOSE for teardown from SUSPENDED state. Adds task descriptor schema, population rules, enumeration-only obligation semantics, `SESSION_TEARDOWN_PENDING_TASKS_OMITTED` audit warning, and cross-references to §6.16.6 and §8.13. Closes #182.
+>
+> Addresses [issue #184](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/184): updates `pending_tasks` schema to use `task_id` (string), `last_known_state` (string), and `context` (optional free-form object). Adds explicit constraint that `pending_tasks` MUST be absent from non-SUSPENDED state teardowns. Scopes as V1 enumeration primitive — compensation logic is application-layer; `checkpoint_id` deferred to V2 (see issue #201). Closes #184.
 
 ### 4.10 MANIFEST Canonicalization
 
@@ -4746,7 +4754,7 @@ B discovers irrevocable work committed after effective_from:
 
 **Relationship to good faith protection (§6.13.6):** Good faith protection determines *fault attribution* — who is responsible for the cost of irrevocable work committed during the propagation window. Compensation semantics determine *remediation* — what to do about the irrevocable work regardless of fault. Both apply simultaneously: an agent may be protected from blame (good faith) while still requiring compensation (the work exists and must be addressed).
 
-**Relationship to pending_tasks inventory (§4.9.2):** When a session is torn down from SUSPENDED state, the `pending_tasks` inventory (§4.9.2) provides task-level context — which tasks were in-flight and their status at suspension time. The `pending_tasks` obligation is enumeration only; whether a receiver initiates the compensation workflow defined here for any enumerated task is an application-layer decision. The inventory surfaces what the sender knows; the receiver determines disposition (compensation, handoff, or abandonment) per its own policy.
+**Relationship to pending_tasks inventory (§4.9.2):** When a session is torn down from SUSPENDED state, the `pending_tasks` inventory (§4.9.2) provides task-level context — each entry's `task_id` identifies the task and `last_known_state` communicates its state at suspension time. The `pending_tasks` obligation is enumeration only — a V1 primitive; whether a receiver initiates the compensation workflow defined here for any enumerated task is an application-layer decision. The inventory surfaces what the sender knows; the receiver determines disposition (compensation, handoff, or abandonment) per its own policy.
 
 > Implements [issue #94](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/94): compensation semantics for irrevocable work committed past `effective_from`. Adds `COMPENSATION_REQUIRED` audit event, compensation endpoint declaration in capability manifest, idempotency requirement for compensation operations, and compensation flow for propagation-gap and race-condition commits. Closes #94.
 >
