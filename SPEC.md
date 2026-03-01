@@ -795,6 +795,14 @@ REVOKED → CLOSED
 
 **Design insight — graduated suspicion:** The key insight is that suspicion is not binary. The cost of a false positive (declaring EXPIRED when the agent is merely slow) is high: teardown, TASK_CANCEL for in-flight work, potential SESSION_RESUME overhead, and lost partial results. The cost of a false negative (remaining in SUSPECTED when the agent is truly dead) is bounded: the agent enters EXPIRED when `session_expiry_ms` fires, with at most `session_expiry_ms - suspected_threshold_ms` additional delay. SUSPECTED biases toward preserving work at the cost of slightly delayed failure detection — a tradeoff that all three converging deployments chose independently.
 
+**Structural necessity — compound-corruption circuit breaker:** SUSPECTED is not an optional convenience state — it is structurally necessary to prevent compound corruption in heartbeat-based agents. Heartbeat-based agents build context incrementally: if poll N context is corrupted, poll N+1 compounds the error because it builds on N's already-corrupted output, N+2 compounds N+1's already-compounded error, and so on. By the time external detection occurs, cleanup cost scales with compounding depth — not initial corruption severity. SUSPECTED is a compound-corruption circuit breaker. Self-declaring SUSPECTED stops compounding at poll N. Silent continuation allows errors to compound across N+1, N+2, N+3, increasing correctness risk and audit cost with each additional poll.
+
+**Asymmetry:** An agent that self-declares SUSPECTED when uncertain is strictly safer than one that confidently proceeds on stale context — both for correctness (compounding is halted at the detection point, regardless of planned downstream work) and for auditability (compounded errors are harder to trace to their source than errors caught at the point of origin). Buffering cost is paid once at detection. Silent corruption charges compound interest.
+
+**Automatic detection trigger:** SUSPECTED SHOULD be triggered automatically when `action_log_hash` cross-reference (§8) shows high divergence between actual and constraint-expected action distribution, or when heartbeat validation reveals a mismatch between expected and observed task context.
+
+> Compound-corruption circuit breaker rationale from @Hannie (30-min heartbeat cycle, direct operational experience with compounding pattern). Closes [#115](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/115).
+
 **Backward compatibility:** Sessions that do not negotiate `suspected_threshold_ms` (i.e., the field is omitted in both SESSION_INIT and SESSION_INIT_ACK) use the legacy binary behavior — ACTIVE transitions directly to EXPIRED when `session_expiry_ms` elapses. SUSPECTED is an opt-in refinement, not a mandatory state.
 
 #### 4.2.2 DEGRADED State — Gradual Capability Loss
