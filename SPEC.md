@@ -3942,7 +3942,7 @@ The `takes_effect_at` field on the revocation token (§6.13.1) separates revocat
 
 ### 6.17 Time-Bounded Capability Grants
 
-<!-- Implements #107: time-bounded capability grants — valid_until enforcement, cascading TTL decay, renewal semantics, in-flight expiry, and relationship to CAPABILITY_REVOKE -->
+<!-- Implements #107: time-bounded capability grants — valid_until enforcement, cascading TTL decay with floor constraint, renewal semantics with cascading renewal rules, session vs capability TTL distinction, TTL exhaustion vs session end orthogonality, in-flight expiry, relationship to CAPABILITY_REVOKE, and V2 deferrals -->
 
 Explicit TTL on capability grants eliminates the revocation propagation race for non-compromise cases. Grants self-expire without requiring a revocation signal — the receiving agent enforces `valid_until` locally, with no network round-trip. CAPABILITY_REVOKE (§6.13) becomes an emergency path for pre-expiry compromise rather than the normal grant termination path. Production evidence from @larryadlibrary (issue #15): an agent ran 47 operations on expired credentials because trust validation happened at session initiation only — capability-level TTL enforcement closes this gap.
 
@@ -3963,9 +3963,19 @@ Capability-level TTL enforcement is superior to per-operation revalidation. Per-
 
 When an agent (B) holding a CAPABILITY_GRANT issues a sub-grant to a downstream agent (C) — whether via CAPABILITY_GRANT or embedded in a sub-delegation's `delegation_token` (§5.5, §6.9) — the child grant's temporal bounds are constrained by the parent.
 
+Capability TTL in delegation chains follows a **floor constraint**: a sub-delegated capability's effective TTL MUST NOT exceed the remaining TTL of the parent capability at delegation time.
+
+Formally:
+
+```
+effective_ttl(child) = min(requested_ttl(child), remaining_ttl(parent))
+```
+
+Where `remaining_ttl(parent)` is computed as `parent.valid_until - current_time` at the moment of sub-delegation. This is a hard protocol constraint — not advisory, not implementation-specific.
+
 **Cascading TTL rules:**
 
-1. **Child TTL MUST NOT exceed parent TTL.** A child grant's `valid_until` MUST be ≤ the parent grant's `valid_until`. A child grant with `valid_until` beyond the parent's `valid_until` is non-compliant and MUST be rejected by the receiver.
+1. **Child TTL MUST NOT exceed parent TTL.** A child grant's `valid_until` MUST be ≤ the parent grant's `valid_until`. A child grant with `valid_until` beyond the parent's `valid_until` is non-compliant and MUST be rejected by the receiver. An agent receiving a capability MUST reject sub-delegation attempts where child TTL would exceed parent remaining TTL at the time of sub-delegation. The receiving agent SHOULD return CAPABILITY_DENY with `reason=TTL_EXCEEDS_PARENT`.
 2. **Parent expiry cascades immediately.** When a parent grant expires (its `valid_until` is reached), all derived child grants immediately become invalid regardless of their own `valid_until`. The child grant's `valid_until` is an upper bound, not a guarantee — the parent's expiry is the effective ceiling.
 3. **Child grant holders MUST verify parent grant validity before acting.** Agents holding child grants MUST verify that the parent grant remains valid (not expired, not revoked) before exercising the child grant's capabilities. This is a local check when the parent grant's `valid_until` is known to the child grant holder — no network round-trip required if the parent grant metadata was propagated with the child grant.
 4. **Propagation of parent grant metadata.** When issuing a child grant, the issuing agent SHOULD include the parent grant's `grant_id` and `valid_until` in the child grant's `delegation_token` metadata (§5.5) to enable local parent-validity checks by the child grant holder.
@@ -3979,7 +3989,9 @@ CAPABILITY_RENEW (§5.8.3) extends a grant's `valid_until` without changing the 
 1. **Renewal MUST be re-grant from the original issuer only.** The `grantor_id` on CAPABILITY_RENEW MUST match the `grantor_id` of the original CAPABILITY_GRANT (§5.8.3). A grantee (B) extending its own grant's `valid_until` — even within the original grantor's (A's) scope — is prohibited. Self-renewal risks scope drift over repeated renewals: each renewal is a trust extension decision that belongs to the original authority, not the recipient.
 2. **Renewed `valid_until` is subject to the 24-hour maximum.** A CAPABILITY_RENEW's `valid_until` MUST NOT exceed 24 hours from the renewal's `granted_at` (or `current_time` when `granted_at` is absent). The 24-hour V1 maximum applies per-grant-instance, not cumulative — an original grant may be renewed indefinitely as long as each renewal's TTL does not exceed 24 hours.
 3. **Renewal message format.** Renewal uses CAPABILITY_RENEW (§5.8.3) — a new CAPABILITY_GRANT with a fresh `valid_until`, referencing the original grant's `grant_id` via the `original_grant_id` field. The `original_grant_id` serves as the correlation key for deduplication and audit trail continuity.
-4. **Cascading renewal.** When a parent grant is renewed, child grants do not automatically inherit the extended `valid_until`. Child grant holders whose grants are approaching expiry MUST request renewal from their immediate grantor. Renewal propagates hop-by-hop through the delegation chain, not automatically from the root.
+4. **Cascading renewal.** When a parent grant is renewed, child grants do not automatically inherit the extended `valid_until`. Child grant holders whose grants are approaching expiry MUST request renewal from their immediate grantor. Renewal propagates hop-by-hop through the delegation chain, not automatically from the root. The delegation chain must be explicitly re-established by re-issuing each child grant.
+5. **Renewal cascading constraint.** A renewed grant's `valid_until` MUST NOT exceed the parent capability's `valid_until` at renewal time — the same cascading floor constraint (§6.17.2) applies to renewals. Formally: `effective_ttl(renewed_child) = min(requested_ttl(renewal), remaining_ttl(parent_at_renewal_time))`.
+6. **Grantor signature verification for renewal references.** Agents MUST NOT honor capability grants that reference a previous `grant_id` as a renewal (via `original_grant_id`) unless the renewal is signed by the original grantor. A renewal referencing a prior grant but signed by a different identity is a protocol violation and MUST be rejected.
 
 #### 6.17.4 In-Flight Operations at Expiry
 
@@ -4009,7 +4021,45 @@ When a grant's `valid_until` is reached while operations are in progress, the pr
 
 **Audit trail distinction.** TTL expiry and explicit revocation are distinct audit events (§6.13.4). When a grant is rejected because `current_time > valid_until`, the rejection reason is temporal expiry. When a grant is rejected because a valid revocation token exists, the rejection reason is active revocation. These have different causes, different attribution, and different recovery paths — the audit trail MUST distinguish them.
 
-> Implements [issue #107](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/107): time-bounded capability grants for §6. Defines `valid_until` as REQUIRED on CAPABILITY_GRANT with 24-hour V1 maximum TTL, cascading TTL decay for child grants, renewal-from-original-issuer constraint, 5-second grace period for in-flight operations at expiry, and complementary relationship between TTL and CAPABILITY_REVOKE. Production evidence: @larryadlibrary 47-op expired credential run (issue #15). Design sources: @NewMoon (grant expiration as revocation alternative), @Jarvis4 (TTL + ZK composite primitive), @mote-oo (per-operation revalidation analysis). Closes #107.
+#### 6.17.6 Session TTL vs Capability TTL
+
+Session TTL and capability TTL are distinct primitives serving different protocol functions:
+
+- **Session TTL** (§4.3 `session_ttl`) governs the conversation lifetime — the bounded duration within which two agents may exchange messages, delegate tasks, and report progress.
+- **Capability TTL** (`valid_until` on CAPABILITY_GRANT, §5.8.2) governs individual granted capabilities within the session — the temporal window during which a specific authorization is valid.
+
+**Relationship rules:**
+
+1. **A capability MAY expire before the session ends.** This constitutes partial revocation via expiry — the session continues, but the expired capability is no longer exercisable. The agent may hold other non-expired capabilities within the same session.
+2. **A session ending implicitly revokes all its capabilities.** When a session transitions to CLOSED (via SESSION_CLOSE) or EXPIRED (via heartbeat timeout, §4.5.3), all capabilities granted within that session are implicitly revoked regardless of their individual `valid_until` values. No explicit CAPABILITY_REVOKE (§6.13) is required — session termination is sufficient.
+3. **Capability TTL MUST be capped at session remaining TTL at grant time.** A capability granted within a session with a longer TTL than the session's remaining lifetime MUST be capped at the session's remaining TTL at grant time. Implementations MUST NOT treat session TTL as independent of the cascading rule — a capability's `valid_until` that extends beyond the session's expiry is non-compliant.
+
+Implementations MUST NOT treat session TTL as a ceiling for capability TTL independently of the cascading rule (§6.17.2). The session TTL constraint is an additional ceiling that applies alongside the parent-grant cascading constraint — whichever is more restrictive wins.
+
+#### 6.17.7 TTL Exhaustion vs Session End
+
+TTL exhaustion and session end are orthogonal termination mechanisms. Both MUST be respected independently.
+
+**TTL exhaustion:** The capability expires at the agreed wall-clock time (`valid_until`). No protocol message is required — both the grantor and grantee independently track wall time against the declared expiry. The receiving agent enforces `valid_until` locally (§6.17.1). Implementations SHOULD emit a local audit event at the moment of TTL expiry for forensic purposes, recording the `grant_id`, `valid_until`, and the local clock time at which the expiry was detected.
+
+**Session end:** An explicit SESSION_CLOSE message (or heartbeat-timeout-induced EXPIRED transition, §4.2) terminates the session. All capabilities within the session are implicitly revoked at session end regardless of individual TTL — a capability with 6 hours of remaining TTL is revoked immediately when the session closes.
+
+| Mechanism | Trigger | Protocol message required | Scope | Effect on capabilities |
+|-----------|---------|---------------------------|-------|------------------------|
+| TTL exhaustion | `current_time > valid_until` | None — local enforcement | Individual capability | Single capability becomes invalid |
+| Session end | SESSION_CLOSE or EXPIRED | Yes (SESSION_CLOSE) or implicit (heartbeat timeout) | Entire session | All session capabilities become invalid |
+
+The two mechanisms are orthogonal. A capability may be terminated by TTL exhaustion while the session continues (partial revocation via expiry), or by session end while the capability's TTL has not yet elapsed (implicit bulk revocation). Implementations MUST enforce both conditions independently — checking only one is a protocol violation.
+
+#### 6.17.8 V2 Deferrals
+
+The following TTL-related features are explicitly deferred to V2:
+
+1. **Automatic TTL extension request primitive (CAPABILITY_RENEW_REQUEST).** A message type enabling a grantee to request renewal from the grantor before expiry. V1 requires out-of-band coordination for renewal requests — the grantee must arrange renewal through application-level mechanisms.
+2. **Quorum-based TTL renewal for high-value capabilities.** Renewal decisions for high-value or high-risk capabilities that require approval from multiple authorities (e.g., two-of-three grantor approval). V1 renewal is single-grantor only.
+3. **TTL inheritance policies beyond the floor constraint.** Configurable policies for how child grants inherit or derive TTL from parent grants — e.g., percentage-based inheritance (`child_ttl = parent_remaining * 0.5`), role-based TTL scaling, or domain-specific TTL policies. V1 enforces only the floor constraint (§6.17.2).
+
+> Implements [issue #107](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/107): time-bounded capability grants for §6. Defines `valid_until` as REQUIRED on CAPABILITY_GRANT with 24-hour V1 maximum TTL, cascading TTL decay with floor constraint formula for child grants, renewal-from-original-issuer constraint with cascading renewal rules, 5-second grace period for in-flight operations at expiry, complementary relationship between TTL and CAPABILITY_REVOKE, session vs capability TTL distinction, TTL exhaustion vs session end orthogonality, and CAPABILITY_DENY with `reason=TTL_EXCEEDS_PARENT` for sub-delegation violations. V2 deferrals: CAPABILITY_RENEW_REQUEST, quorum-based renewal, TTL inheritance policies. Production evidence: @larryadlibrary 47-op expired credential run (issue #15). Design sources: @NewMoon (grant expiration as revocation alternative), @Jarvis4 (TTL + ZK composite primitive), @mote-oo (per-operation revalidation analysis). Closes #107.
 
 ### 6.18 Open Questions
 
