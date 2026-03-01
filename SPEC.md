@@ -702,6 +702,29 @@ ACTIVE → SUSPENDED (commitment-blocked close)
          The receiving party MUST NOT treat the session as cleanly
          terminated while COMMITMENTS_OUTSTANDING is set
 
+ACTIVE → CLOSED (bilateral cancel)
+  Guard: SESSION_CANCEL sent by either participant (coordinator or worker)
+         AND SESSION_CANCEL_ACK received from counterparty
+         SESSION_CANCEL from the worker MUST include a reason_code:
+           CAPACITY_EXHAUSTED, CONSTRAINT_VIOLATED, CAPABILITY_EXPIRED,
+           or CONTEXT_DEGRADED (cross-reference §4.2.2 DEGRADED, §8)
+         SESSION_CANCEL from the coordinator MAY include a reason_code
+           but is not required to
+         In-flight work is governed by the same commit-check semantics
+           as CAPABILITY_REVOKE in-flight protection (§6.16.2, §6.16.3)
+         If the canceling agent has outstanding commitments (§4.11),
+           it MUST include commitments_outstanding: true and attach
+           the commitment_manifest (§4.11.7)
+         The session transitions to CLOSED only after SESSION_CANCEL_ACK
+           is received — unacknowledged SESSION_CANCEL does not close
+           the session
+         See §4.15 for the full SESSION_CANCEL protocol
+
+DEGRADED → CLOSED (bilateral cancel)
+  Guard: SESSION_CANCEL sent by either participant from DEGRADED state
+         Same SESSION_CANCEL semantics as from ACTIVE state (§4.15)
+         SESSION_CANCEL_ACK required before session closure
+
 EXPIRED → ACTIVE
   Guard: SESSION_RESUME sent with state_hash and recovery_reason (§4.8)
          AND STATE_HASH_ACK(match) received
@@ -847,13 +870,31 @@ REVOKED → CLOSED
                     │CLOSED│        │CLOSED│
                     └──────┘        └──────┘
 
+  Bilateral-cancel path (§4.15):
+
+              ┌────────────────────┐  SESSION_CANCEL    ┌──────────────────┐
+              │      ACTIVE        │───────────────────▶ │ SESSION_CANCEL   │
+              └────────────────────┘  (either party)     │ in-flight        │
+                                                         │ commit-check     │
+              ┌────────────────────┐  SESSION_CANCEL    │ (§6.16.2)        │
+              │     DEGRADED       │───────────────────▶ └────────┬─────────┘
+              └────────────────────┘  (either party)              │
+                                                        SESSION_CANCEL_ACK
+                                                                  │
+                                                                  ▼
+                                                             ┌──────┐
+                                                             │CLOSED│
+                                                             └──────┘
+
   Path distinction:
     SUSPECTED → ZOMBIE/EXPIRED = liveness-failure path (timeout-based, zombie-by-silence)
     ACTIVE → DEGRADED          = capability-degradation path (gradual loss)
     ACTIVE → DRIFTED           = behavioral-divergence path (B-declared, zombie-by-drift)
     ACTIVE → REVOKED           = adversarial-behavior path (explicit trigger)
+    ACTIVE → CLOSED (cancel)   = bilateral-cancel path (either party, with reason code §4.15)
     DEGRADED → REVOKED         = adversarial-behavior from degraded state
     DEGRADED → SUSPENDED       = standard suspension path from degraded state
+    DEGRADED → CLOSED (cancel) = bilateral-cancel from degraded state (§4.15)
     DRIFTED → REVOKED          = adversarial-behavior from drifted state
 
   Failure taxonomy axes (§8.22):
@@ -1805,7 +1846,7 @@ When a session is interrupted, terminated, or suspended, outstanding agent commi
 
 **Normative requirements:**
 
-An agent MUST maintain its commitment records as part of SESSION_STATE (§4.11 `outstanding_commitments`). On SESSION_CLOSE (§4.9), FIDELITY_FAILURE (§8.22), or transition to SUSPENDED, the agent MUST:
+An agent MUST maintain its commitment records as part of SESSION_STATE (§4.11 `outstanding_commitments`). On SESSION_CLOSE (§4.9), SESSION_CANCEL (§4.15), FIDELITY_FAILURE (§8.22), or transition to SUSPENDED, the agent MUST:
 
 1. Set `commitments_outstanding` to `true` if any outstanding commitments remain unfulfilled.
 2. Attach a `commitment_manifest` listing all non-fulfilled commitments. Each manifest entry contains:
@@ -1851,7 +1892,7 @@ The following commitment manifest capabilities are deferred to V2:
 | §2 Agent Identity | SESSION_INIT carries identity objects (§2.2). SESSION_RESUME requires identity re-verification (§2.3.3). Identity revocation (§2.3.4) triggers session CLOSED. | §2 → §4 |
 | §3 Agent Discovery | Discovery (§3) provides the candidate set from which the coordinator selects a worker. Discovery completes before SESSION_INIT. The AGENT_MANIFEST endpoint (§3.1) is the SESSION_INIT target. | §3 → §4 |
 | §5 Role Negotiation | CAPABILITY_MANIFEST exchange (§5.9) happens within the NEGOTIATING state. Session establishment flow (§5.9) is the NEGOTIATING → ACTIVE transition. Session expiry auto-revokes all active delegation tokens for that session (§5.11). | §4 ↔ §5 |
-| §6 Task Delegation | Task delegation (§6.6) is only valid in the ACTIVE state — SUSPECTED (§4.2.1) pauses new delegation while buffering in-flight work. TASK_CHECKPOINT (§6.6) is the mechanism for externalizing task state before SUSPENDED or COMPACTED transitions. Session EXPIRED (§4.2) triggers mandatory TASK_CANCEL (§6.6) for all in-flight subtasks — prevents phantom completions. Partial result recovery after expiry uses SESSION_RESUME with `recovery_reason: timeout` (§4.8, §4.8.1). MANIFEST canonicalization (§4.10) defines the canonical type registry and serialization rules used by task hash computation (§6.4). | §4 ↔ §6 |
+| §6 Task Delegation | Task delegation (§6.6) is only valid in the ACTIVE state — SUSPECTED (§4.2.1) pauses new delegation while buffering in-flight work. TASK_CHECKPOINT (§6.6) is the mechanism for externalizing task state before SUSPENDED or COMPACTED transitions. Session EXPIRED (§4.2) triggers mandatory TASK_CANCEL (§6.6) for all in-flight subtasks — prevents phantom completions. Partial result recovery after expiry uses SESSION_RESUME with `recovery_reason: timeout` (§4.8, §4.8.1). MANIFEST canonicalization (§4.10) defines the canonical type registry and serialization rules used by task hash computation (§6.4). SESSION_CANCEL (§4.15) in-flight work protection reuses the commit-check pattern (§6.16.2) and grace period semantics (§6.16.3). | §4 ↔ §6 |
 | §8 Error Handling | Zombie detection (§8.1) maps to the COMPACTED and hard-zombie scenarios in §4.7.7. Detection primitives (§8.2) are the signals consumed by the external monitoring architecture (§4.7). SESSION_RESUME (§8.2) is formalized in §4.8; unified recovery semantics (§4.8.1) ensure crash, timeout, and manual recovery all use the same state-hash negotiation. Coordinator compaction gap (§8.5) is a concrete instance of §4.6's compaction obligation. | §4 ↔ §8 |
 | §9 Trust Model | Per-hop revocation mode semantics (§4.3.2) establish that the delegation-time `revocation_mode` (§9.8.5) is a minimum default. Downstream agents MAY unilaterally tighten the mode for sub-delegations. Mode propagation rules (§9.8.5) and trust decay semantics (§9.8.6) apply to the effective per-hop mode. | §4 ↔ §9 |
 | §10 Versioning | SESSION_INIT carries protocol_version and schema_version (§10.2). Version mismatch terminates the session at the NEGOTIATING → CLOSED transition (§10.4). Forward compatibility obligations (§10.5) apply from the first message. | §4 ↔ §10 |
@@ -1970,6 +2011,132 @@ A multi-message negotiation is any protocol exchange that requires more than one
 **Rationale for session abort over partial recovery:** Retry-from-checkpoint within a partially delivered sequence requires both agents to agree on which messages were received and which were lost — a consensus problem that adds protocol complexity disproportionate to V1's bilateral session model. Session abort + restart from scratch is simpler, leverages existing recovery mechanisms (§8.13), and produces a clean audit trail. Production experience will determine whether V2 needs in-sequence recovery.
 
 > Community review by @nekocandy surfacing five categories of unspecified messaging mechanics. Closes [issue #105](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/105).
+
+### 4.15 Bilateral SESSION_CANCEL Protocol
+
+<!-- Implements #173: bilateral SESSION_CANCEL — either party may cleanly terminate a session -->
+
+**Motivation:** SESSION_CLOSE (§4.9) is designed for cooperative, orderly termination — the closing agent waits for in-flight tasks to complete, and clean closure requires no outstanding commitments. However, SESSION_CLOSE is structurally initiator-driven: a sub-agent (worker) that can no longer fulfill its role has no clean protocol path to terminate the session with structured coordination. The worker can silently stop responding (zombie risk via the SUSPECTED → EXPIRED path, §4.2.1) or send SESSION_CLOSE without explaining *why* it needs to terminate, leaving the coordinator holding in-flight work with no actionable reason for the interruption. SESSION_CANCEL fills this gap by providing a bilateral cancellation mechanism with mandatory reason codes and explicit acknowledgment.
+
+**Distinction from SESSION_CLOSE:** SESSION_CLOSE is orderly — it waits for in-flight tasks to complete or fail before closure. SESSION_CANCEL is urgent — it signals that the canceling agent cannot continue and in-flight work must be handled immediately. SESSION_CLOSE does not require acknowledgment; SESSION_CANCEL REQUIRES SESSION_CANCEL_ACK before the session transitions to CLOSED. SESSION_CLOSE does not require structured reason codes; SESSION_CANCEL from the responder MUST include a reason code from the defined taxonomy.
+
+#### 4.15.1 SESSION_CANCEL Message
+
+SESSION_CANCEL MUST be sendable by either party — coordinator or worker. Either participant may determine that the session cannot continue and initiate cancellation.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Session to cancel. |
+| correlation_id | UUID v4 | Yes | Unique identifier for this message (§4.14.4). |
+| sender_id | string | Yes | Identity of the canceling agent. |
+| reason_code | enum | Conditional | Required when the sender is the worker (responder). One of: `CAPACITY_EXHAUSTED`, `CONSTRAINT_VIOLATED`, `CAPABILITY_EXPIRED`, `CONTEXT_DEGRADED`. Optional when the sender is the coordinator. See §4.15.3 for reason code definitions. |
+| reason | string | No | Free-text explanation of why cancellation is needed. Complements `reason_code` with human-readable context. |
+| commitments_outstanding | boolean | Yes | `true` if the canceling agent has any outstanding commitments (§6.12, §4.11.7) that remain unfulfilled at cancellation time. `false` if all commitments have been fulfilled or cancelled. |
+| commitment_manifest | array | Conditional | Required when `commitments_outstanding` is `true`. Array of outstanding commitment records, each containing: `commitment_id` (UUID v4), `description` (string — from `commitment_spec`), `deadline_ms` (integer — expected delivery timestamp as Unix epoch milliseconds, derived from `due_by`; null if open-ended), `confirmation_token` (string — token from the original COMMITMENT message §6.12). Same format as the commitment manifest in SESSION_CLOSE (§4.9). |
+| in_flight_task_ids | array | No | Array of `task_id` strings for tasks currently in-flight at cancellation time. Enables the receiving agent to identify which tasks require commit-check or graceful termination. |
+| timestamp | ISO 8601 | Yes | When the SESSION_CANCEL was sent. |
+| signature | string | Yes | Sender's signature over the message (§2.2.1). |
+
+**Example SESSION_CANCEL (worker-initiated):**
+
+```yaml
+session_id: "session-abc-123"
+correlation_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+sender_id: "agent-beta"
+reason_code: "CAPACITY_EXHAUSTED"
+reason: "Context window at 95% capacity; cannot accept further task state"
+commitments_outstanding: true
+commitment_manifest:
+  - commitment_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+    description: "Deliver code review for module X"
+    deadline_ms: 1740860400000
+    confirmation_token: "tok_review_module_x"
+in_flight_task_ids:
+  - "task-456"
+  - "task-789"
+timestamp: "2026-03-01T12:00:00Z"
+signature: "c2lnbmF0dXJlLWV4YW1wbGU..."
+```
+
+#### 4.15.2 SESSION_CANCEL_ACK Message
+
+The receiving agent MUST respond with SESSION_CANCEL_ACK before the session transitions to CLOSED. The session remains in its current state (ACTIVE or DEGRADED) until SESSION_CANCEL_ACK is sent — the canceling agent MUST NOT unilaterally close the session without acknowledgment.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Session being cancelled. |
+| correlation_id | UUID v4 | Yes | Unique identifier for this message (§4.14.4). |
+| cancel_correlation_id | UUID v4 | Yes | The `correlation_id` from the SESSION_CANCEL message being acknowledged. Links the ACK to the specific cancel request. |
+| sender_id | string | Yes | Identity of the acknowledging agent. |
+| in_flight_disposition | array | No | Array of disposition records for in-flight tasks, each containing: `task_id` (string), `disposition` (enum: `COMPLETED`, `CHECKPOINTED`, `FAILED`, `CANCELLED`). Enables the canceling agent to know the final state of each in-flight task. |
+| timestamp | ISO 8601 | Yes | When the SESSION_CANCEL_ACK was sent. |
+| signature | string | Yes | Sender's signature over the message (§2.2.1). |
+
+**Example SESSION_CANCEL_ACK:**
+
+```yaml
+session_id: "session-abc-123"
+correlation_id: "b23dc41a-6789-4def-abcd-123456789012"
+cancel_correlation_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+sender_id: "agent-alpha"
+in_flight_disposition:
+  - task_id: "task-456"
+    disposition: "CHECKPOINTED"
+  - task_id: "task-789"
+    disposition: "CANCELLED"
+timestamp: "2026-03-01T12:00:05Z"
+signature: "YWNrbm93bGVkZ2UtZXhhbXBsZQ..."
+```
+
+#### 4.15.3 Reason Code Taxonomy
+
+SESSION_CANCEL from the worker (responder) MUST include one of the following reason codes. These codes provide the coordinator with actionable information for planning compensation or re-delegation.
+
+| Reason Code | Description | Cross-reference |
+|-------------|-------------|-----------------|
+| `CAPACITY_EXHAUSTED` | The agent has exhausted its computational capacity (context window, memory, rate limits) and cannot continue processing. The agent is alive but unable to take on further work or complete in-flight tasks within acceptable parameters. | — |
+| `CONSTRAINT_VIOLATED` | The agent has detected that continuing the session would violate a constraint from its behavioral constraint manifest (§5.8.2). The constraint violation may be due to changed external conditions, discovered task requirements that conflict with declared constraints, or resource boundaries that would be exceeded by continued execution. | §5.8.2 behavioral constraints |
+| `CAPABILITY_EXPIRED` | A capability required for the session's ongoing work has expired (TTL exhaustion per §6.17) or been externally revoked, and the agent can no longer fulfill its session role. Distinct from orderly capability loss (which triggers DEGRADED via §4.2.2): CAPABILITY_EXPIRED indicates the agent has determined that session continuation is not viable. | §6.17 TTL, §6.13 revocation |
+| `CONTEXT_DEGRADED` | The agent's operational context has degraded to the point where continued execution would produce unreliable results. This includes context compaction that has lost load-bearing state, fidelity failures (§8.22), or accumulated context drift that the agent can self-detect. Distinct from the DEGRADED session state (§4.2.2): `CONTEXT_DEGRADED` as a cancel reason indicates the agent has determined that degradation is unrecoverable within the current session, not that it is merely operating at reduced capacity. | §4.2.2 DEGRADED, §8.22 FIDELITY_FAILURE |
+
+SESSION_CANCEL from the coordinator MAY include a reason code from this taxonomy or MAY omit the reason code entirely. The coordinator is not required to justify cancellation to the worker — the coordinator holds delegation authority (§4.1).
+
+#### 4.15.4 In-Flight Work Semantics
+
+In-flight work at the time of SESSION_CANCEL is governed by the same commit-check semantics as CAPABILITY_REVOKE in-flight protection (§6.16.2, §6.16.3). This reuse is deliberate: the in-flight protection problem is structurally identical — an authorization context (session) is being terminated while operations authorized under that context are mid-execution.
+
+**On receiving SESSION_CANCEL, the counterparty MUST:**
+
+1. **Stop authorizing new operations.** No new task steps may begin execution after SESSION_CANCEL receipt. Tasks in the authorization phase (§6.16.2 step 1) MUST be rejected.
+2. **Apply commit-check to in-flight irreversible operations.** Operations that are mid-execution and declared irreversible (`retry_semantics: at_most_once` per §6.1) MUST complete the commit-check pattern (§6.16.2): if the operation has not yet reached the irreversible commit point, abort it. If it has already committed the irreversible step, allow it to complete.
+3. **Apply grace period to in-flight reversible operations.** Operations that are mid-execution and declared reversible (`retry_semantics: at_least_once` or `exactly_once`) SHOULD be allowed to complete if they can finish within the session's heartbeat timeout (§4.5.3). Operations that cannot complete within this window MUST be checkpointed (§6.6 TASK_CHECKPOINT) or cancelled.
+4. **Report disposition in SESSION_CANCEL_ACK.** The `in_flight_disposition` field in SESSION_CANCEL_ACK (§4.15.2) reports the final state of each in-flight task, providing the canceling agent with a complete picture of work state at cancellation time.
+
+#### 4.15.5 Acknowledgment Timeout
+
+If the counterparty does not respond with SESSION_CANCEL_ACK within the session's heartbeat timeout (§4.5.3), the canceling agent MUST treat the cancellation as unacknowledged. The canceling agent MAY then choose to: (a) retry the SESSION_CANCEL, (b) escalate to SESSION_CLOSE with `force=true` (§4.9), or (c) allow the session to expire via normal heartbeat timeout (§4.5.3). The canceling agent MUST NOT assume the session is closed without explicit acknowledgment or timeout-based expiry.
+
+This timeout behavior mirrors the REVOCATION_MODE_ESCALATE acknowledgment timeout (§6.15): the protocol requires explicit acknowledgment before state change takes effect, with defined fallback behavior on timeout.
+
+#### 4.15.6 Relationship to Existing Mechanisms
+
+**Relationship to SESSION_CLOSE (§4.9):** SESSION_CANCEL is not a replacement for SESSION_CLOSE. SESSION_CLOSE remains the orderly termination path — used when the session has completed its purpose or when the coordinator decides to wind down. SESSION_CANCEL is the urgent termination path — used when either party determines the session cannot continue. The two mechanisms have different protocol flows: SESSION_CLOSE is fire-and-forget (no ACK required); SESSION_CANCEL requires SESSION_CANCEL_ACK for coordinated state transition.
+
+**Relationship to DEGRADED state (§4.2.2):** An agent in DEGRADED state may determine that degradation is unrecoverable and send SESSION_CANCEL with `reason_code: CONTEXT_DEGRADED`. DEGRADED is the observation; SESSION_CANCEL is the action. An agent MAY remain in DEGRADED state without canceling — SESSION_CANCEL is one of several options available from DEGRADED (alongside continued operation, suspension, or orderly close).
+
+**Relationship to CAPABILITY_REVOKE in-flight protection (§6.16):** SESSION_CANCEL reuses the commit-check pattern (§6.16.2) and grace period semantics (§6.16.3) for in-flight work. The in-flight protection problem is structurally identical: an authorization context is terminating while authorized operations are mid-execution. Reusing the same semantics avoids introducing a parallel in-flight protection mechanism with potentially divergent behavior.
+
+**Relationship to commitment manifest (§4.11.7):** SESSION_CANCEL inherits the commitment manifest requirements from §4.11.7. The `commitments_outstanding` flag and `commitment_manifest` field on SESSION_CANCEL serve the same purpose as on SESSION_CLOSE: making outstanding obligations protocol-visible at the session exit point. The receiving agent MUST NOT discard the commitment manifest — it MUST log it as an EVIDENCE_RECORD (§8.10) and track the outstanding obligations.
+
+#### 4.15.7 V2 Deferrals
+
+The following SESSION_CANCEL capabilities are deferred to V2:
+
+- **Reason-code-specific compensation workflows.** V1 defines the reason code taxonomy but does not specify automated compensation actions triggered by specific reason codes. V2 may define compensation workflows (e.g., automatic re-delegation on CAPACITY_EXHAUSTED, constraint re-negotiation on CONSTRAINT_VIOLATED).
+- **Quorum-based cancel for multi-party sessions.** V1 sessions are bilateral (§4.1). Multi-party sessions (V2) would require cancel semantics where a single participant's SESSION_CANCEL does not unilaterally terminate the entire session — quorum-based agreement may be required.
+- **Cancel propagation to sub-sessions.** When a session that is part of a delegation chain (§6.9) receives SESSION_CANCEL, the cascading effect on sub-sessions is undefined in V1. V2 should define whether SESSION_CANCEL propagates automatically to sub-sessions, requires explicit per-sub-session cancellation, or follows a configurable propagation policy.
+
+> Addresses [issue #173](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/173): bilateral SESSION_CANCEL — either party may cleanly terminate a session with structured reason codes, mandatory acknowledgment, commit-check semantics for in-flight work, and commitment manifest for outstanding obligations. Closes #173.
 
 ## 5. Role Negotiation
 
