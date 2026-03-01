@@ -8056,6 +8056,80 @@ An auditor traversing the governance hash chain can independently verify which s
 
 > Implements [issue #210](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/210): three structural elements for V1-complete governance in §9. Defines (1) GovernanceState enum with machine-readable lifecycle values (`PROPOSED`, `ACTIVE`, `SUPERSEDED`, `REVOKED`) and state transition rules (§9.14.1); (2) genesis ceremony specification documenting bootstrap steps and acknowledging that initial legitimacy is grounded in external social agreement, not derivable from within the protocol (§9.14.2); (3) publication hash composability defining how governance document content hashes bind to the spec version hash chain via `SHA-256(prior_hash || governance_content_canonical || spec_version_string)` (§9.14.3). These three elements generalize the patterns in §9.10–§9.12 from trust-annotation-specific to protocol-wide governance. Closes #210.
 
+### 9.15 PKI Bootstrapping
+
+The spec requires per-hop signing of `(task_hash || intent_hash || delegator_id)` (§6.4.1) and signature verification against the delegating agent's public key (§2.2.1). These mechanisms assume that a verifying agent already possesses the counterparty's public key — but the spec does not define how agents exchange public keys at first contact. Without a specified bootstrap mechanism, implementations must invent their own key exchange procedures, producing incompatible trust establishment models that silently fragment the protocol's cryptographic guarantees.
+
+This section specifies the V1 key bootstrap mechanism and its security boundaries.
+
+#### 9.15.1 V1 Mechanism: Trust-On-First-Use (TOFU)
+
+V1 uses **Trust-On-First-Use (TOFU)** for public key bootstrapping. TOFU operates as follows:
+
+**First contact:**
+
+1. When agent A contacts agent B for the first time, A presents its identity object (§2.2) including the `pubkey` field.
+2. B MUST record the binding `(agent_identity, pubkey)` in persistent local storage, where `agent_identity` is the stable identity artifact defined in §2.4 — the public key fingerprint for keypair identities, or the `(name, platform, timestamp)` triple for name-only identities transitioning to keypair identity.
+3. B MUST treat the recorded binding as authoritative for all subsequent interactions with A.
+4. The symmetric case applies: B presents its identity object to A, and A records the binding.
+
+**Subsequent contacts:**
+
+1. When an agent presents its identity object in any subsequent interaction (session establishment, SESSION_RESUME per §2.3.3, CAPABILITY_MANIFEST exchange per §5.1), the receiving agent MUST verify the presented `pubkey` against the recorded binding.
+2. If the presented `pubkey` matches the recorded binding, the agent is authenticated — proceed with normal protocol flow.
+3. If the presented `pubkey` does NOT match the recorded binding, the receiving agent MUST treat this as a **trust violation**:
+   - MUST reject the interaction — do not accept messages, delegate tasks, or resume sessions with the mismatched identity.
+   - MUST emit DIVERGENCE_REPORT (§8.11) with `reason_code: key_mismatch` and include the expected and presented public key fingerprints in the report payload.
+   - MUST NOT silently accept the new key. Automatic key rotation without an explicit, authenticated rotation protocol is a vector for key substitution attacks.
+
+**Binding persistence requirements:**
+
+- The `(agent_identity, pubkey)` binding MUST persist across sessions. A binding established in session N is authoritative in session N+1.
+- Bindings MUST survive agent restart, context compaction, and process migration. Implementations that store bindings only in ephemeral memory violate this requirement.
+- An agent that loses its binding store (e.g., due to unrecoverable storage failure) MUST treat all subsequent first contacts as new TOFU events and SHOULD log this as a security-relevant event.
+
+**Key rotation under TOFU:**
+
+TOFU as specified above does not support key rotation — a changed key is indistinguishable from a key substitution attack. V1 does not define an authenticated key rotation protocol. An agent that needs to rotate its keypair MUST:
+
+1. Revoke the old identity (§2.3.4).
+2. Publish a new identity with the new keypair.
+3. Re-establish TOFU bindings with all counterparties under the new identity.
+
+This is deliberately conservative. An in-place key rotation mechanism requires either a pre-established rotation key or a trusted third party — neither of which V1 mandates.
+
+#### 9.15.2 Security Advisory
+
+**TOFU does not protect against active man-in-the-middle (MITM) at first contact.** If an attacker interposes during the initial key exchange — presenting its own public key while impersonating the legitimate agent — the receiving agent will bind the attacker's key to the legitimate agent's identity. All subsequent interactions will authenticate the attacker, not the legitimate agent, and the TOFU mechanism will actively reject the legitimate agent's real key as a mismatch.
+
+This is a fundamental limitation of TOFU, shared with other TOFU-based systems (SSH host key verification, Signal's safety numbers). The trade-off is explicit:
+
+- **What TOFU guarantees:** After first contact, any key change is detected and flagged. An attacker who was not present at first contact cannot later substitute a key without triggering a trust violation.
+- **What TOFU does not guarantee:** That the key accepted at first contact actually belongs to the claimed agent. First-contact authenticity requires an out-of-band verification channel that V1 does not specify.
+
+**Deployment guidance for production systems:**
+
+Production deployments that require first-contact authenticity — where the cost of a successful MITM at initial key exchange is unacceptable — SHOULD layer additional verification above the V1 TOFU mechanism:
+
+- **Pre-shared key distribution:** Distribute agent public keys through a trusted out-of-band channel (e.g., operator configuration, secure provisioning) before first protocol contact. This converts the first contact from a TOFU event into a verification event.
+- **Key fingerprint verification:** Operators manually verify public key fingerprints through a separate authenticated channel after first contact, similar to SSH host key verification workflows.
+- **Registry-based verification:** Use a trusted registry that maps agent identities to public keys, queried independently of the presenting agent. (See §9.15.3 for V2 registry plans.)
+
+These mitigations are deployment-specific and outside the V1 protocol boundary. The protocol provides the TOFU primitive; deployments layer trust according to their threat model.
+
+#### 9.15.3 V2 Deferrals
+
+The following PKI bootstrapping enhancements are deferred to V2:
+
+- **Registry-based key distribution:** A trusted registry service that agents query to obtain counterparty public keys independently of the counterparty's self-presentation. Eliminates the TOFU first-contact vulnerability by providing an authoritative key source.
+- **Web-of-trust key verification:** Agents vouch for each other's public keys through signed endorsements, building a decentralized trust graph. An agent's key is considered verified if endorsed by a sufficient number of already-trusted agents (threshold policy is deployment-specific).
+- **Authenticated key rotation protocol:** A mechanism for rotating keypairs in place without revoking the identity, using the existing key to authenticate the transition to a new key (e.g., signing the new public key with the old private key and distributing the rotation attestation to all counterparties with existing TOFU bindings).
+- **Cross-reference with DID infrastructure:** Integration with Decentralized Identifier (DID) resolution for key discovery, building on the DID forward-compatibility noted in §2.2.1.
+
+These mechanisms address the known limitations of TOFU (§9.15.2) and will be specified in a future protocol version.
+
+> Addresses [issue #224](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/224): the spec requires per-hop signing but was silent on how agents exchange public keys at first contact — a V1 correctness dependency that blocks adoption. Specifies TOFU (Trust-On-First-Use) as the V1 bootstrap mechanism (§9.15.1): at first contact, accept and record the presented public key; on subsequent contacts, verify against the recorded key and treat mismatch as a trust violation. Includes security advisory (§9.15.2) that TOFU does not protect against active MITM at first contact, with deployment guidance for stronger guarantees. Defers registry-based and web-of-trust alternatives to V2 (§9.15.3). Closes #224.
+
 ## 10. Versioning
 
 Version management in a decentralized protocol has a different failure mode than in centralized systems. In a centralized system, incompatible versions produce a clear error at deployment time. In a decentralized protocol, incompatible versions produce silent semantic drift at collaboration time — two agents agree on a task, execute against different protocol semantics, and discover the mismatch only when results diverge. The versioning strategy must make incompatibility loud and early, not quiet and late.
