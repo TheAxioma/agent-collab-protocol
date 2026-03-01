@@ -728,10 +728,11 @@ REVOKED → CLOSED
               ┌────────────────────┐  latency /        ┌──────────┐
               │      ACTIVE        │─────────────────▶ │ DEGRADED │
               └────────────────────┘  partial cap      └┬───┬───┬─┘
-                        ▲              loss / app        │   │   │
-                        │              self-report       │   │   │
+                        ▲              loss / canary     │   │   │
+                        │              / drift / fidelity│   │   │
                         │                                │   │   │
-                        │  conditions cleared            │   │   │
+                        │  conditions cleared +          │   │   │
+                        │  fresh attestation             │   │   │
                         └────────────────────────────────┘   │   │
                                                              │   │
                          adversarial behavior (§8.16)        │   │
@@ -828,20 +829,46 @@ REVOKED → CLOSED
 #### 4.2.2 DEGRADED State — Gradual Capability Loss
 
 <!-- Implements #79: DEGRADED intermediate state between ACTIVE and REVOKED -->
+<!-- Implements #102: DEGRADED detection signals, declaration authority, protocol behavior -->
 
 **Motivation:** The §4.2 state machine prior to DEGRADED treated session health as binary within the operational range: a session was either ACTIVE (fully functional) or heading toward REVOKED/EXPIRED (terminal). Real distributed systems exhibit gradual capability loss without crossing a single hard threshold. An agent experiencing sustained high latency, partial capability loss, or resource pressure is not SUSPECTED (liveness is not in question — the agent is alive and responding) and is not REVOKED (no adversarial intent). It is operating at reduced capacity — a "yellow card" state that warrants explicit protocol acknowledgment. DEGRADED fills this gap by giving coordinators structured options for handling degradation without forcing a binary choice between ignoring the problem and tearing down the session.
 
-**V1 scope:** V1 defines the DEGRADED state, its transitions, and caller options. Domain-specific quality metrics (e.g., "response quality dropped below threshold X") are **out of scope for V1** — only latency and partial capability loss signals are required entry conditions. Quality degradation detection is application-specific and deferred to V2.
+**V1 scope:** V1 defines the DEGRADED state, its transitions, caller options, declaration authority, protocol behavior requirements, and six detection signal classes organized into two tiers. Domain-specific quality metrics (e.g., "response quality dropped below threshold X") are **out of scope for V1** — quality degradation detection is application-specific and deferred to V2. Quorum-based escalation (requiring agreement from multiple verifiers) is a V2 design direction.
 
-**DEGRADED entry conditions:** An agent transitions from ACTIVE to DEGRADED when any of the following conditions are detected:
+**DEGRADED entry conditions:** An agent transitions from ACTIVE to DEGRADED when any of the following conditions are detected. Detection signals are organized into two tiers: deployment-observable signals (latency, capability loss) and protocol-level signals (canary failure, behavioral drift, fidelity attestation).
+
+**Tier 1 — Deployment-observable signals:**
 
 1. **Sustained latency increase.** Response times for task-related messages (TASK_PROGRESS, TASK_COMPLETE) exceed the session's expected latency profile for `degraded_confirmation_count` (default: 3) consecutive interactions. The expected latency profile is deployment-specific — the protocol does not define absolute latency thresholds. Detection is local: the coordinator monitors worker response latency against its own expectations.
 
 2. **Partial capability loss.** The counterparty reports a reduced capability set via CAPABILITY_UPDATE (§5.8), or capability invocations that previously succeeded begin failing with transient errors. Partial loss means some capabilities remain functional — total capability loss is a terminal condition (SESSION_CLOSE).
 
-3. **Application self-report.** The counterparty reports `app_status: DEGRADED` in a HEARTBEAT message (§4.5.3). This detection path requires `heartbeat_params.application_liveness = true` negotiated at SESSION_INIT (§4.3.1). Self-reported DEGRADED is the most reliable signal — the agent itself has detected reduced capacity.
+3. **Application self-report.** The counterparty reports `app_status: DEGRADED` in a HEARTBEAT message (§4.5.3). This detection path requires `heartbeat_params.application_liveness = true` negotiated at SESSION_INIT (§4.3.1). Self-reported DEGRADED is treated as advisory — see declaration authority below.
 
-**Detection is local and independent.** As with SUSPECTED (§4.2.1), each side evaluates degradation independently. The coordinator may consider the session DEGRADED while the worker considers it ACTIVE (e.g., the coordinator observes increased latency that the worker is unaware of). This asymmetry is by design — degradation perception depends on the observer's expectations.
+**Tier 2 — Protocol-level detection signals:**
+
+4. **Canary failure rate.** Sustained failure rate of canary tasks above a deployment-defined threshold over a sliding window. Canary tasks are lightweight, known-good tasks injected by the delegating agent or external verifier to probe agent health. A canary failure rate that exceeds the deployment-configured threshold (e.g., >30% failure over the last N interactions) over a sustained window produces a DEGRADED signal. The threshold and window size are deployment-specific — the protocol defines the signal class, not the numeric values. Canary task design SHOULD use tasks with deterministic expected outputs to distinguish agent degradation from task-inherent difficulty.
+
+5. **Behavioral drift.** KL-divergence between the agent's actual action distribution (derived from `action_log_hash` cross-reference, §8.21) and the expected distribution from declared constraints (`behavioral_constraint_manifest`, §5.8.2) exceeds a deployment-defined threshold over a sliding window. This is a stronger signal than single-interval divergence (which may be transient variance) — sustained divergence across multiple heartbeat intervals indicates systematic behavioral erosion. The divergence metric and threshold are deployment-specific; the protocol defines the signal class and its relationship to the `action_log_hash` cross-reference mechanism (§8.21.2).
+
+6. **Fidelity attestation failure.** Context compaction is detected (§4.2, COMPACTED state) without subsequent re-attestation of the agent's capability manifest. An agent that has undergone compaction and resumes without re-attesting its capabilities may be operating on incomplete or corrupted state — it has lost fidelity without demonstrating recovery. The external verifier (§4.7.2) or delegating agent detects the gap between compaction event and missing re-attestation. This signal is distinct from the COMPACTED state itself: COMPACTED triggers SESSION_RESUME; fidelity attestation failure triggers DEGRADED when the agent resumes but does not re-attest.
+
+**Declaration authority.** DEGRADED MUST be declared by an external verifier (§4.7.2) or the delegating agent. These parties have the observational baseline and process-level isolation required to assess degradation objectively. Self-declaration (via `app_status: DEGRADED` in HEARTBEAT) SHOULD be permitted but MUST be treated as advisory only — a degraded agent may be unable to accurately assess its own state (phenomenological blindness, §4.7.1). The delegating agent or external verifier receiving a self-declaration SHOULD validate it against independent signals before transitioning the session to DEGRADED. Quorum-based escalation (requiring agreement from multiple verifiers before DEGRADED declaration) is a V2 design direction — V1 relies on single-verifier or delegating-agent authority.
+
+**Detection asymmetry.** Unlike SUSPECTED (§4.2.1), where each side evaluates independently, DEGRADED declaration authority is asymmetric by design. The delegating agent and external verifier have the observational baseline (expected latency profiles, capability expectations, behavioral constraint manifests) against which to measure degradation. The degraded agent may lack this baseline or may be unable to detect its own degradation (phenomenological blindness). The coordinator may consider the session DEGRADED while the worker considers it ACTIVE — this is expected, not an error.
+
+**Protocol behavior in DEGRADED state.** An agent in DEGRADED state:
+
+- MUST continue heartbeat at normal interval. Degradation is not a liveness failure — heartbeat suppression or slowdown would conflate DEGRADED with SUSPECTED and corrupt the liveness detection path (§4.2.1).
+- MUST append `trust_state: DEGRADED` to KEEPALIVE messages (§4.5.1). This field signals the agent's current trust state to the counterparty and to external verifiers monitoring the KEEPALIVE stream. The `trust_state` field is defined in the KEEPALIVE message table (§4.5.1).
+- SHOULD reduce scope of new sub-delegations. An agent that is itself degraded SHOULD NOT sub-delegate at full scope — its reduced capacity may propagate degradation downstream. The agent SHOULD either reduce the task scope in sub-delegated TASK_ASSIGN messages or refrain from sub-delegation until recovery.
+- MUST NOT initiate new sessions with trust requirement higher than DEGRADED. A degraded agent cannot credibly claim ACTIVE trust level to a new counterparty. New SESSION_INIT messages from a degraded agent MUST declare the agent's current trust state, enabling the counterparty to make an informed enrollment decision.
+
+**Delegating agent behavior on receiving KEEPALIVE with `trust_state: DEGRADED`:** The delegating agent receiving a KEEPALIVE with `trust_state: DEGRADED`:
+
+- MAY continue existing task under reduced trust. The task was delegated when the agent was ACTIVE; continuing under DEGRADED is a trust reduction, not a protocol violation. The delegating agent SHOULD lower its confidence in the task outcome and SHOULD increase monitoring frequency (shorter KEEPALIVE intervals, more frequent SEMANTIC_CHALLENGE §8.9.2).
+- SHOULD trigger READYCHECK before assigning new work. A READYCHECK is a lightweight probe (distinct from SEMANTIC_CHALLENGE) that verifies the degraded agent's current capacity for the specific task being considered. The delegating agent SHOULD NOT assign new tasks to a degraded agent without first confirming the agent can handle the additional load. READYCHECK semantics follow the same pattern as HEARTBEAT_PING/PONG (§8.9.1) — a request-response pair with a deployment-configured timeout.
+- MAY escalate to REVOKED at delegating agent's discretion. If the delegating agent determines that the degradation pattern is consistent with adversarial behavior (§8.16) or that sustained degradation without recovery constitutes an unacceptable risk, the delegating agent MAY unilaterally transition the session to REVOKED. This escalation is the delegating agent's prerogative — DEGRADED does not require consensus for revocation.
 
 **Caller options when session enters DEGRADED:** The coordinator (or the agent that detected degradation) MUST choose one of the following responses:
 
@@ -853,8 +880,8 @@ REVOKED → CLOSED
 
 **DEGRADED exit conditions:**
 
-- **Back to ACTIVE:** The conditions that triggered DEGRADED entry clear. Latency returns to expected levels, capabilities are restored (via CAPABILITY_UPDATE), or the counterparty reports `app_status: ACTIVE` in HEARTBEAT. No SESSION_RESUME is required — the session was never declared dead or suspected. The transition back to ACTIVE is automatic when detection signals clear.
-- **Forward to REVOKED:** Adversarial behavior is detected while the session is in DEGRADED state (§8.16 detection signals). The same revocation semantics apply as for ACTIVE → REVOKED (§8.15). DEGRADED does not shield against adversarial detection.
+- **Back to ACTIVE:** The conditions that triggered DEGRADED entry clear. Latency returns to expected levels, capabilities are restored (via CAPABILITY_UPDATE), or the counterparty reports `app_status: ACTIVE` in HEARTBEAT. Recovery MUST include fresh attestation — the degraded agent MUST re-attest its capability manifest (§5.9) before the delegating agent or external verifier transitions the session back to ACTIVE. Stale attestation from pre-DEGRADED state is insufficient. No SESSION_RESUME is required — the session was never declared dead or suspected.
+- **Forward to REVOKED:** Adversarial behavior is detected while the session is in DEGRADED state (§8.16 detection signals), or degradation reaches a critical threshold and cannot be remediated — sustained detection signals across multiple sliding windows without recovery, at the delegating agent's discretion. The same revocation semantics apply as for ACTIVE → REVOKED (§8.15). DEGRADED does not shield against adversarial detection.
 - **Forward to CLOSED:** The coordinator initiates orderly termination via SESSION_CLOSE, or session TTL expires. Standard closure semantics apply.
 
 **Why DEGRADED is distinct from SUSPECTED:**
@@ -864,14 +891,17 @@ REVOKED → CLOSED
 | **Failure class** | Liveness ambiguity — is the agent alive? | Capability reduction — the agent is alive but impaired |
 | **Task delegation** | MUST NOT delegate new tasks | MAY delegate with reduced expectations |
 | **Heartbeat status** | Heartbeats absent or delayed | Heartbeats present and timely |
-| **Recovery** | Automatic on heartbeat receipt | Automatic when degradation signals clear |
-| **Terminal path** | → EXPIRED (timeout) | → REVOKED (adversarial) or → CLOSED (orderly) |
+| **Recovery** | Automatic on heartbeat receipt | Requires fresh attestation after degradation signals clear |
+| **Terminal path** | → EXPIRED (timeout) | → REVOKED (adversarial or critical threshold) or → CLOSED (orderly) |
+| **Declaration authority** | Local and independent (each side evaluates) | External verifier or delegating agent; self-declaration advisory only |
 
 **Why DEGRADED is distinct from REVOKED:**
 
-REVOKED is an adversarial determination — the counterparty is coherent but hostile. DEGRADED is a capacity determination — the counterparty is cooperative but impaired. The distinction matters because DEGRADED has a recovery path (back to ACTIVE) while REVOKED is terminal with no resume. Conflating degradation with adversarial behavior would force session termination for agents that are experiencing transient resource pressure — a disproportionate response.
+REVOKED is an adversarial determination — the counterparty is coherent but hostile. DEGRADED is a capacity determination — the counterparty is cooperative but impaired. The distinction matters because DEGRADED has a recovery path (back to ACTIVE with fresh attestation) while REVOKED is terminal with no resume. Conflating degradation with adversarial behavior would force session termination for agents that are experiencing transient resource pressure — a disproportionate response. Systems drift before they collapse — detection requires a baseline, and baseline erosion is the fundamental problem DEGRADED addresses.
 
-**Backward compatibility:** DEGRADED detection via `app_status` self-report requires `heartbeat_params.application_liveness = true` (§4.3.1). Sessions that do not negotiate application liveness can still enter DEGRADED via latency monitoring or partial capability loss detection — these are observable without heartbeat extensions. DEGRADED is an opt-in state for sessions that want explicit degradation tracking; sessions without degradation monitoring continue using the existing ACTIVE → CLOSED path for sessions that become unproductive.
+**Backward compatibility:** DEGRADED detection via `app_status` self-report requires `heartbeat_params.application_liveness = true` (§4.3.1). Sessions that do not negotiate application liveness can still enter DEGRADED via latency monitoring, partial capability loss detection, or Tier 2 protocol-level signals — these are observable without heartbeat extensions. DEGRADED is an opt-in state for sessions that want explicit degradation tracking; sessions without degradation monitoring continue using the existing ACTIVE → CLOSED path for sessions that become unproductive.
+
+> DEGRADED state detection signals, declaration authority, and protocol behavior formalized from [issue #102](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/102). Source: @bu-oracle (systems drift before they collapse; detection requires baseline; baseline erosion problem), @VcityAI (yellow card state between ACTIVE and REVOKED; gradual degradation more common than outright failure in distributed compute; DePIN network equivalence). Closes #102.
 
 #### 4.2.3 DRIFTED State — Behavioral Constraint Divergence
 
@@ -1157,6 +1187,7 @@ KEEPALIVE is a protocol-layer heartbeat. It is negotiated at session start — t
 | monotonic_counter | integer | Yes | Sender's current sequence number. Gaps indicate missed messages. |
 | lease_epoch | integer | No | Current lease epoch (see §4.5.2). |
 | timestamp | ISO 8601 | Yes | When the KEEPALIVE was sent. |
+| trust_state | enum | No | Sender's current trust state: `ACTIVE`, `DEGRADED`, or `DRIFTED`. MUST be included when the sender is in DEGRADED state (§4.2.2). Omission is equivalent to `ACTIVE`. Enables the counterparty and external verifiers to track trust state transitions via the KEEPALIVE stream without requiring a separate signaling channel. |
 
 **KEEPALIVE is optional.** If neither agent includes `keepalive` in SESSION_INIT / SESSION_INIT_ACK, no protocol-level keepalive is active. Session liveness in this case depends on deployment-specific mechanisms (transport-layer heartbeats, external monitoring, task-level timeouts). The protocol does not mandate KEEPALIVE, but implementations that support session suspension or compaction recovery SHOULD enable it — without heartbeat, teardown and resume decisions are intractable.
 
