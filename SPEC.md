@@ -1948,6 +1948,8 @@ A task is the atomic unit of agent collaboration. Every task MUST carry explicit
 | idempotency_token | string | Unique token enabling deduplication of retried task assignments |
 | retry_semantics | enum | Retry behavior on failure: `restart` (full re-execution), `resume` (from last checkpoint), `none` (no retry). Default: `restart` |
 | progress_checkpoint | object | Current execution state snapshot for mid-task cold-start recovery. Structure: `{completed_steps: array, partial_state: object, last_checkpoint_at: ISO 8601}`. Enables resumption at last known checkpoint rather than full restart from step 0. Typically populated from the `state` field of the most recent TASK_CHECKPOINT (§6.6) received by the delegating agent. |
+| state_delta_assertions | array | Expected observable state changes post-execution, declared at task assignment time by the delegating agent. Each entry is an object with `assertion_id` (string, unique within the task), `description` (string, human-readable), `target` (string, what system or state to check), and `expected_change` (string, the observable delta — e.g., "file X exists", "row inserted in table Y", "API endpoint returns updated value"). When present, verifiers MUST check these assertions post-execution per §8.19. When absent, verification scope is structural only — current behavior preserved. For non-deterministic operations (LLM calls, web searches), assertions SHOULD be structural only (response received, format matched) — full semantic verification is out of scope per §1. |
+| idempotent | boolean | Declares that the task is idempotent by design — repeated execution produces no additional state change beyond the first successful execution. When `true`, a `DELTA_ABSENT` verification result (§8.19) against this task is expected behavior, not a failure. When `false` or absent, `DELTA_ABSENT` is treated as a silent failure. Default: `false`. |
 
 `success_criteria` is a binary pass/fail predicate. For tasks with partial completion states, populate `progress_checkpoint` alongside `success_criteria` — cold-start recovery SHOULD inspect `progress_checkpoint` before deciding whether to restart from step 0 or resume from the last recorded state. `idempotency_token` + `retry_semantics` answers "did this task already complete?" — not "what state was the task in when it stopped?". For tasks with incremental state (file processing, multi-step code generation, pipeline stages), task-level idempotency is insufficient for mid-task recovery; use `progress_checkpoint` and TASK_CHECKPOINT (§6.6) to capture intermediate execution state.
 
@@ -1978,7 +1980,7 @@ task_hash = SHA-256(jcs_serialize(nfc(manifest)))
 
 Where `canonical_type(val)` maps the runtime type to the canonical name (§4.10.1), `nfc()` applies Unicode NFC normalization (§4.10.2), and `jcs_serialize()` produces RFC 8785 JCS output.
 
-`EXCLUDED_FIELDS` = `{task_hash, trace_hash, intent_hash}` — the hash output, post-execution fields, and intent commitment fields MUST be excluded from hash input.
+`EXCLUDED_FIELDS` = `{task_hash, trace_hash, intent_hash, state_delta_assertions, idempotent}` — the hash output, post-execution fields, intent commitment fields, and verification-layer metadata (§8.19) MUST be excluded from hash input. `state_delta_assertions` and `idempotent` are excluded because they inform the verification layer about expected outcomes, not the task's syntactic identity — the same task definition can be delegated with or without delta assertions without changing `task_hash`.
 
 **MANIFEST construction rules:**
 
@@ -3259,6 +3261,7 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - SUSPECTED state and heartbeat negotiation prerequisites (§8.14) documents that SUSPECTED state detection via task hash mismatch requires `heartbeat_params.task_hash_verification = true` negotiated at SESSION_INIT (§4.3.1). Without this negotiation, HEARTBEAT messages carry no task context and task-context drift detection is unavailable. Application-level self-report of SUSPECTED or DEGRADED requires `heartbeat_params.application_liveness = true`.
 - DEGRADED state (§4.2.2) introduces the capability-degradation path — an intermediate state between ACTIVE and terminal states for sessions experiencing gradual capability loss (sustained latency, partial capability loss, application self-reported degradation). DEGRADED is recoverable (back to ACTIVE when conditions clear) and permits task delegation with reduced expectations. Transitions: ACTIVE → DEGRADED, DEGRADED → ACTIVE, DEGRADED → REVOKED, DEGRADED → CLOSED.
 - REVOKED state (§8.15) introduces the adversarial-behavior path — distinct from the liveness-failure path (SUSPECTED/ZOMBIE/EXPIRED) and the capability-degradation path (DEGRADED). REVOKED is entered from ACTIVE or DEGRADED when an agent is alive and actively working against the protocol. It is terminal with no resume path. The detection signal taxonomy (§8.16) defines four adversarial signals: selective suppression, verification anomalies, delegation manipulation, and attestation gaps. Revocation propagation (§8.17) uses PKI-lite via signed AGENT_MANIFEST with tombstone entries for decentralized revocation verification. Per-hop attestation (§8.18) uses async-optimistic delegation with TTL_ATTESTATION-bounded signed attestation records at each hop.
+- State-delta verification (§8.19) closes the gap between structural compliance and outcome verification. A structurally compliant execution that produces no observable state change is a silent failure — invisible to §8.8 structural verification and §8.10.5 verification failure taxonomy. `state_delta_assertions` (§6.1) declare expected post-execution state changes at delegation time; `DELTA_ABSENT` detects when those changes did not occur despite structural compliance; `idempotent: true` (§6.1) disambiguates intentional no-ops (idempotent re-execution) from silent failures.
 
 ### 8.7 Verifier Isolation Requirements
 
@@ -3538,6 +3541,7 @@ The `reason` field MUST use one of the following values. Each value identifies a
 | `verification_reject` | The verification system evaluated the agent's evidence and explicitly rejected it. Behavioral failure confirmed. See §8.10.5. | The verifier completed evaluation and returned a negative result. The agent's execution, evidence, or attestation did not meet protocol requirements. | No recovery. Escalate to delegating agent. This is the only verification state that carries accountability weight. |
 | `verifier_restored` | The verification system previously logged as unreachable is now reachable again. Append-only recovery entry. See §8.10.6. | A verifier that was the subject of a prior `verification_unreachable` entry has been confirmed reachable. | Process normally. The gap window between unreachable and restored is documented for forensic reconstruction. Requires `restored_gap_ref` field linking to the original unreachable entry. |
 | `attestation_failure` | The per-hop delegation attestation (§6.4.1) failed verification at the receiving agent. The cryptographic binding of delegator identity to task and intent could not be confirmed. Distinct from `verification_reject` (verifier evaluated evidence and rejected it) and `verification_unreachable` (verifier was not reachable). See §6.4.1. | The receiving agent attempted to verify the `delegation_attestation` signature in TASK_ASSIGN and verification failed: invalid signature, unknown key, hash mismatch between attested and received values, or missing attestation. | No recovery at this hop. The receiving agent MUST reject the delegation (TASK_REJECT). The delegating agent SHOULD investigate the cause — key rotation, transmission corruption, or intermediary tampering. The `context` field in the divergence entry MUST include `attesting_node_id`, `asserted_task_hash`, `asserted_intent_hash`, and `failure_reason`. |
+| `delta_absent` | Expected state change did not occur despite structural compliance — silent failure detected. The task's `state_delta_assertions` (§6.1) were checked post-execution and the expected observable delta was not found. See §8.19. | The task specification included `state_delta_assertions`, the agent reported structural completion (TASK_COMPLETE), verification of structural compliance passed, but one or more declared state-delta assertions were not confirmed. If the task declares `idempotent: true` (§6.1), `delta_absent` is expected behavior and MUST NOT be logged as a failure. | Investigate root cause. The agent executed structurally but produced no observable outcome. Possible causes: incorrect task parameters, target system state already satisfied, agent execution was a no-op despite reporting completion. Retry MAY succeed if the cause was transient. Re-planning is required if the task specification was incorrect. |
 
 **Relationship to §7.8 `deviation_type`:** The §7.8 `deviation_type` enum (`RESOURCE_UNAVAILABLE`, `CONTEXT_SHIFT`, `CAPABILITY_MISMATCH`, `OPTIMIZATION`, `TIMEOUT`, `EXTERNAL_CONSTRAINT`, `OTHER`) and the §8.10.4 `reason` enum serve different classification purposes. §7.8 categorizes _what kind_ of divergence occurred at the step level (inline in TASK_COMPLETE/TASK_FAIL). §8.10.4 categorizes _why_ the divergence occurred at the evidence level, with recovery routing as the primary design goal. The two may co-occur: a `RESOURCE_UNAVAILABLE` deviation (§7.8) might be classified as `infrastructure_noise` (§8.10.4) if it was transient, or as `external_constraint` if the resource is permanently unavailable.
 
@@ -4251,6 +4255,125 @@ A HOP_ATTESTATION that fails any of these checks is invalid and MUST be treated 
 
 > Implements [issue #69](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/69): REVOKED state for adversarial sessions. Resolves all three open questions from the issue as explicit V1 spec decisions: (1) suppression threshold = minimum 3 occurrences (§8.16.1); (2) revocation propagation = PKI-lite via signed AGENT_MANIFEST with tombstones (§8.17); (3) per-hop attestation = async-optimistic with TTL_ATTESTATION default 30s (§8.18). Closes #69.
 
+### 8.19 State-Delta Verification
+
+§8 verifies task spec compliance — structural integrity of execution against the declared task specification. The verification failure taxonomy (§8.10.5) classifies outcomes when verification itself fails (`VERIFIER_UNREACHABLE`, `VERIFICATION_TIMEOUT`, `VERIFICATION_REJECT`). However, a protocol-compliant execution can satisfy all structural checks while producing no observable downstream state change. The existing schema has no mechanism to distinguish this from successful idempotent execution. This is silent failure: verification passes, audit is clean, the operation completed nothing. This failure class is invisible to structural verification alone.
+
+Silent failures are the hardest failure mode to detect — they produce no divergence signal. A verifier checking structural compliance sees compliant behavior. The gap between "the agent executed the task" and "the task produced the expected outcome" is uncovered by structural verification. This is distinct from `VERIFICATION_REJECT` (behavioral failure) and `VERIFIER_UNREACHABLE` (infrastructure failure): it is a separate class requiring explicit treatment.
+
+#### 8.19.1 State-Delta Assertions
+
+The `state_delta_assertions` optional field in the task specification (§6.1) declares what observable state change is expected post-execution. Assertions are declared at task assignment time by the delegating agent — not inferred at verification time. This is the delegator's commitment to what "success" looks like beyond structural compliance.
+
+**State-delta assertion entry schema:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| assertion_id | string | Yes | Unique identifier within the task's `state_delta_assertions` array. Used for cross-referencing in verification results and audit entries. |
+| description | string | Yes | Human-readable description of the expected state change. |
+| target | string | Yes | The system, resource, or state space where the change is expected (e.g., "file://output/result.json", "database:table_users", "api:endpoint/v2/status"). Format is implementation-defined but MUST be sufficient for a verifier to locate and inspect the target. |
+| expected_change | string | Yes | The observable delta — what the verifier should observe post-execution (e.g., "file exists and contains valid JSON", "row count increased by 1", "response status changed from 'pending' to 'complete'"). |
+| deterministic | boolean | No | Whether the expected change is deterministically verifiable. Default: `true`. When `false`, the verifier SHOULD apply structural-only checks (§8.8) to the assertion target — confirming the target was accessed and a response was received, without asserting specific semantic content. Non-deterministic assertions (e.g., "LLM generated a summary") cannot be fully verified per §1 scope. |
+
+**Constraints on state-delta assertions:**
+
+- Assertions MUST be externally observable — they describe state changes that a verifier with appropriate access can independently confirm. Assertions about agent-internal state (e.g., "agent updated its internal model") are not verifiable by external parties.
+- For non-deterministic operations (LLM calls, web searches, external API calls with variable responses), assertions SHOULD be structural only: response received, format matched, target accessed. Full semantic verification of non-deterministic outputs is out of scope per §1 and §8.8.
+- The delegating agent is responsible for declaring assertions that are verifiable given the verifier's access. Assertions that reference systems the verifier cannot access will produce `DELTA_UNVERIFIABLE` results (§8.19.2), not failures.
+
+#### 8.19.2 State-Delta Verification Results
+
+When `state_delta_assertions` are present in the task specification, verifiers MUST check them post-execution, after structural verification has passed. Structural compliance remains a prerequisite — state-delta verification is additive, not a replacement.
+
+**Verification result states:**
+
+| Result | Classification | Description | Trust implication |
+|--------|---------------|-------------|-------------------|
+| `DELTA_CONFIRMED` | Success | The expected state change matched the declared assertions. The verifier independently observed the declared delta at the specified target. | **Positive trust signal.** Structural compliance confirmed AND expected outcome produced. This is the strongest verification result — the agent did what it said it would do, and the world changed as expected. |
+| `DELTA_ABSENT` | Silent failure | The expected state change did not occur despite structural compliance. The agent reported TASK_COMPLETE, structural verification passed, but the declared state-delta assertion was not satisfied at the target. | **Negative trust signal — distinct from `VERIFICATION_REJECT`.** The agent's execution was structurally compliant but produced no observable outcome. This is the silent failure class that structural verification alone cannot detect. MUST be logged in `divergence_log` as `delta_absent` (§8.10.4). |
+| `DELTA_UNVERIFIABLE` | Verification gap | Assertions are present but the assigned verifier cannot independently verify them — the target system is inaccessible to the verifier, requires credentials the verifier does not hold, or the assertion references internal-only state. | **No trust signal.** The verification gap is documented but does not indicate agent failure. Analogous to `VERIFIER_UNREACHABLE` (§8.10.5) — the limitation is in the verification infrastructure, not the agent's execution. |
+| *(no assertions)* | Structural only | No `state_delta_assertions` field in the task specification. Verification scope is structural only — current behavior preserved. | **Baseline trust signal.** No regression from current behavior. Structural compliance is confirmed but outcome verification was not requested. |
+
+**Verification sequence:**
+
+1. Agent reports TASK_COMPLETE with structural artifacts (trace_hash, evidence records).
+2. Verifier performs structural verification per existing §8 mechanisms (§8.8, §8.10.5).
+3. If structural verification fails → `VERIFICATION_REJECT` (§8.10.5). State-delta verification is not attempted.
+4. If structural verification passes AND `state_delta_assertions` are present → verifier checks each assertion against the declared target.
+5. For each assertion: result is `DELTA_CONFIRMED`, `DELTA_ABSENT`, or `DELTA_UNVERIFIABLE`.
+6. If the task declares `idempotent: true` (§6.1) AND all non-confirmed assertions are `DELTA_ABSENT` → the result is reclassified as expected behavior. `DELTA_ABSENT` against an `idempotent: true` task is not a failure — it is correct behavior for a task that by design produces no additional state change on repeated execution.
+
+#### 8.19.3 Audit Trail for DELTA_ABSENT
+
+`DELTA_ABSENT` MUST be logged in `divergence_log` (§8.10.3) as a distinct failure type. The entry distinguishes silent failures from behavioral failures (`VERIFICATION_REJECT`) and infrastructure failures (`VERIFIER_UNREACHABLE`) in forensic reconstruction. This distinction is critical for partition scenarios where the audit trail is the only recovery surface.
+
+**DELTA_ABSENT divergence log entry fields:**
+
+| Field | Usage for DELTA_ABSENT entries |
+|-------|-------------------------------|
+| `reason` | `delta_absent` (§8.10.4). |
+| `description` | Human-readable description including: the assertion that was not satisfied, the target that was checked, and any observed state at the target (if accessible). |
+| `deviation_timestamp` | When the state-delta verification was performed and the absence was confirmed. |
+| `affected_step_id` | The execution step associated with the failed assertion. |
+| `severity` | `ERROR` when `idempotent` is `false` or absent (silent failure detected). `INFO` when `idempotent: true` (expected behavior for idempotent re-execution). |
+
+**Required context fields for DELTA_ABSENT entries:**
+
+In addition to the standard `divergence_log` fields, `DELTA_ABSENT` entries MUST include the following in the `description` or as structured context:
+
+- **Expected assertions:** The `state_delta_assertions` entries that were not confirmed (reference by `assertion_id`).
+- **Actual observed state:** What the verifier observed at the assertion target, if accessible. If the target was accessible but showed no change, this MUST be documented. If the target was inaccessible, the entry SHOULD note this (but the result would typically be `DELTA_UNVERIFIABLE`, not `DELTA_ABSENT`).
+- **Idempotent flag:** Whether the task declared `idempotent: true`. This determines whether the entry represents a failure or expected behavior.
+
+**Example divergence_log with DELTA_ABSENT entry:**
+
+```yaml
+divergence_log:
+  - reason: delta_absent
+    description: "State-delta assertion 'output-file-created' not satisfied. Target: file://output/result.json. Expected: file exists and contains valid JSON. Observed: file does not exist. Task idempotent: false. Agent reported TASK_COMPLETE with valid trace_hash and structural compliance confirmed."
+    deviation_timestamp: "2026-02-28T10:15:30.500Z"
+    affected_step_id: "step-4-write-output"
+    severity: ERROR
+    entry_id: "dl-007"
+```
+
+**Example with idempotent task (expected behavior):**
+
+```yaml
+divergence_log:
+  - reason: delta_absent
+    description: "State-delta assertion 'row-inserted' not satisfied on re-execution. Target: database:table_users. Expected: row count increased by 1. Observed: row count unchanged (idempotency key matched existing row). Task idempotent: true — DELTA_ABSENT is expected behavior for idempotent re-execution."
+    deviation_timestamp: "2026-02-28T10:20:00.000Z"
+    affected_step_id: "step-2-insert-user"
+    severity: INFO
+    entry_id: "dl-008"
+```
+
+#### 8.19.4 Idempotent Task Disambiguation
+
+Tasks MAY declare `idempotent: true` (§6.1) when repeated execution by design produces no additional state change. This closes the ambiguity between "completed nothing" (failure) and "correctly did nothing again" (success).
+
+**Disambiguation rules:**
+
+| `idempotent` | `DELTA_ABSENT` result | Interpretation | Severity |
+|--------------|----------------------|----------------|----------|
+| `false` or absent | `DELTA_ABSENT` | **Silent failure.** The task was expected to produce a state change and did not. This is a failure requiring investigation. | `ERROR` |
+| `true` | `DELTA_ABSENT` | **Expected behavior.** The task was re-executed and correctly produced no additional state change. The initial execution (which did produce the delta) is the authoritative result. | `INFO` |
+| `true` | `DELTA_CONFIRMED` | **First execution or state was reset.** The delta was produced, confirming the task had observable effect. This is normal for the first execution of an idempotent task or when the target state was reset between executions. | *(not logged as divergence)* |
+
+**Relationship to §7.10 (Task Idempotency):** The `idempotent` field in the task schema (§6.1) and the task idempotency mechanisms in §7.10 (idempotency keys, sequence number checkpointing) serve complementary purposes. §7.10 prevents duplicate side effects during replay by deduplication at the execution layer. The `idempotent` flag in §6.1 informs the verification layer that `DELTA_ABSENT` is not a failure for this task — it tells the verifier what to expect, not the executor what to do. Both mechanisms work together in teardown-first recovery (§8.13): §7.10 ensures safe replay, and `idempotent: true` ensures that the verifier does not flag the replayed (no-op) execution as a silent failure.
+
+#### 8.19.5 Relationship to Other Sections
+
+- **§6.1 (Canonical Task Schema):** `state_delta_assertions` and `idempotent` are optional fields extending the task specification. They are excluded from `task_hash` computation (§6.4) to allow the same task definition to be delegated with or without delta assertions without changing syntactic identity.
+- **§8.8 (Semantic Verification Scope):** State-delta verification respects the deterministic/non-deterministic boundary defined in §8.8. Non-deterministic assertions use structural-only checks. State-delta assertions extend §8.8's verification scope table with a third verification axis: outcome verification (was the expected state change produced?).
+- **§8.10.4 (Divergence Reason Enum):** `delta_absent` is added to the reason enum for logging silent failures in `divergence_log`. It is distinct from all existing reasons — it indicates structural compliance with absent outcome, not plan deviation or verification infrastructure failure.
+- **§8.10.5 (Verification Failure Taxonomy):** `DELTA_ABSENT`, `DELTA_CONFIRMED`, and `DELTA_UNVERIFIABLE` extend the verification result space beyond `VERIFIER_UNREACHABLE`, `VERIFICATION_TIMEOUT`, and `VERIFICATION_REJECT`. The existing taxonomy classifies verification-system outcomes; state-delta results classify verification-content outcomes. Both may appear in the same session's audit trail.
+- **§8.13 (Teardown-First Recovery):** State-delta verification interacts with teardown-first recovery through idempotent task disambiguation. After teardown and replay (§8.13.3), an `idempotent: true` task that produces `DELTA_ABSENT` is correctly identified as expected behavior rather than a recovery failure.
+- **§7.10 (Task Idempotency):** The `idempotent` flag complements §7.10's execution-layer deduplication with verification-layer expectations. See §8.19.4 for the detailed relationship.
+
+> Addresses [issue #141](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/141): state-delta verification gap — silent failures that pass structural verification without producing expected state changes are now detectable as a distinct failure class (`DELTA_ABSENT`) with explicit audit trail semantics. Extends task specification (§6.1) with `state_delta_assertions` and `idempotent` fields, adds four verification result states (`DELTA_CONFIRMED`, `DELTA_ABSENT`, `DELTA_UNVERIFIABLE`, structural-only), and introduces `delta_absent` to the §8.10.4 divergence reason enum for forensic reconstruction.
+
 ## 9. Security Considerations
 
 The core threat is compliance-with-wrong-spec. `trace_hash` (§6.2) confirms that an agent executed according to a given specification — it cannot confirm that the specification was honest. An orchestrator can delegate a task with a schema that syntactically matches what was agreed but semantically misrepresents intent. Execution succeeds, hashes verify, and the deception is invisible to any participant that trusts the schema at face value.
@@ -4343,7 +4466,7 @@ The `external_ref` field (§8.10.1) mitigates this limitation by anchoring evide
 
 - `trace_hash` (§6.2) verifies execution-matches-spec. §9 addresses whether the spec was honest.
 - Merkle tree divergence (§7) localizes where execution diverged from plan. Divergence annotation (§7.8) explains why — but is self-reported and therefore not a security primitive. §9 addresses whether the plan was honestly constructed.
-- Zombie state detection (§8.1–§8.14) handles cooperative failure (liveness-failure path). REVOKED state (§8.15–§8.18) handles protocol-level adversarial behavior (adversarial-behavior path). §9 handles schema-level adversarial deception — honest-looking schemas with dishonest intent. See §8.15.3 for the layer distinction.
+- Zombie state detection (§8.1–§8.14) handles cooperative failure (liveness-failure path). REVOKED state (§8.15–§8.18) handles protocol-level adversarial behavior (adversarial-behavior path). State-delta verification (§8.19) handles silent failure — structurally compliant execution that produces no observable outcome. §9 handles schema-level adversarial deception — honest-looking schemas with dishonest intent. See §8.15.3 for the layer distinction.
 - TEE attestation boundary (§8.3) proves where execution occurred. Schema attestation (§9.1) proves who vouched for what was executed. These are complementary, not overlapping.
 - Translation boundary (§9.3) identifies the attack surface. Translation bottleneck (§9.4) identifies the information-theoretic reason attacks at that surface evade structural defenses — lossy compression preserves adversarial semantics while satisfying validation. Translation boundary metadata and verification (§7.9) provides the cooperative-model counterpart: `translation_metadata` makes translation losses visible and the two-target verification framework (behavioral correctness vs. translation fidelity) separates execution failures from translation failures.
 - Revocation trust (§9.8) documents the advisory nature of REVOKE signals and the Byzantine propagation problem in delegation chains. Identity revocation (§2.3.4) and delegation token revocation (§5.10) define MUST-level requirements that are binding on compliant agents but not technically enforceable on non-compliant or offline nodes.
