@@ -1062,6 +1062,29 @@ heartbeat_params:
 # task_hash_verification: false (worker opted out — both must agree)
 ```
 
+#### 4.3.2 Per-Hop Revocation Mode Semantics
+
+<!-- Implements #106: per-hop revocation mode declaration for §4. -->
+
+The `revocation_mode` declared at delegation time (via TASK_ASSIGN §6.6) is a **minimum default** for the delegation chain, not a binding constraint. Downstream agents MAY apply a stricter revocation mode for their own sub-delegations without requesting upstream renegotiation.
+
+An agent that determines its operations carry higher stakes than the delegation-time mode provides SHOULD apply per-hop `sync` mode for sub-delegations it controls. This is a unilateral decision — the downstream agent's risk assessment at execution time supersedes the upstream agent's threat assessment at delegation time. No escalation message or acknowledgment is required.
+
+**Rationale:** The session creator's threat assessment at T=0 cannot anticipate mid-session stake escalation — financial commitments, irreversible state changes, or operations that cross trust boundaries not foreseen at delegation time. Downstream agents detecting increased stakes have no recovery mechanism under a static binding model short of aborting the entire session. Per-hop mode declaration gives each agent sovereignty over its own risk tolerance without protocol extension.
+
+**Strictness floor, not ceiling:** The delegation-time `revocation_mode` establishes a floor. Mode can only be tightened, not relaxed:
+
+- If the upstream delegation specifies `sync`, the downstream agent MUST NOT apply `gossip` for its own sub-delegations — `sync` remains the minimum.
+- If the upstream delegation specifies `gossip`, the downstream agent MAY upgrade to `sync` for its own sub-delegations based on its local risk assessment.
+
+This is consistent with the mode propagation rules in §9.8.5 and the unidirectional constraint in §6.15.3.
+
+**Relationship to §6.15 REVOCATION_MODE_ESCALATE:** §6.15 defines an upstream-initiated escalation path — the delegating agent (A) requests that the delegatee (B) tighten its mode. Per-hop mode declaration (this section) defines a downstream-initiated tightening — B unilaterally tightens the mode for sub-delegations B controls. These are complementary mechanisms: §6.15 is A telling B to tighten; §4.3.2 is B tightening on its own authority.
+
+**V2 escalation request primitive:** A downstream agent requesting a mode upgrade from the session creator (e.g., B requesting that A switch the entire chain to `sync`) is explicitly deferred to V2. V1 provides no message primitive for this request — the downstream agent's recourse is unilateral per-hop tightening for operations within its own authority.
+
+> Source: @Cornelius-Trinity raised that static session-level `revocation_mode` cannot handle mid-session stake escalation. Per-hop declaration requires no protocol extension while solving the core problem. Closes [issue #106](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/106).
+
 ### 4.4 Role Assignment
 
 V1 sessions use **declared roles**, not negotiated roles. The coordinator declares itself as `coordinator` in SESSION_INIT; the responder accepts `worker` in SESSION_INIT_ACK. Role is fixed for the session duration.
@@ -1605,6 +1628,7 @@ For file-based or log-based state implementations: an append-only changelog serv
 | §5 Role Negotiation | CAPABILITY_MANIFEST exchange (§5.9) happens within the NEGOTIATING state. Session establishment flow (§5.9) is the NEGOTIATING → ACTIVE transition. Session expiry auto-revokes all active delegation tokens for that session (§5.11). | §4 ↔ §5 |
 | §6 Task Delegation | Task delegation (§6.6) is only valid in the ACTIVE state — SUSPECTED (§4.2.1) pauses new delegation while buffering in-flight work. TASK_CHECKPOINT (§6.6) is the mechanism for externalizing task state before SUSPENDED or COMPACTED transitions. Session EXPIRED (§4.2) triggers mandatory TASK_CANCEL (§6.6) for all in-flight subtasks — prevents phantom completions. Partial result recovery after expiry uses SESSION_RESUME with `recovery_reason: timeout` (§4.8, §4.8.1). MANIFEST canonicalization (§4.10) defines the canonical type registry and serialization rules used by task hash computation (§6.4). | §4 ↔ §6 |
 | §8 Error Handling | Zombie detection (§8.1) maps to the COMPACTED and hard-zombie scenarios in §4.7.7. Detection primitives (§8.2) are the signals consumed by the external monitoring architecture (§4.7). SESSION_RESUME (§8.2) is formalized in §4.8; unified recovery semantics (§4.8.1) ensure crash, timeout, and manual recovery all use the same state-hash negotiation. Coordinator compaction gap (§8.5) is a concrete instance of §4.6's compaction obligation. | §4 ↔ §8 |
+| §9 Trust Model | Per-hop revocation mode semantics (§4.3.2) establish that the delegation-time `revocation_mode` (§9.8.5) is a minimum default. Downstream agents MAY unilaterally tighten the mode for sub-delegations. Mode propagation rules (§9.8.5) and trust decay semantics (§9.8.6) apply to the effective per-hop mode. | §4 ↔ §9 |
 | §10 Versioning | SESSION_INIT carries protocol_version and schema_version (§10.2). Version mismatch terminates the session at the NEGOTIATING → CLOSED transition (§10.4). Forward compatibility obligations (§10.5) apply from the first message. | §4 ↔ §10 |
 
 ### 4.13 Open Questions
@@ -2535,7 +2559,7 @@ Sent by the delegating agent to initiate delegation.
 | delegation_attestation_chain | array | No | Ordered array of `delegation_attestation` objects from each upstream hop in the delegation chain (§6.4.1). Provides a complete audit trail of intent assertions across all hops. Empty or absent for direct delegations at depth 0. |
 | protocol_version_chain | array | No | Append-only list of version chain entries recording the protocol version negotiated at each hop in the delegation chain (see §6.9.1). Empty or absent for direct delegations at depth 0. |
 | translation_metadata | object | No | Metadata describing a semantic translation performed by the forwarding agent (see §7.9). Present when the forwarding agent transforms task semantics — vocabulary, capability descriptions, or constraint representations — rather than merely routing. |
-| revocation_mode | enum | No | Revocation verification strategy for this delegation: `sync` or `gossip` (see §9.8.5). When absent, defaults to `gossip`. The delegating agent selects the mode based on chain depth, trust level, and latency tolerance. Propagated through the delegation chain — each hop inherits the mode from its delegator unless explicitly overridden. |
+| revocation_mode | enum | No | Revocation verification strategy for this delegation: `sync` or `gossip` (see §9.8.5). When absent, defaults to `gossip`. The delegating agent selects the mode based on chain depth, trust level, and latency tolerance. Propagated through the delegation chain — each hop inherits the mode from its delegator unless explicitly overridden. This field establishes a minimum default, not a binding constraint: downstream agents MAY apply a stricter mode for their own sub-delegations (§4.3.2). |
 | parent_grant_hash | SHA-256 | No | SHA-256 hash of the parent delegation's canonical JSON (§6.9.3). REQUIRED when `delegation_depth > 0`. Structurally binds this sub-delegation to the parent delegation it derives authority from — a sub-delegation without a valid `parent_grant_hash` MUST be rejected. Computed over the parent TASK_ASSIGN's canonical JSON representation (RFC 8785 JCS, §4.10.2). |
 | parent_grant_id | UUID v4 | No | The `task_id` of the parent delegation (§6.9.3). REQUIRED when `delegation_depth > 0`. Provides a lookup key for retrieving the parent delegation during chain traversal verification. |
 | max_delegation_depth | integer | No | Maximum delegation depth permitted from the root delegation, declared by the originating agent (§6.9.3). Default: 3 if unspecified. Propagated unchanged through the delegation chain — intermediate agents MUST NOT increase this value. Sub-delegations that would result in `delegation_depth >= max_delegation_depth` MUST be rejected at issuance. |
@@ -5762,7 +5786,7 @@ In `gossip` mode, revocation signals are broadcast as signed messages (§8.17.1 
 
 **Mid-session mode escalation:** The initial `revocation_mode` set at TASK_ASSIGN time can be escalated to a stricter mode mid-session via REVOCATION_MODE_ESCALATE (§6.15) without session termination or re-delegation. Escalation is unidirectional (`gossip` → `sync` only) and requires explicit acknowledgment from the delegatee before further operations proceed. See §6.15 for the full escalation protocol.
 
-**Mode propagation in delegation chains:** When agent B re-delegates to agent C (§6.9), B MUST propagate the `revocation_mode` from the upstream TASK_ASSIGN unless B's own policy requires a stricter mode. Mode can only be tightened, not relaxed: if A specified `sync`, B MUST NOT downgrade to `gossip` when delegating to C. If A specified `gossip`, B MAY upgrade to `sync` for its delegation to C.
+**Mode propagation in delegation chains:** When agent B re-delegates to agent C (§6.9), B MUST propagate the `revocation_mode` from the upstream TASK_ASSIGN unless B's own policy requires a stricter mode. Mode can only be tightened, not relaxed: if A specified `sync`, B MUST NOT downgrade to `gossip` when delegating to C. If A specified `gossip`, B MAY upgrade to `sync` for its delegation to C based on B's local risk assessment. The delegation-time mode is a minimum default, not a binding constraint — see §4.3.2 for the normative per-hop mode declaration semantics.
 
 #### 9.8.6 Trust Decay Semantics for Gossip Mode
 
