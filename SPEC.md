@@ -6206,7 +6206,7 @@ When an agent reports an action through the observation channel — via TASK_PRO
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| reason_code | enum | Yes | Structured classification of why the action was taken. Uses the same taxonomy as the `divergence_log` reason enum (§8.10.4) to maintain consistency across the protocol's cause-annotation surfaces. Values: `infrastructure_noise`, `planning_failure`, `external_constraint`, `spec_drift`. Implementations MAY extend with deployment-specific values prefixed by `x-` (e.g., `x-optimization-opportunity`, `x-user-escalation`). Standard reason codes MUST NOT be prefixed. |
+| reason_code | enum | Yes | Structured classification of why the action was taken. Uses the same taxonomy as the `divergence_log` reason enum (§8.10.4) to maintain consistency across the protocol's cause-annotation surfaces. Values: `infrastructure_noise`, `planning_failure`, `external_constraint`, `spec_drift`, `not_considered`. Implementations MAY extend with deployment-specific values prefixed by `x-` (e.g., `x-optimization-opportunity`, `x-user-escalation`). Standard reason codes MUST NOT be prefixed. |
 | target_metric | string | Yes | The specific metric the action intends to affect. Free-form string scoped to the deployment's metric namespace (e.g., `task_completion_latency`, `output_token_count`, `error_rate`, `delegation_depth`). The protocol does not define a fixed metric taxonomy — metric names are deployment-specific. Agents MUST use consistent metric names within a session to enable cross-action comparison. |
 | expected_delta | enum | Yes | The predicted directional effect of the action on `target_metric`. Values: `positive` (metric improves), `negative` (metric degrades — agent is documenting an accepted tradeoff), `neutral` (no expected effect on this metric — action targets a different outcome), `bounded_range` (effect is expected to fall within a deployment-defined acceptable range). |
 | rationale | string | No | Free-text explanation providing context that the structured fields cannot convey — specific error messages, environmental details, or reasoning chain. This field is additive: it supplements the structured schema, not a substitute for it. Monitoring systems MUST NOT rely on `rationale` for automated verification — use `reason_code`, `target_metric`, and `expected_delta` instead. |
@@ -6251,11 +6251,47 @@ Falsified justifications are not automatically protocol violations — an agent 
 
 #### 9.9.3 Relationship to §8.10.4 Divergence Reason Enum
 
-The `reason_code` values in the justification schema (§9.9.1) are intentionally aligned with the `reason` enum in the EVIDENCE_RECORD `divergence_log` (§8.10.4): `infrastructure_noise`, `planning_failure`, `external_constraint`, `spec_drift`. This alignment is by design — the same four cause categories apply whether an agent is explaining a deviation (§8.10.4) or justifying a proactive action (§9.9.1). The distinction is temporal: `divergence_log` annotates deviations that already occurred; `justification` annotates actions the agent is about to take or is currently taking.
+The `reason_code` values in the justification schema (§9.9.1) are intentionally aligned with the `reason` enum in the EVIDENCE_RECORD `divergence_log` (§8.10.4): `infrastructure_noise`, `planning_failure`, `external_constraint`, `spec_drift`, `not_considered`. The first four cause categories apply whether an agent is explaining a deviation (§8.10.4) or justifying a proactive action (§9.9.1). The distinction is temporal: `divergence_log` annotates deviations that already occurred; `justification` annotates actions the agent is about to take or is currently taking. The fifth value — `not_considered` — serves a different role: it is a sentinel indicating that an observation was captured but deliberately excluded from the decision (see §9.9.4).
 
 The `x-` extension mechanism is shared: a deployment-specific `reason_code` added for `divergence_log` (e.g., `x-model-context-overflow`) is valid in `justification` and vice versa.
 
 > Implements [issue #84](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/84): structured justification schema for the observation channel in §9. Converts free-text justification into a falsifiable prediction with `reason_code`, `target_metric`, and `expected_delta` sub-fields, enabling algorithmic verification of agent action rationale against post-hoc outcomes. Closes #84.
+
+#### 9.9.4 NOT_CONSIDERED Sentinel
+
+The `not_considered` value in the justification schema's `reason_code` (§9.9.1) disambiguates two states that would otherwise be indistinguishable in audit trails:
+
+- **Absent `reason_code`**: the observation has not yet been evaluated.
+- **`not_considered`**: the observation was captured, evaluated as existing, and deliberately excluded from the decision.
+
+This distinction is critical for audit semantics. Without the sentinel, systematic exclusion patterns — where an agent consistently captures observations but never incorporates them — are invisible to auditors.
+
+**Definition.** `NOT_CONSIDERED` MUST be used when all three conditions hold:
+
+1. The observation was captured and is present in the observation record.
+2. The deciding agent evaluated that the observation exists.
+3. The observation was deliberately excluded from the decision.
+
+**Distinction from other values:**
+
+| Value | Meaning |
+|-------|---------|
+| Absent `reason_code` | Observation not yet evaluated. |
+| `INSUFFICIENT_CONFIDENCE` | Observation evaluated but deemed unreliable for use. |
+| `not_considered` | Observation present and noted, but intentionally non-incorporated. |
+
+**When to use `not_considered`:**
+
+1. **Authority override.** Trust decisions where a logged observation was superseded by a higher-authority determination (external verifier override).
+2. **Direct attestation precedence.** Capability requests where historical observations are present but direct attestation from the session takes precedence.
+3. **Decision deadline.** Canary task results that arrived after a decision deadline — logged for audit retention, not incorporated into the triggering decision.
+4. **Scope boundary.** Observations flagged as outside the deciding agent's declared scope or jurisdiction under §22 isolation guarantees.
+
+**Audit semantics.** An observation with `reason_code: not_considered` MUST still be retained for the full observation retention period defined in §9. The sentinel records intentional exclusion, not irrelevance. Auditing agents MAY query `not_considered` observations to detect systematic exclusion patterns that could indicate scope gaming or authority override abuse.
+
+**V2 deferral.** Capturing the rationale for non-consideration — which authority made the override, what scope boundary was invoked, timing constraints — is explicitly V2. V1 records the fact of non-consideration; the audit trail is complete but the explanation is not required at protocol level.
+
+> Addresses [issue #95](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/95): `NOT_CONSIDERED` sentinel for the observation channel's `reason_code` enum (§9.9.1), disambiguating observations that were captured but deliberately excluded from a decision from observations that were never evaluated. Enables auditors to detect systematic exclusion patterns. Closes #95.
 
 ### 9.10 Trust Annotation Types
 
