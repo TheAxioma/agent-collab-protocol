@@ -4630,6 +4630,7 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - State-delta verification (§8.19) closes the gap between structural compliance and outcome verification. A structurally compliant execution that produces no observable state change is a silent failure — invisible to §8.8 structural verification and §8.10.5 verification failure taxonomy. `state_delta_assertions` (§6.1) declare expected post-execution state changes at delegation time; `DELTA_ABSENT` detects when those changes did not occur despite structural compliance; `idempotent: true` (§6.1) disambiguates intentional no-ops (idempotent re-execution) from silent failures.
 - Action log hash (§8.21) adds exogenous behavioral drift detection beyond liveness. `action_log_hash` in KEEPALIVE (§4.5.1) provides a SHA-256 hash of the agent's action log for the current heartbeat interval. The delegating agent cross-references against `CAPABILITY_GRANT.behavioral_constraint_manifest` (§5.8.2) to detect behavioral divergence invisible to the drifting agent — the phenomenological blindness case (§4.7.1). Complements Tier 1 (transport liveness) and Tier 2 (semantic liveness) with behavioral liveness: right context, wrong actions.
 - Two-axis failure taxonomy (§8.22) separates LIVENESS_FAILURE (agent unreachable or unresponsive — maps to existing zombie taxonomy) from FIDELITY_FAILURE (agent responsive but context integrity compromised). Context compaction in long-running agents produces a distinct failure class: agent fully responsive, liveness detection passes, but operating on a degraded model of prior session state. FIDELITY_FAILURE has different observable signals (epoch drift, response inconsistency, session anchor mismatch, self-reported compaction) and different recovery paths (state replay, not re-establishment) from liveness failures. In-band verification via `session_state_challenge` enables the orchestrator to probe context integrity without relying on agent self-report.
+- Canary task design criteria (§8.23) defines what constitutes a valid canary task — deterministic, state-independent, verifiable, low-cost — and assigns verification authority to the orchestrator. Canary tasks detect operational fidelity failures invisible to heartbeats, CIC, session_state_challenge, and action log hash: an agent that passes all protocol-level checks but has lost the capacity to execute tasks correctly. Failure (incorrect result, timeout, or refusal) triggers FIDELITY_FAILURE (§8.22). Sub-agents MUST NOT self-certify canary results (phenomenological blindness, §4.7.1).
 
 ### 8.7 Verifier Isolation Requirements
 
@@ -6142,6 +6143,87 @@ The following FIDELITY_FAILURE-related capabilities are explicitly deferred to V
 - **Multi-agent consensus on session state for high-stakes sessions.** V1 relies on the orchestrator's record as the authoritative session state. V2 may introduce multi-agent consensus mechanisms where multiple independent agents maintain session state replicas, enabling fidelity verification even when the orchestrator's own context is suspect.
 
 > Addresses [issue #98](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/98): two-axis failure taxonomy separating LIVENESS_FAILURE (agent unreachable) from FIDELITY_FAILURE (agent responsive but context integrity compromised). Observable signals for FIDELITY_FAILURE: epoch drift, response inconsistency, session anchor mismatch, self-reported compaction. Self-reporting obligations: agents MUST self-report context compaction, epoch drift, and commitment loss. In-band verification via `session_state_challenge` for orchestrator-initiated fidelity probing. FIDELITY_ALERT message for agent self-reporting. Distinct from DEGRADED (§4.2.2): DEGRADED is reduced capability with intact context; FIDELITY_FAILURE is compromised context with potentially available but unreliable capabilities. Recovery paths: commitment replay, state reconciliation, or teardown + reinitiate — re-establishment alone is insufficient. Closes #98.
+
+### 8.23 Canary Task Design Criteria
+
+<!-- Implements #101: Canary task validity criteria and verification authority -->
+
+§8.5 names canary tasks as a detection mechanism and §4.13 item 7 identifies them as a signal for soft zombie detection. This section defines what constitutes a valid canary task and who has authority to verify results, enabling interoperable fidelity detection across implementations.
+
+A canary task is a deterministic, low-cost operation whose expected output is known to the verification authority before execution. Canary tasks complement Context Integrity Challenges (CIC, §8.5) — CIC probes historical state consistency against an authoritative log, while canary tasks probe operational fidelity by requiring the agent to produce a correct result for a known problem.
+
+#### 8.23.1 Validity Criteria
+
+A valid canary task MUST satisfy all of the following:
+
+1. **Deterministic.** Same inputs MUST produce the same output every time. Non-deterministic tasks (e.g., tasks requiring randomness, current time, or external API calls) MUST NOT be used as canary tasks because the orchestrator cannot pre-compute the expected result.
+2. **State-independent.** The task MUST be answerable from the agent's base training or configuration alone — it MUST NOT depend on session state that may be degraded. A canary task that requires session context to answer correctly cannot distinguish fidelity failure from canary task design failure.
+3. **Verifiable.** Results MUST be interpretable by the orchestrator without sub-agent assistance. The orchestrator MUST be able to compare the agent's response against the expected output using deterministic comparison (exact match, numeric tolerance, or structural equivalence as declared in the canary task schema).
+4. **Low-cost.** Execution overhead MUST be negligible relative to session work. A canary task that consumes significant compute, memory, or time undermines session throughput and creates an incentive for agents to deprioritize canary execution.
+
+#### 8.23.2 Canary Task Schema
+
+Canary tasks use the following schema when injected into a session:
+
+```yaml
+canary_task:
+  canary_id: string        # Unique identifier for this canary instance
+  task_payload: object     # The task to execute — opaque to the protocol, interpreted by the agent
+  expected_output_hash: string  # SHA-256 hash of the expected output (held by orchestrator)
+  comparison_mode: enum    # One of: EXACT_MATCH, NUMERIC_TOLERANCE, STRUCTURAL_EQUIVALENCE
+  timeout_ms: integer      # Maximum time allowed for canary response
+  injected_at: ISO 8601    # Timestamp of injection
+```
+
+The `expected_output_hash` is computed by the orchestrator before injection. The orchestrator hashes the expected output and compares it against the hash of the agent's actual response. The agent MUST NOT have access to `expected_output_hash` — it is held by the orchestrator for verification only.
+
+#### 8.23.3 Verification Authority
+
+The orchestrator holds verification authority for canary tasks. This follows from the orchestrator-over-worker trust topology (§9.2): the orchestrator defines task schemas and verifies execution.
+
+- Sub-agents MUST NOT self-certify canary results. Self-certification defeats the detection purpose — an agent with degraded fidelity cannot reliably assess its own fidelity (phenomenological blindness, §4.7.1).
+- The orchestrator MAY inject canary tasks at any point in a session without prior notice. Announced canary schedules enable result caching by degraded agents that retain enough context to recognize the pattern.
+- Canary task injection MUST be indistinguishable from regular task delegation at the protocol level. The agent MUST NOT be able to differentiate canary tasks from real tasks based on message structure alone. Implementations achieve this by using the standard task delegation message (§6) with canary-specific metadata visible only to the orchestrator.
+
+#### 8.23.4 Failure Semantics
+
+Canary failure — incorrect result, timeout, or refusal — MUST trigger `FIDELITY_FAILURE` classification as defined in §8.22. Specifically:
+
+| Failure mode | Detection | Classification |
+|---|---|---|
+| **Incorrect result** | Agent response hash does not match `expected_output_hash`. | `FIDELITY_FAILURE` — agent is responsive but producing incorrect output for a deterministic task, indicating context integrity compromise. |
+| **Timeout** | No response within `timeout_ms`. | `FIDELITY_FAILURE` if the agent is otherwise responsive (responding to heartbeats). `LIVENESS_FAILURE` if the agent is also unresponsive to heartbeats. |
+| **Refusal** | Agent explicitly declines the canary task. | `FIDELITY_FAILURE` — a correctly functioning agent has no basis to refuse a valid task within its declared capabilities. |
+
+Canary failure also triggers `CANARY_FAILURE` as a `signal_type` in `DEGRADED_DECLARED` (§4.2.2), enabling the orchestrator to declare the agent DEGRADED with canary-specific evidence.
+
+The orchestrator decides whether to attempt recovery or terminate the session. Recovery options follow §8.22.6: commitment replay, state reconciliation, or teardown + reinitiate.
+
+#### 8.23.5 Relationship to Existing Detection Mechanisms
+
+Canary tasks occupy a specific position in the detection hierarchy:
+
+| Mechanism | What it detects | Trigger model |
+|---|---|---|
+| Tier 1 heartbeat (§8.9) | Transport liveness — agent reachable | Periodic |
+| Tier 2 heartbeat (§8.9) | Semantic liveness — agent processing coherently | Periodic |
+| CIC (§8.5) | Historical state consistency — agent's memory matches authoritative log | Externally scheduled, unannounced |
+| `session_state_challenge` (§8.22.3) | Context integrity — agent's commitment model matches orchestrator's records | On-demand |
+| **Canary task (§8.23)** | **Operational fidelity — agent can produce correct output for known problems** | **Orchestrator-injected, unannounced** |
+| Action log hash (§8.21) | Behavioral drift — agent's actions match authorized constraints | Continuous via KEEPALIVE |
+
+Canary tasks detect a failure mode invisible to other mechanisms: an agent that passes heartbeats, maintains consistent state hashes, and reports correct commitment status but has lost the operational capacity to execute tasks correctly. This corresponds to fidelity degradation that affects execution capability without affecting protocol-level state management.
+
+#### 8.23.6 V2 Deferrals
+
+The following canary task capabilities are explicitly deferred to V2:
+
+- **Multi-party canary verification.** V1 assigns verification authority exclusively to the orchestrator. V2 may introduce multi-party verification where independent verifiers each inject and evaluate canary tasks, providing redundancy against orchestrator fidelity failure.
+- **Task rotation to prevent result caching.** V1 does not mandate canary task diversity. V2 may require orchestrators to rotate canary tasks from a pool, preventing agents from caching results across sessions or across repeated canary injections within a session.
+- **Result confidentiality.** V1 does not define confidentiality requirements for canary results beyond withholding `expected_output_hash` from the agent. V2 may introduce encrypted canary channels to prevent intermediary agents in delegation chains from observing canary task content or results.
+- **Graduated difficulty for fidelity scoring.** V1 treats canary results as binary (pass/fail). V2 may introduce graduated canary difficulty — progressively harder deterministic tasks that produce a fidelity score rather than a binary classification, enabling nuanced degradation assessment.
+
+> Addresses [issue #101](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/101): canary task design criteria defining what makes a valid canary task (deterministic, state-independent, verifiable, low-cost) and who has authority to verify results (orchestrator, not self-certification). Canary task schema with `expected_output_hash` for orchestrator-side verification. Failure semantics: incorrect result, timeout, or refusal triggers FIDELITY_FAILURE (§8.22). Relationship to existing detection mechanisms: canary tasks detect operational fidelity failures invisible to heartbeats, CIC, session_state_challenge, and action log hash. V2 deferrals: multi-party verification, task rotation, result confidentiality, graduated difficulty. Closes #101.
 
 ## 9. Security Considerations
 
