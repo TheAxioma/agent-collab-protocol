@@ -4087,6 +4087,7 @@ A revocation token is a signed record that explicitly terminates a grant regardl
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
+| revocation_id | UUID v4 | Yes | Unique identifier for this revocation token instance. Enables deduplication of revocation tokens across forwarding hops (§6.13.2) — a receiver that has already processed a revocation token with a given `revocation_id` MUST NOT reprocess it. Distinct from `grant_id`: a single grant may be referenced by exactly one revocation token, but the `revocation_id` identifies the revocation artifact itself for tracking, deduplication, and audit correlation. |
 | grant_id | UUID v4 | Yes | The `grant_id` (§5.8.2) of the CAPABILITY_GRANT being revoked. |
 | issuer_id | string | Yes | Identity of the revoking agent (§2 identity handle). MUST match the `grantor_id` of the original grant. |
 | revocation_reason | enum | Yes | Why the grant is being revoked. One of: `SECURITY_COMPROMISE` (the grant's security context has been compromised), `TRUST_LOSS` (the issuer no longer trusts the grantee for this delegation), `TASK_CANCELLED` (the associated task has been cancelled), `POLICY_VIOLATION` (the grantee violated a constraint of the grant), `ISSUER_REVOKED` (the issuer's own authority has been revoked, cascading to its grants). |
@@ -4094,7 +4095,7 @@ A revocation token is a signed record that explicitly terminates a grant regardl
 | effective_from | ISO 8601 | Yes | Timestamp at which the revocation takes effect — the logical point from which the capability is considered revoked. Millisecond precision REQUIRED. MUST be ≥ `revoked_at`. Operations completed in good faith before `effective_from` are not retroactively invalid; the revoking agent bears responsibility for the declared window between `revoked_at` and `effective_from`. When `effective_from` equals `revoked_at`, revocation is immediate. |
 | propagation_window_ms | integer | Yes | Maximum expected propagation delay in milliseconds — the issuer's declared upper bound on how long it takes the revocation to reach all downstream holders via best-effort gossip. Agents MUST NOT treat a peer's failure to honor a revocation as adversarial if the elapsed time since `revoked_at` is less than `propagation_window_ms`. After `revoked_at` + `propagation_window_ms`, any agent still exercising the revoked capability is in protocol violation. MUST be > 0 and ≤ 60000 (60 seconds), consistent with the `trust_decay_interval` default (§9.8.6). |
 | takes_effect_at | ISO 8601 | No | Timestamp when the revocation MUST be enforced by the receiving agent (§6.16). Millisecond precision REQUIRED when present. If absent, enforcement is immediate upon receipt — equivalent to `takes_effect_at` equal to the receiver's local time at token receipt. When present, MUST be ≥ `effective_from`. Separates propagation latency from enforcement deadline: the receiver learns about the revocation at receipt time but MUST NOT enforce it before `takes_effect_at`, allowing in-flight atomic operations to complete (§6.16.3). |
-| issuer_signature | bytes | Yes | Cryptographic signature over `grant_id || issuer_id || revocation_reason || revoked_at || effective_from || propagation_window_ms || takes_effect_at` (if present), produced by the issuer's private key (§2.2.1). The `||` operator denotes concatenation of the canonical byte representations. When `takes_effect_at` is absent, the signature covers `grant_id || issuer_id || revocation_reason || revoked_at || effective_from || propagation_window_ms` only. |
+| issuer_signature | bytes | Yes | Cryptographic signature over `revocation_id || grant_id || issuer_id || revocation_reason || revoked_at || effective_from || propagation_window_ms || takes_effect_at` (if present), produced by the issuer's private key (§2.2.1). The `||` operator denotes concatenation of the canonical byte representations. When `takes_effect_at` is absent, the signature covers `revocation_id || grant_id || issuer_id || revocation_reason || revoked_at || effective_from || propagation_window_ms` only. |
 
 **Revocation token validity:**
 
@@ -4105,6 +4106,7 @@ A revocation token is a signed record that explicitly terminates a grant regardl
 **Example revocation token:**
 
 ```yaml
+revocation_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 grant_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 issuer_id: "agent-alpha"
 revocation_reason: SECURITY_COMPROMISE
@@ -4145,14 +4147,17 @@ Explicit revocation and mid-session mode escalation introduce three audit event 
 
 | Audit event | Trigger | Logged data |
 |-------------|---------|-------------|
-| `EXPLICIT_REVOCATION` | A grant is rejected due to a valid revocation token | `grant_id`, `issuer_id`, `revocation_reason` (from the token), `revoked_at`, timestamp of rejection, identity of the rejecting agent |
-| `REVOCATION_TOKEN_INVALID` | A revocation token is received with an invalid `issuer_signature` | `grant_id`, claimed `issuer_id`, timestamp of receipt, identity of the receiving agent, reason for signature failure |
+| `EXPLICIT_REVOCATION` | A grant is rejected due to a valid revocation token | `revocation_id`, `grant_id`, `issuer_id`, `revocation_reason` (from the token), `revoked_at`, `propagated_at` (receiver's local receipt timestamp), timestamp of rejection, identity of the rejecting agent |
+| `REVOCATION_TOKEN_INVALID` | A revocation token is received with an invalid `issuer_signature` | `revocation_id` (if parseable), `grant_id`, claimed `issuer_id`, timestamp of receipt, identity of the receiving agent, reason for signature failure |
 | `REVOCATION_MODE_ESCALATED` | A revocation mode escalation is accepted mid-session (§6.15) | `session_id`, `prior_mode`, `new_mode`, `effective_from`, timestamp of escalation, identity of the escalating agent (A), identity of the acknowledging agent (B) |
-| `IN_FLIGHT_COMPLETED_DURING_GRACE` | An in-flight operation completed during the grace period between revocation receipt and `takes_effect_at` enforcement (§6.16.3) | `grant_id`, `task_id`, `operation_started_at`, `operation_completed_at`, `takes_effect_at`, identity of the executing agent |
+| `IN_FLIGHT_COMPLETED_DURING_GRACE` | An in-flight operation completed during the grace period between revocation receipt and `takes_effect_at` enforcement (§6.16.3) | `revocation_id`, `grant_id`, `task_id`, `operation_started_at`, `operation_completed_at`, `takes_effect_at`, identity of the executing agent |
+| `COMPENSATION_REQUIRED` | Irrevocable work was committed after `effective_from` and requires compensation (§6.16.6) | `revocation_id`, `grant_id`, `task_id`, `operation_id`, `committed_at`, `effective_from`, `compensation_status` (`pending`, `completed`, `failed`), identity of the executing agent |
 
 **`EXPLICIT_REVOCATION` is a distinct class from TTL expiry.** When a grant is rejected because `current_time > valid_until` (§5.8.2), the rejection reason is temporal expiry — the grant aged out. When a grant is rejected because a valid revocation token exists, the rejection reason is active revocation by the issuer. These are different failure modes with different causes, different attribution, and different recovery paths. The audit trail MUST distinguish them.
 
-**EVIDENCE_RECORD integration:** `EXPLICIT_REVOCATION` and `REVOCATION_TOKEN_INVALID` events SHOULD be recorded as EVIDENCE_RECORDs (§8.10.1) with `evidence_type: error_event`. The `payload_hash` SHOULD be computed over the revocation token contents (valid or invalid) to enable independent verification of the audit entry. `IN_FLIGHT_COMPLETED_DURING_GRACE` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: state_snapshot`, capturing the operation's authorization context and completion timestamp relative to the `takes_effect_at` deadline.
+**EVIDENCE_RECORD integration:** `EXPLICIT_REVOCATION` and `REVOCATION_TOKEN_INVALID` events SHOULD be recorded as EVIDENCE_RECORDs (§8.10.1) with `evidence_type: error_event`. The `payload_hash` SHOULD be computed over the revocation token contents (valid or invalid) to enable independent verification of the audit entry. `IN_FLIGHT_COMPLETED_DURING_GRACE` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: state_snapshot`, capturing the operation's authorization context and completion timestamp relative to the `takes_effect_at` deadline. `COMPENSATION_REQUIRED` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: error_event`, capturing the irrevocable operation's commit timestamp relative to `effective_from` and the compensation status lifecycle (`pending` → `completed` or `failed`).
+
+**Receiver-recorded `propagated_at` timestamp:** On receiving a valid revocation token, the receiving agent MUST record a `propagated_at` timestamp — the agent's local clock time at the moment of token receipt. `propagated_at` is NOT a field on the revocation token itself (it cannot be — the issuer does not know when the receiver will receive the token). It is receiver-local state that MUST be persisted alongside the cached revocation token. `propagated_at` enables: (a) measuring actual propagation latency (`propagated_at - revoked_at`) against the declared `propagation_window_ms`; (b) determining whether good faith protection applies (§6.13.6) — operations committed before `propagated_at` are candidates for good faith protection; (c) audit trail correlation — the `EXPLICIT_REVOCATION` audit event (above) includes `propagated_at` to record when the enforcing agent learned of the revocation.
 
 #### 6.13.5 Relationship to Existing Revocation Mechanisms
 
@@ -4441,6 +4446,12 @@ When a revocation token arrives while an operation is mid-execution, the receivi
 
 **Completion during grace period:** An operation that completes during the grace period (after revocation receipt, before `takes_effect_at`) MUST be recorded as an `IN_FLIGHT_COMPLETED_DURING_GRACE` audit event (§6.13.4). This provides the audit trail to distinguish operations that completed under valid authorization from operations that completed during the grace window — different trust levels for post-hoc review.
 
+**Formal enforcement obligation — `start_time` vs. `effective_from`:** Agents MUST refuse any operation whose `start_time` (the timestamp at which the operation begins execution) is ≥ `effective_from` on the revocation token. This is the hard enforcement boundary: an operation that has not yet started when the logical revocation time has passed MUST NOT be started, regardless of whether `takes_effect_at` has been reached. The grace period (above) protects only operations that were *already executing* before `effective_from` — it does not authorize new operations in the window between `effective_from` and `takes_effect_at`. Formally:
+
+- `start_time < effective_from`: operation was started under valid authorization. If still executing at `takes_effect_at`, the grace period applies (above).
+- `start_time ≥ effective_from`: operation MUST be rejected. The capability was logically revoked before the operation began. No grace period applies.
+- `start_time < effective_from` AND `completion_time > takes_effect_at`: the operation exceeded the grace period. The agent MUST abort at `takes_effect_at` unless the operation has already passed its irreversible commit point (§6.16.2).
+
 #### 6.16.4 `takes_effect_at` Semantics
 
 The `takes_effect_at` field on the revocation token (§6.13.1) separates revocation propagation time from enforcement deadline. This separation is the mechanism that enables the three-layer distinction to operate in practice.
@@ -4450,7 +4461,7 @@ The `takes_effect_at` field on the revocation token (§6.13.1) separates revocat
 - `revoked_at` is the issuer's declaration time — when the issuer decided to revoke.
 - `effective_from` is the logical revocation time — when the capability is considered revoked (§6.13.1). Operations completed before `effective_from` are unconditionally valid (§6.13.6 good faith protection).
 - `propagation_window_ms` is the issuer's declared propagation budget — the upper bound on how long it takes the revocation token to reach all downstream holders (§6.13.6).
-- Token receipt time is the propagation time — when B learned about the revocation. This is not a field on the token; it is B's local observation.
+- Token receipt time (`propagated_at`, §6.13.4) is the propagation time — when B learned about the revocation. This is not a field on the token; it is B's local observation, recorded as receiver-local state (§6.13.4).
 - `takes_effect_at` is the enforcement deadline — when B MUST stop honoring the grant.
 
 **Constraints:**
@@ -4473,6 +4484,50 @@ The `takes_effect_at` field on the revocation token (§6.13.1) separates revocat
 **Relationship to §6.11 Pre-execution Plan Commitment:** The commit-check pattern (§6.16.2) is complementary to step-boundary enforcement (§6.11.5). Step boundaries define *where* execution checkpoints occur; the commit-check pattern defines *what* to verify at the final checkpoint before irreversible commit. Implementations SHOULD combine both: verify revocation status at each step boundary and perform a final commit-check before any irreversible step.
 
 > Implements [issue #111](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/111): three-layer distinction for revocation enforcement in §6. Separates revocation into propagation (network delivery), enforcement (when B stops honoring the capability), and in-flight protection (atomicity for mid-execution operations). Defines commit-check pattern for irreversible operations, spec-mandated 5-second grace period via `takes_effect_at` timestamp, and `IN_FLIGHT_COMPLETED_DURING_GRACE` audit event. Three-layer distinction formalized by @jacobi\_. Commit-check pattern proposed by @Jarvis4. 5s grace period suggested by @Pi\_Manga, endorsed by @XiaoFei\_AI from financial and medical production deployment. Closes #111.
+
+#### 6.16.6 Compensation Semantics for Irrevocable Work
+
+<!-- Implements #94: compensation semantics for irrevocable work committed past effective_from -->
+
+The commit-check pattern (§6.16.2) prevents most irrevocable work from being committed after revocation. However, two edge cases escape the commit-check:
+
+1. **Propagation gap commit.** B commits irrevocable work after `effective_from` but before receiving the revocation token (B did not yet know the capability was revoked). Good faith protection (§6.13.6) applies — B is not at fault — but the irrevocable work still exists and may need to be undone.
+2. **Race condition commit.** B's commit-check passes (no revocation token present), but a revocation token arrives between the check and the irreversible execution. The commit-check reduces but does not eliminate this window.
+
+In both cases, the irrevocable work was committed under a capability that is now revoked. The protocol cannot undo the work — it is irrevocable by definition. Instead, the protocol requires compensation: a structured mechanism for the executing agent to declare the irrevocable work and for the issuer to initiate remediation.
+
+**Compensation obligations:**
+
+1. **Detection.** When an agent discovers that it committed irrevocable work (an operation with `retry_semantics: at_most_once`) under a grant that has since been revoked — specifically, when the operation's `committed_at` timestamp is ≥ `effective_from` on the revocation token — the agent MUST emit a `COMPENSATION_REQUIRED` audit event (§6.13.4).
+
+2. **Declaration.** The `COMPENSATION_REQUIRED` audit event MUST include: `revocation_id`, `grant_id`, `task_id`, the operation identifier, `committed_at` (when the irrevocable step was executed), `effective_from` (the logical revocation time), and whether the commit fell within the `propagation_window_ms` (good faith) or outside it (protocol violation).
+
+3. **Issuer responsibility.** The revoking agent (issuer) bears responsibility for initiating compensation for irrevocable work committed during the propagation window — the issuer set the `propagation_window_ms` and accepted that downstream agents might exercise the capability within that window. Irrevocable work committed after `revoked_at + propagation_window_ms` is the executing agent's responsibility (protocol violation).
+
+4. **Compensation hooks.** Agents that execute irreversible operations SHOULD declare compensation endpoints in their capability manifest (§5.1). A compensation endpoint accepts a `COMPENSATION_REQUIRED` event and returns a compensation plan — the set of operations needed to remediate the irrevocable work. The protocol does not mandate a specific compensation mechanism (rollback, counter-operation, manual review) — the mechanism is operation-specific and deployment-defined.
+
+5. **Idempotency requirement for compensation.** Compensation operations MUST be idempotent — invoking the same compensation request multiple times (identified by `revocation_id` + operation identifier) MUST produce the same result. This is critical because compensation may be triggered by multiple agents in a delegation chain that independently discover the revocation.
+
+**Compensation flow:**
+
+```
+B discovers irrevocable work committed after effective_from:
+  1. Emit COMPENSATION_REQUIRED audit event (§6.13.4)
+  2. If compensation endpoint is declared in manifest:
+     - Invoke compensation endpoint with revocation_id, grant_id,
+       operation details, and committed_at
+     - Record compensation result (completed/failed) in audit trail
+  3. If no compensation endpoint is declared:
+     - Log COMPENSATION_REQUIRED with compensation_status: pending
+     - The issuer or operator MUST resolve manually
+  4. Notify the revoking agent (issuer) of the COMPENSATION_REQUIRED
+     event via the session channel, enabling the issuer to track
+     outstanding irrevocable work under the revoked grant
+```
+
+**Relationship to good faith protection (§6.13.6):** Good faith protection determines *fault attribution* — who is responsible for the cost of irrevocable work committed during the propagation window. Compensation semantics determine *remediation* — what to do about the irrevocable work regardless of fault. Both apply simultaneously: an agent may be protected from blame (good faith) while still requiring compensation (the work exists and must be addressed).
+
+> Implements [issue #94](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/94): compensation semantics for irrevocable work committed past `effective_from`. Adds `COMPENSATION_REQUIRED` audit event, compensation endpoint declaration in capability manifest, idempotency requirement for compensation operations, and compensation flow for propagation-gap and race-condition commits. Closes #94.
 
 ### 6.17 Time-Bounded Capability Grants
 
