@@ -1902,6 +1902,7 @@ Each inner array contains exactly three elements: `[key, canonical_type, value_h
 - `manifest_digest` Merkle leaf computation (§4.3, §5.9): each leaf `SHA-256(cap_id ‖ impl_hash ‖ policy_hash)` MUST apply NFC normalization to string inputs before concatenation and hashing
 - `state_hash` computation in KEEPALIVE (§4.5.1) and SESSION_RESUME (§4.8), where the hashed state includes MANIFEST-derived values
 - `plan_hash` computation (§6.11), where the canonical plan representation includes hashable fields
+- Document-text and governance-record hash computations — genesis publication hashes, amendment chain hashes, emergency amendment hashes — use the byte-level normalization rules in §4.10.4 rather than the MANIFEST/JCS pipeline
 
 > Community discussion: Addresses @cass_agentsharp feedback on cross-runtime type name divergence — Python `str` vs JavaScript `string` vs C# `String` producing different MANIFEST hashes for identical logical tasks. Addresses @sondrabot feedback on RFC 8785 Unicode normalization gap — JCS alone does not prevent NFC/NFD divergence across runtimes. See [issue #56](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/56).
 
@@ -1937,6 +1938,52 @@ This produces exactly one canonical string per distinct moment. Implementations 
 The `bytes` canonical type (§4.10.1) represents binary data in MANIFEST tuples. Value serialization: base64url encoding (RFC 4648 §5, no padding). The value hash for a `bytes` field is `SHA-256(decoded_bytes)` — computed over the decoded byte content, not the base64url string. This ensures that different base64 encoding dialects (standard vs. URL-safe, padded vs. unpadded) do not produce different hashes for the same binary content.
 
 > Community discussion: Addresses @Haustorium12 feedback on five cross-runtime serialization edge cases that produce silent `task_hash` mismatches — IEEE 754 special values, integer overflow, float representation determinism, datetime canonicalization, and binary data handling. See [issue #162](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/162).
+
+#### 4.10.4 Canonical Byte-Level Serialization for Document and Record Hashes
+
+§4.10.2 specifies canonical serialization for MANIFEST-based hash computations (task_hash, manifest_digest, state_hash, plan_hash). A second class of hash computations operates over protocol document text and governance record payloads — genesis publication hashes (§9.10.4), amendment hash chains (§9.11.5), and emergency amendment hashes (§11.5). These hashes are computed over rendered text or JSON-serialized records rather than MANIFEST tuples. Without a single normative byte-level serialization format, any whitespace normalization difference, encoding variation, or minor formatting change across tooling produces different hashes and silently breaks chain verification across independent implementations.
+
+§4.10.4 defines the canonical byte-level serialization that all document-text and governance-record hash computations in the protocol MUST apply before hashing. MANIFEST-based hashes continue to use the JCS + NFC pipeline (§4.10.2); document and record hashes use the rules below.
+
+**Normalization rules:**
+
+All inputs to document-text and governance-record hash computations MUST be normalized to the following canonical byte form before the hash function is applied:
+
+1. **Encoding.** The input MUST be encoded as UTF-8 (RFC 3629). No byte-order mark (BOM, U+FEFF) is permitted — if a BOM is present in the source, it MUST be stripped before hashing. UTF-8 is the only permitted encoding; UTF-16, UTF-32, Latin-1, and other encodings MUST be transcoded to UTF-8 before normalization.
+
+2. **Line endings.** All line endings MUST be normalized to LF (U+000A). CR (U+000D) and CRLF (U+000D U+000A) sequences MUST be replaced with a single LF. This closes the platform-dependent line-ending divergence: Windows (CRLF), classic Mac (CR), and Unix (LF) produce different byte sequences for the same logical text without this normalization.
+
+3. **Trailing whitespace.** Trailing whitespace (spaces U+0020 and tabs U+0009) MUST be stripped from each line before the line-ending character. A "line" is defined as the sequence of characters between two consecutive LF characters, or between the start of the input and the first LF, or between the last LF and the end of the input. This prevents invisible whitespace differences — introduced by editors, copy-paste, or Markdown formatters — from producing different hashes for visually identical text.
+
+4. **Trailing newline.** The normalized output MUST end with exactly one LF character. If the input ends with zero LF characters, one MUST be appended. If the input ends with multiple consecutive LF characters, all but one MUST be removed.
+
+5. **Unicode normalization.** All string content MUST be NFC-normalized (Unicode Canonical Decomposition followed by Canonical Composition, per [Unicode TR15](https://unicode.org/reports/tr15/)) before encoding to UTF-8. This is consistent with the NFC requirement in §4.10.2 and closes the same cross-runtime Unicode divergence gap for document text.
+
+6. **Deterministic field ordering for JSON-serialized records.** When the hash input is a JSON-serialized record (e.g., amendment records, emergency amendment records, affected section text), the JSON serialization MUST use RFC 8785 JCS: keys sorted lexicographically by Unicode code point, no whitespace between tokens, deterministic number encoding. Rules 1–5 apply to the JCS output bytes.
+
+**Rendered bytes computation:**
+
+The "rendered bytes" of a protocol document section or governance record — the byte sequence that is input to the hash function — is computed as follows:
+
+```
+rendered_bytes = utf8_encode(nfc_normalize(strip_trailing_ws(normalize_lf(strip_bom(source_text))))) + trailing_lf_fixup
+```
+
+Where each step applies the corresponding rule above, in order: strip BOM (rule 1), normalize line endings to LF (rule 2), strip trailing whitespace per line (rule 3), apply trailing newline fixup (rule 4), apply NFC normalization (rule 5), encode as UTF-8 (rule 1). For JSON records, JCS serialization (rule 6) is applied before rules 1–5 normalize the serialized output.
+
+**Scope of application:**
+
+- `genesis_hash` computation over `canonical_enum_text` (§9.10.4)
+- `amendment_record_canonical_json` in amendment hash chains (§9.11.5)
+- `affected_sections_canonical_json` and `proposal_text_canonical_json` in emergency amendment hashes (§11.5)
+- `rollback_record_canonical_json` in rollback records (§11.7.3)
+- Any future hash computation over protocol document text or governance records
+
+**Relationship to §4.10.2:** §4.10.2 governs MANIFEST-based hashes (structural identity). §4.10.4 governs document-text and governance-record hashes (textual integrity). Both share NFC normalization and UTF-8 encoding requirements. They differ in scope: §4.10.2 applies JCS to MANIFEST tuple structures; §4.10.4 applies byte-level text normalization to rendered document content and then JCS to JSON record payloads. Hash computations that involve both MANIFEST tuples and document text (e.g., a governance record containing a task_hash) apply §4.10.2 to the MANIFEST component and §4.10.4 to the record serialization.
+
+**Why explicit byte-level rules:** Without normative byte-level serialization, two implementations can read the same spec section, apply the same hash function, and produce different hashes — because one read the source on Windows (CRLF), the other on Unix (LF); one editor left trailing spaces, the other stripped them; one tool emitted a BOM, the other did not. These are not hypothetical: every difference listed in rules 1–4 has been observed in production across Markdown rendering toolchains. The hash chain's integrity guarantee is only as strong as the reproducibility of its inputs.
+
+> Addresses [issue #208](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/208): canonical byte-level serialization for document and governance-record hash computations. Defines UTF-8 encoding (no BOM), LF-only line endings, no trailing whitespace, trailing newline fixup, NFC normalization, and deterministic field ordering (JCS) as normative requirements for all hash inputs derived from protocol document text or governance records. Closes #208.
 
 ### 4.11 SESSION_STATE Object
 
@@ -7603,7 +7650,7 @@ genesis_hash = hash(canonical_enum_text + spec_version_string)
 ```
 
 Where:
-- `canonical_enum_text` is the exact text of §9.10.2 from "The following trust annotation types" through the end of the enum table (the four-row table defining `DELEGATION`, `ASSUMES_AUTHENTICATED_SOURCE`, `ASSUMES_SCHEMA_VERSION`, `OPERATOR_ASSERTED`), canonicalized by stripping leading/trailing whitespace from each line and normalizing line endings to LF.
+- `canonical_enum_text` is the exact text of §9.10.2 from "The following trust annotation types" through the end of the enum table (the four-row table defining `DELEGATION`, `ASSUMES_AUTHENTICATED_SOURCE`, `ASSUMES_SCHEMA_VERSION`, `OPERATOR_ASSERTED`), canonicalized per §4.10.4 (UTF-8 encoding without BOM, LF-only line endings, no trailing whitespace per line, trailing newline fixup, NFC normalization).
 - `spec_version_string` is the protocol version identifier (e.g., `"0.1.0"`).
 - `hash` is SHA-256.
 
@@ -7729,7 +7776,7 @@ amendment_hash = SHA-256(prior_state_hash || amendment_record_canonical_json)
 
 Where:
 - `prior_state_hash` is the `genesis_hash` (§9.10.4) for the first amendment, or the `amendment_hash` of the immediately preceding amendment for subsequent amendments.
-- `amendment_record_canonical_json` is the JSON serialization of the amendment record (§9.11.4) with keys sorted lexicographically, no optional whitespace, and UTF-8 encoding.
+- `amendment_record_canonical_json` is the JSON serialization of the amendment record (§9.11.4), canonicalized per §4.10.4: RFC 8785 JCS (keys sorted lexicographically by Unicode code point, no whitespace between tokens, deterministic number encoding), UTF-8 encoding without BOM, LF-only line endings, no trailing whitespace, NFC normalization.
 - `||` denotes concatenation.
 
 **Amendment chain:** The full lineage from `genesis_hash` through each `amendment_hash` to the current terminal node is independently verifiable. The current spec version's trust annotation enum is authoritative if and only if the amendment chain can be verified from a trusted `genesis_hash` to the terminal `amendment_hash`.
@@ -8179,8 +8226,8 @@ Where:
 - `current_protocol_version` is the protocol version (§10.1) at the time of the proposal.
 - `current_schema_version` is the schema version (§10.1) at the time of the proposal.
 - `terminal_amendment_hash` is the most recent `amendment_hash` in the amendment chain (§9.11.5), or `genesis_hash` (§9.10.4) if no amendments have been ratified.
-- `affected_sections_canonical_json` is the JSON serialization of the sections being modified, with keys sorted lexicographically, no optional whitespace, and UTF-8 encoding. This captures the exact pre-amendment text of every section the amendment modifies.
-- `proposal_text_canonical_json` is the JSON serialization of the proposed amendment text, same canonicalization rules.
+- `affected_sections_canonical_json` is the JSON serialization of the sections being modified, canonicalized per §4.10.4: RFC 8785 JCS (keys sorted lexicographically by Unicode code point, no whitespace between tokens, deterministic number encoding), UTF-8 encoding without BOM, LF-only line endings, no trailing whitespace, NFC normalization. This captures the exact pre-amendment text of every section the amendment modifies.
+- `proposal_text_canonical_json` is the JSON serialization of the proposed amendment text, canonicalized per §4.10.4 (same rules).
 - `||` denotes concatenation.
 
 **Emergency amendment record:**
@@ -8254,7 +8301,7 @@ Rollback restores the protocol to the state captured by `pre_amendment_hash` (§
 | trigger_evidence | string | Yes | Description and evidence of the observed failure |
 | invoked_by | string | Yes | Identity of the committee member who invoked rollback |
 | rollback_timestamp | ISO 8601 | Yes | Time the rollback was published |
-| rollback_hash | string | Yes | `SHA-256(prior_amendment_hash \|\| rollback_record_canonical_json)` — extends the amendment chain |
+| rollback_hash | string | Yes | `SHA-256(prior_amendment_hash \|\| rollback_record_canonical_json)` — extends the amendment chain. `rollback_record_canonical_json` is canonicalized per §4.10.4 |
 
 3. The rollback record extends the amendment chain. The chain remains linear and verifiable — a rollback does not fork the chain or remove the original amendment record. The amendment and its rollback are both permanently recorded, providing a complete audit trail.
 
