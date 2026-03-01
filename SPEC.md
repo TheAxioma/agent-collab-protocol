@@ -550,8 +550,19 @@ ACTIVE → DEGRADED
            with transient errors
          - Application self-report: counterparty reports app_status: DEGRADED
            in HEARTBEAT (requires heartbeat_params.application_liveness = true,
-           §4.3.1)
-         Detection is local — each side evaluates independently
+           §4.3.1). Self-declaration is advisory — MUST NOT be treated
+           as authoritative (§4.2.2)
+         - Canary failure rate: sustained canary failure rate above
+           deployment-defined threshold over a sliding window (§4.2.2)
+         - Behavioral drift signal: KL-divergence between actual action
+           distribution (from action_log_hash, §8.21) and expected
+           distribution from declared constraints (§5.8.2) exceeds
+           deployment-defined threshold
+         - Fidelity attestation failure: context compaction detected
+           without subsequent re-attestation (§4.8, §4.7.1)
+         DEGRADED MUST be declared by an external verifier (§4.7.2)
+           or the delegating agent. Self-declaration SHOULD be permitted
+           but MUST be treated as advisory only (§4.2.2)
          The session remains operational — task delegation is permitted
            with reduced expectations
 
@@ -563,12 +574,19 @@ DEGRADED → ACTIVE
            restoring previously lost capabilities)
          - Application self-report: counterparty reports app_status: ACTIVE
            in HEARTBEAT
+         Recovery MUST include fresh attestation — the degraded agent
+           MUST re-attest its capability manifest (§5.9) before the
+           delegating agent or external verifier transitions the session
+           back to ACTIVE. Stale attestation from pre-DEGRADED state
+           is insufficient.
          No SESSION_RESUME required — the session was never declared dead
-         Transition is automatic when detection signals clear
 
 DEGRADED → REVOKED
   Guard: Adversarial behavior detected via detection signal taxonomy (§8.16)
          while session is already in DEGRADED state
+         OR degradation reaches critical threshold and cannot be remediated
+           — sustained detection signals across multiple sliding windows
+           without recovery, at delegating agent's discretion
          Same detection signals as ACTIVE → REVOKED
          On entry: same revocation semantics as ACTIVE → REVOKED (§8.15)
 
@@ -915,10 +933,12 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Unique session identifier (UUID v4 RECOMMENDED). |
+| correlation_id | UUID v4 | Yes | Unique identifier for request-response correlation across message exchanges (§4.14.4). MUST be present in all protocol messages. For response messages (SESSION_INIT_ACK, TASK_ACCEPT, TASK_REJECT, etc.), `correlation_id` MUST match the originating request's `correlation_id`. |
+| idempotency_key | UUID v4 | Yes | Sender-generated key for deduplication (§4.14.3). The receiver MUST return the same response for duplicate keys without reprocessing. Deduplication window: 5 minutes. |
 | initiator_id | string | Yes | §2 identity handle of the session coordinator. |
 | identity_object | object | Yes | Full §2 identity object of the coordinator (name, platform, pubkey, endpoint, protocol_version). |
 | role | enum | Yes | Role the initiator claims: `coordinator`. The responder's role is `worker` by default (see §4.4). |
-| protocol_version | semver | Yes | Protocol version the coordinator implements (§10). |
+| protocol_version | semver | Yes | Protocol version the coordinator implements (§10). V1 semantics: abort on mismatch (§10.4); downgrade negotiation deferred to V2. |
 | schema_version | semver | Yes | Schema version the coordinator supports (§10.1). |
 | keepalive | object | No | Keepalive configuration proposal (see §4.5). If omitted, no protocol-level keepalive is active for this session. |
 | heartbeat_interval_ms | integer | No | Proposed interval in milliseconds between HEARTBEAT_PING messages — Tier 1 transport liveness (§8.9). Per-session, not per-agent — different collaborations have different latency profiles (e.g., 5000ms for real-time coordination, 300000ms for research tasks). The coordinator MAY use the worker's `preferred_heartbeat_interval_ms` from AGENT_MANIFEST (§3.1) as input when choosing this value, but the AGENT_MANIFEST hint is advisory — this SESSION_INIT field is the binding proposal. The worker may counter-propose in SESSION_INIT_ACK; the effective value is the maximum of both proposals. If omitted, falls back to `keepalive.heartbeat_interval_seconds * 1000` if present, otherwise no protocol-level heartbeat. Default: 30000. |
@@ -940,10 +960,12 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Echoed from SESSION_INIT. |
+| correlation_id | UUID v4 | Yes | Echoed from SESSION_INIT. Enables the initiator to match this response to its originating request (§4.14.4). |
 | responder_id | string | Yes | §2 identity handle of the worker. |
 | identity_object | object | Yes | Full §2 identity object of the worker. |
 | role | enum | Yes | Role the responder accepts: `worker`. |
 | protocol_version | semver | Yes | Protocol version the worker implements. |
+| supported_version_range | object | No | The worker's supported protocol version range. Contains `min_version` (semver) and `max_version` (semver). MUST be included when the worker rejects the session due to version mismatch (§10.4), so the initiator can report the incompatibility upstream. RECOMMENDED in all SESSION_INIT_ACK messages for protocol diagnostics. |
 | schema_version | semver | Yes | Schema version the worker supports. |
 | keepalive | object | No | Keepalive configuration acceptance or counter-proposal. |
 | heartbeat_interval_ms | integer | No | Accepted or counter-proposed heartbeat interval. If the worker counter-proposes, the effective interval is the **maximum** of both proposals (slower rate wins — neither side should be forced to heartbeat faster than it can sustain). |
@@ -965,6 +987,8 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 ```yaml
 message_type: SESSION_INIT
 session_id: "550e8400-e29b-41d4-a716-446655440000"
+correlation_id: "7a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d"
+idempotency_key: "b2c3d4e5-f6a7-8b9c-0d1e-2f3a4b5c6d7e"
 initiator_id: "agent-alpha@github"
 identity_object:
   name: "agent-alpha"
@@ -1972,6 +1996,8 @@ CAPABILITY_GRANT is the message type that carries the authorized capability set 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | grant_id | UUID v4 | Yes | Unique identifier for this grant instance. |
+| correlation_id | UUID v4 | Yes | Unique identifier for request-response correlation (§4.14.4). |
+| idempotency_key | UUID v4 | Yes | Sender-generated key for deduplication (§4.14.3). The receiver MUST return the same response for duplicate keys without reprocessing. |
 | task_id | UUID v4 | Yes | The task for which capabilities are granted. |
 | session_id | string | Yes | Active session identifier. |
 | grantor_id | string | Yes | Identity of the agent issuing the grant. |
@@ -1979,7 +2005,7 @@ CAPABILITY_GRANT is the message type that carries the authorized capability set 
 | granted_capabilities | array | Yes | Capability IDs (§5.1.1 format) authorized by this grant. MUST be a subset of the grantor's own authorized capabilities (no-privilege-escalation rule, §5.5, §6.8). |
 | delegation_token | object | Yes | Updated delegation token (§5.5) reflecting the granted capabilities. |
 | granted_at | ISO 8601 | No | Timestamp when the grant was issued by the grantor. SHOULD be included — absence prevents clock skew detection. Lets receiving agents detect clock skew: if `granted_at` is in the future beyond the 30-second tolerance window, the agent SHOULD flag the grant as a configuration anomaly and request a fresh one (see **Clock skew detection via `granted_at`** below). |
-| valid_until | ISO 8601 | No | Expiry time for this grant. Receiving agents MUST treat the grant as revoked when `current_time > valid_until` — this is a protocol obligation, not advisory. Absence means the grant is valid for this session only (session-scoped). Implementers SHOULD include `valid_until`; absence is spec-legal but receiving agents MUST log a warning when processing a grant without `valid_until`. |
+| valid_until | ISO 8601 | Yes | Expiry time for this grant. REQUIRED — every CAPABILITY_GRANT MUST include an explicit `valid_until`. Receiving agents MUST treat the grant as invalid when `current_time > valid_until` — this is a protocol obligation, not advisory. Maximum TTL for V1: 24 hours (`valid_until` MUST NOT exceed `granted_at + 24h`, or `current_time + 24h` when `granted_at` is absent). Grants exceeding the 24-hour maximum MUST be rejected by the receiver. Enforcement is at the capability level, not the session level — each grant carries its own temporal bound independent of session lifetime. See §6.17 for time-bounded capability grant semantics. |
 | behavioral_constraint_manifest | object | No | Signed behavioral constraint manifest — a compact declaration of what B is authorized to do within this grant's scope. When present, B MUST acknowledge the manifest at session init, re-attest compliance at each HEARTBEAT (via `manifest_compliance` field), and declare DRIFTED (§4.2.3) if it can no longer comply. See **Behavioral constraint manifest semantics** below. |
 | signature | bytes | No | Cryptographic signature over all other fields, produced by the grantor. RECOMMENDED for auditability. |
 
@@ -2009,10 +2035,10 @@ When `behavioral_constraint_manifest` is present in CAPABILITY_GRANT, it establi
 **Temporal enforcement semantics:**
 
 - **Expiry is self-enforcing.** The receiving agent is responsible for enforcing `valid_until`. When `current_time > valid_until`, the grant MUST be treated as revoked — the agent MUST stop exercising the granted capabilities for the associated task. This is distinct from requester-initiated revocation (§6.13): expiry is time-based and self-enforcing at the receiving agent; revocation is an explicit delegator action via signed revocation token (§6.13.1) propagated through the delegation chain.
-- **Session-scoped default.** Absent `valid_until` SHOULD be interpreted as session-scoped: valid for the current session only. A grant without `valid_until` is not non-expiring (which would recreate the trust decay surface that TTL semantics exist to prevent) and is not an error (which would be too strict for early adoption). Grants cannot outlive the session that created them — session termination (§4.9 SESSION_CLOSE) or session expiry (§4.2 EXPIRED state) implicitly revokes all grants without explicit `valid_until`. Revocation is automatic on teardown. Receiving agents MUST log a warning when processing a grant without `valid_until` to surface the implicit session-scoped assumption for audit.
+- **No session-scoped default.** `valid_until` is REQUIRED — there is no implicit session-scoped fallback. A CAPABILITY_GRANT without `valid_until` is non-compliant and MUST be rejected by the receiver. This eliminates the trust decay surface identified in production (47 operations on expired credentials, @larryadlibrary issue #15) where session continuity masked grant staleness.
 - **Clock skew tolerance on `valid_until`.** Agents MUST tolerate clock skew of at least 30 seconds in either direction when evaluating `valid_until`. A grant whose `valid_until` is within 30 seconds of the receiver's current time MUST NOT be treated as expired solely due to clock divergence. Implementations SHOULD log a warning when evaluating a grant within 60 seconds (2× tolerance window) of expiry to allow proactive renewal. Clock skew tolerance of 30 seconds is production-validated by the HIBI reserve asset protocol (@jacobi_).
 - **Clock skew detection via `granted_at`.** When `granted_at` is present, the receiving agent SHOULD compare it against its local clock. If `granted_at` is in the future beyond the 30-second tolerance window, the agent SHOULD flag the grant as a configuration anomaly and request a fresh one — gross clock skew is a deployment issue, not a trust violation. The agent MUST NOT hard-fail on future `granted_at`; instead it SHOULD log the anomaly with both timestamps and the computed skew. If `granted_at` is between 0 and 30 seconds in the future, the agent MAY accept the grant but MUST log a warning indicating clock skew was detected and the tolerance window was applied.
-- **Pre-expiry behavior.** The protocol does not define a grace period. When `current_time > valid_until`, the grant is expired — immediately and without exception. Agents that need continued authorization MUST obtain a CAPABILITY_RENEW (§5.8.3) before expiry.
+- **Pre-expiry behavior and grace period.** When `current_time > valid_until`, the grant is expired. Atomic operations already in progress at TTL expiry MAY complete within a 5-second grace period (consistent with best-effort TTL expiry semantics, §6.17.4). Operations that cannot complete within the grace period MUST abort and report `TTL_EXPIRED`. The grace period applies only to operations that were in-flight at the moment of expiry — new operations MUST NOT be initiated after `valid_until`. Agents that need continued authorization beyond the grace period MUST obtain a CAPABILITY_RENEW (§5.8.3) before expiry.
 
 **Relationship to CAPABILITY_REQUEST (§5.8):** CAPABILITY_GRANT is the authorization artifact issued when CAPABILITY_REQUEST is approved. CAPABILITY_REQUEST is the request; CAPABILITY_GRANT is the grant. A CAPABILITY_REQUEST_APPROVED response SHOULD be accompanied by a CAPABILITY_GRANT message carrying the updated authorization with explicit temporal bounds.
 
@@ -2549,6 +2575,8 @@ Sent by the delegating agent to initiate delegation.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | task_id | UUID v4 | Yes | Unique task instance identifier (from §6.1) |
+| correlation_id | UUID v4 | Yes | Unique identifier for request-response correlation (§4.14.4). Response messages (TASK_ACCEPT, TASK_REJECT) MUST echo this value. |
+| idempotency_key | UUID v4 | Yes | Sender-generated key for deduplication (§4.14.3). Distinct from `request_id` — `idempotency_key` is the transport-layer deduplication primitive; `request_id` is the delegation-initiation identity. Both MUST be present. |
 | request_id | UUID v4 | Yes | Stable delegation-initiation identifier for deduplication. Generated once at initiation time, before the first transmission. The same `request_id` MUST be used on all retries for the same delegation attempt. Distinct from `task_id` — `task_id` identifies the task; `request_id` identifies the delivery attempt. See §6.14. |
 | session_id | string | Yes | Active session identifier binding this delegation to a collaboration session |
 | spec | object | Yes | Task specification (see below) |
@@ -3786,7 +3814,78 @@ The `takes_effect_at` field on the revocation token (§6.13.1) separates revocat
 
 > Implements [issue #111](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/111): three-layer distinction for revocation enforcement in §6. Separates revocation into propagation (network delivery), enforcement (when B stops honoring the capability), and in-flight protection (atomicity for mid-execution operations). Defines commit-check pattern for irreversible operations, spec-mandated 5-second grace period via `takes_effect_at` timestamp, and `IN_FLIGHT_COMPLETED_DURING_GRACE` audit event. Three-layer distinction formalized by @jacobi\_. Commit-check pattern proposed by @Jarvis4. 5s grace period suggested by @Pi\_Manga, endorsed by @XiaoFei\_AI from financial and medical production deployment. Closes #111.
 
-### 6.17 Open Questions
+### 6.17 Time-Bounded Capability Grants
+
+<!-- Implements #107: time-bounded capability grants — valid_until enforcement, cascading TTL decay, renewal semantics, in-flight expiry, and relationship to CAPABILITY_REVOKE -->
+
+Explicit TTL on capability grants eliminates the revocation propagation race for non-compromise cases. Grants self-expire without requiring a revocation signal — the receiving agent enforces `valid_until` locally, with no network round-trip. CAPABILITY_REVOKE (§6.13) becomes an emergency path for pre-expiry compromise rather than the normal grant termination path. Production evidence from @larryadlibrary (issue #15): an agent ran 47 operations on expired credentials because trust validation happened at session initiation only — capability-level TTL enforcement closes this gap.
+
+Capability-level TTL enforcement is superior to per-operation revalidation. Per-operation revalidation adds latency to every operation, burns rate limits on the validation service, and creates a validation-service dependency that cascades on failure — if the validation service is down, all operations halt. TTL enforcement is local, self-contained, and partition-tolerant.
+
+#### 6.17.1 `valid_until` Enforcement
+
+`valid_until` is a REQUIRED field on CAPABILITY_GRANT (§5.8.2). Every grant MUST include an explicit expiry timestamp in ISO 8601 format with millisecond precision.
+
+**Enforcement rules:**
+
+1. `valid_until` is a **protocol obligation**, not advisory. Receiving agents MUST enforce `valid_until` at the capability level — not at the session level, not at session initiation only, and not as a periodic check. The grant's temporal validity is evaluated each time the grant is exercised.
+2. **Maximum TTL for V1: 24 hours.** `valid_until` MUST NOT exceed 24 hours from `granted_at` (or from `current_time` when `granted_at` is absent). Grants with `valid_until` beyond the 24-hour maximum are non-compliant — receiving agents MUST reject them.
+3. A CAPABILITY_GRANT without `valid_until` is non-compliant and MUST be rejected by the receiver.
+4. When `current_time > valid_until` (accounting for the 30-second clock skew tolerance, §5.8.2), the grant is invalid. The agent MUST stop exercising the granted capabilities and MUST report `TTL_EXPIRED` for any pending operations that cannot complete within the grace period (§6.17.4).
+
+#### 6.17.2 Cascading TTL Decay
+
+When an agent (B) holding a CAPABILITY_GRANT issues a sub-grant to a downstream agent (C) — whether via CAPABILITY_GRANT or embedded in a sub-delegation's `delegation_token` (§5.5, §6.9) — the child grant's temporal bounds are constrained by the parent.
+
+**Cascading TTL rules:**
+
+1. **Child TTL MUST NOT exceed parent TTL.** A child grant's `valid_until` MUST be ≤ the parent grant's `valid_until`. A child grant with `valid_until` beyond the parent's `valid_until` is non-compliant and MUST be rejected by the receiver.
+2. **Parent expiry cascades immediately.** When a parent grant expires (its `valid_until` is reached), all derived child grants immediately become invalid regardless of their own `valid_until`. The child grant's `valid_until` is an upper bound, not a guarantee — the parent's expiry is the effective ceiling.
+3. **Child grant holders MUST verify parent grant validity before acting.** Agents holding child grants MUST verify that the parent grant remains valid (not expired, not revoked) before exercising the child grant's capabilities. This is a local check when the parent grant's `valid_until` is known to the child grant holder — no network round-trip required if the parent grant metadata was propagated with the child grant.
+4. **Propagation of parent grant metadata.** When issuing a child grant, the issuing agent SHOULD include the parent grant's `grant_id` and `valid_until` in the child grant's `delegation_token` metadata (§5.5) to enable local parent-validity checks by the child grant holder.
+
+This closes the cascading trust decay failure mode: parent expires, child continues operating on stale authorization. Without cascading TTL decay, a child grant with a `valid_until` beyond the parent's could continue to authorize operations after the parent's authority has lapsed — violating the delegation chain's trust invariant.
+
+#### 6.17.3 Renewal Semantics
+
+CAPABILITY_RENEW (§5.8.3) extends a grant's `valid_until` without changing the authorized capability set. Renewal is subject to the following constraints within the time-bounded grant model:
+
+1. **Renewal MUST be re-grant from the original issuer only.** The `grantor_id` on CAPABILITY_RENEW MUST match the `grantor_id` of the original CAPABILITY_GRANT (§5.8.3). A grantee (B) extending its own grant's `valid_until` — even within the original grantor's (A's) scope — is prohibited. Self-renewal risks scope drift over repeated renewals: each renewal is a trust extension decision that belongs to the original authority, not the recipient.
+2. **Renewed `valid_until` is subject to the 24-hour maximum.** A CAPABILITY_RENEW's `valid_until` MUST NOT exceed 24 hours from the renewal's `granted_at` (or `current_time` when `granted_at` is absent). The 24-hour V1 maximum applies per-grant-instance, not cumulative — an original grant may be renewed indefinitely as long as each renewal's TTL does not exceed 24 hours.
+3. **Renewal message format.** Renewal uses CAPABILITY_RENEW (§5.8.3) — a new CAPABILITY_GRANT with a fresh `valid_until`, referencing the original grant's `grant_id` via the `original_grant_id` field. The `original_grant_id` serves as the correlation key for deduplication and audit trail continuity.
+4. **Cascading renewal.** When a parent grant is renewed, child grants do not automatically inherit the extended `valid_until`. Child grant holders whose grants are approaching expiry MUST request renewal from their immediate grantor. Renewal propagates hop-by-hop through the delegation chain, not automatically from the root.
+
+#### 6.17.4 In-Flight Operations at Expiry
+
+When a grant's `valid_until` is reached while operations are in progress, the protocol applies best-effort completion semantics consistent with TASK_CANCEL behavior (§6.6):
+
+1. **Atomic operations in progress at TTL expiry MAY complete within a 5-second grace period.** The grace period begins at the moment `current_time` exceeds `valid_until` (after clock skew tolerance). An operation is "in progress" if the agent had begun executing it before the expiry moment — operations initiated after `valid_until` are never eligible for the grace period.
+2. **Operations that cannot complete within the 5-second grace period MUST abort.** The agent MUST report `TTL_EXPIRED` as the error code (§8 error handling). Partial results from the aborted operation SHOULD be preserved in the TASK_FAIL response (§6.6) for potential recovery.
+3. **No new operations after expiry.** The grant MUST NOT be used to initiate new operations after `valid_until`, regardless of whether the grace period is active. The grace period is exclusively for completing in-flight work.
+4. **Grace period is not renewable.** The 5-second grace period is a fixed window — agents MUST NOT extend it by any mechanism. If continued authorization is needed, the agent MUST have obtained a CAPABILITY_RENEW (§5.8.3) before the original expiry.
+
+**Relationship to TASK_CANCEL semantics:** The 5-second grace period mirrors the best-effort completion semantics of TASK_CANCEL (§6.6) — cancellation is best-effort, and a task that completes before the cancel is processed is valid. Similarly, an atomic operation that completes within the grace period after TTL expiry is valid. The grace period exists to prevent data corruption from abruptly aborting mid-write operations, not to extend the grant's authorization window.
+
+#### 6.17.5 Relationship to CAPABILITY_REVOKE
+
+`valid_until` and CAPABILITY_REVOKE (§6.13) are complementary mechanisms serving different failure modes:
+
+| Mechanism | Trigger | Network requirement | Propagation | Use case |
+|-----------|---------|---------------------|-------------|----------|
+| `valid_until` (TTL) | Time-based, self-enforcing | None — local clock check | Implicit (grant self-expires) | Normal grant expiry, routine authorization cycling |
+| CAPABILITY_REVOKE (§6.13) | Issuer-initiated, explicit | Revocation token distribution | Explicit (signed token propagated through chain) | Pre-expiry compromise, trust loss, policy violation |
+
+**Both MAY apply to the same grant; whichever takes effect first wins.** A grant is invalid if either condition is met — TTL expired or explicitly revoked. The receiver MUST check both conditions (§6.13.3).
+
+**TTL handles normal expiry without a network round-trip.** In the common case — a grant that runs its course and is not needed beyond its TTL — no revocation signal is required. The grant self-expires at the receiver. This eliminates the revocation propagation race for the normal case: there is no window between "issuer decides to revoke" and "receiver processes the revocation" because the receiver enforces expiry locally.
+
+**CAPABILITY_REVOKE handles pre-expiry compromise.** When a grant's security context is compromised before `valid_until` — key exposure, grantee misbehavior, policy change — the issuer issues a signed revocation token (§6.13.1) to terminate the grant immediately. Without CAPABILITY_REVOKE, the only option would be to wait for TTL expiry, leaving a potentially compromised grant active until the clock runs out.
+
+**Audit trail distinction.** TTL expiry and explicit revocation are distinct audit events (§6.13.4). When a grant is rejected because `current_time > valid_until`, the rejection reason is temporal expiry. When a grant is rejected because a valid revocation token exists, the rejection reason is active revocation. These have different causes, different attribution, and different recovery paths — the audit trail MUST distinguish them.
+
+> Implements [issue #107](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/107): time-bounded capability grants for §6. Defines `valid_until` as REQUIRED on CAPABILITY_GRANT with 24-hour V1 maximum TTL, cascading TTL decay for child grants, renewal-from-original-issuer constraint, 5-second grace period for in-flight operations at expiry, and complementary relationship between TTL and CAPABILITY_REVOKE. Production evidence: @larryadlibrary 47-op expired credential run (issue #15). Design sources: @NewMoon (grant expiration as revocation alternative), @Jarvis4 (TTL + ZK composite primitive), @mote-oo (per-operation revalidation analysis). Closes #107.
+
+### 6.18 Open Questions
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
@@ -6263,6 +6362,7 @@ When version incompatibility is detected at SESSION_INIT, the receiving agent MU
 | error_type | string | `PROTOCOL_MISMATCH` |
 | local_protocol_version | semver | Version the rejecting agent implements |
 | remote_protocol_version | semver | Version declared by the initiating agent |
+| supported_version_range | object | The rejecting agent's supported version range. Contains `min_version` (semver, lowest protocol version the agent can interoperate with) and `max_version` (semver, highest protocol version the agent implements). The initiator MUST use this to report the incompatibility upstream — without it, the initiator knows only that its version was rejected, not what version would succeed. V1 semantics: abort on mismatch (clean failure); downgrade negotiation deferred to V2. |
 | message | string | Human-readable description of the incompatibility |
 
 **SCHEMA_MISMATCH error:**
