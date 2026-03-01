@@ -3339,6 +3339,18 @@ Two agents — one in Python using `json.dumps`, one in Rust using `serde_cbor` 
 
 `task_hash` (§6.4) commits to the structural *what* of a task — syntactic identity. `intent_hash` commits to the semantic *why* — the delegator's declared purpose, constraints, and outcome framing. Without `intent_hash`, an adversarial intermediary B in a chain A→B→C can forward an unchanged `task_hash` to C while substituting A's intent context: the delegation remains protocol-compliant, audit-clean, and semantically distorted.
 
+#### V1 Scope: Tamper-Evidence Only
+
+> **V1 provides tamper-evidence for intent, not authorization verification.** Implementors MUST NOT conflate these two properties.
+
+**Tamper-evidence** (V1 guarantee): Per-hop signing of `(task_hash || intent_hash || delegator_id)` proves that an intermediary did not substitute or modify the delegator's declared intent context after signing. If B signs an attestation over `intent_hash`, any subsequent alteration of the intent fields invalidates B's signature. The hash is preserved; the content it commits to is immutable post-attestation.
+
+**Authorization verification** (NOT a V1 guarantee): Confirming that a preserved intent actually *authorized* what a delegated agent executed. Even with a valid, unmodified `intent_hash`, V1 cannot determine whether agent C's execution falls within the semantic scope of agent A's original intent. For example, A delegates "refactor the parser" to B, B re-delegates to C — V1 can prove A's intent was not swapped, but cannot evaluate whether C's execution (rewriting the lexer) is semantically covered by "refactor the parser."
+
+**Mechanism gap:** Authorization verification requires a shared intent vocabulary — a common semantic framework that all participants use to interpret intent fields and evaluate whether an execution satisfies a declared intent. This dependency is strictly harder than PKI (which V1 already assumes) because it requires semantic agreement, not just cryptographic infrastructure. Shared intent semantics are deferred to V2.
+
+**Implementor guidance:** A delegation chain where every `intent_hash` verifies is audit-clean (no intermediary tampered with intent) but is not necessarily semantically correct (the preserved intent may not cover the downstream execution). V1 implementations MUST NOT treat successful `intent_hash` verification as proof of authorization compliance.
+
 #### intent_hash Computation
 
 `intent_hash` is the SHA-256 hash of the delegation intent context. The intent context is the concatenation of the following fields from the task schema (§6.1), canonicalized per §4.10:
