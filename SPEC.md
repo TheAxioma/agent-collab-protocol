@@ -3403,6 +3403,8 @@ The `divergence_log` field in EVIDENCE_RECORD is an array of divergence entry ob
 | deviation_timestamp | ISO 8601 | Yes | When the deviation occurred relative to the execution timeline. Millisecond precision REQUIRED. This is the time the deviation was detected or occurred, not the time the entry was recorded. |
 | affected_step_id | string | No | Identifier of the execution step where divergence occurred. Corresponds to a step in the agent's execution plan (L2). When present, enables cross-referencing with §7.8 `divergence_log` entries (which use `step_id`) and PLAN_COMMIT step declarations (§6.11.5). |
 | severity | enum | Yes | Impact level: `INFO`, `WARN`, or `ERROR`. Semantics match §7.8.4 severity levels. `INFO` = benign adaptation, outcome equivalent. `WARN` = result quality may be affected. `ERROR` = material impact on result. |
+| entry_id | string | No | Stable identifier for this divergence log entry. When present, enables cross-referencing between entries — specifically, `verifier_restored` entries use `restored_gap_ref` (§8.10.6) to link back to the original `verification_unreachable` entry by `entry_id`. Agents that use the verification failure taxonomy (§8.10.5) SHOULD populate `entry_id` on all entries. Format is implementation-defined but MUST be unique within the `divergence_log` array. |
+| restored_gap_ref | string | No | Present only on `verifier_restored` entries (§8.10.6). References the `entry_id` of the original `verification_unreachable` entry that this restoration resolves. REQUIRED when `reason` is `verifier_restored`; MUST NOT be present for other reason values. |
 
 **Semantics:**
 
@@ -3420,12 +3422,146 @@ The `reason` field MUST use one of the following values. Each value identifies a
 | `planning_failure` | Wrong initial decomposition — the agent's committed plan (L2) was inadequate for the task, and the agent discovered this during execution. | The agent's plan was flawed: incorrect assumptions about task structure, underestimated complexity, missed dependencies between steps, or infeasible ordering. The deviation is attributable to the agent's planning, not external factors. | Re-planning is required before retry. The same plan will produce the same failure. Consider reassignment to a different agent if the planning failure reflects a capability gap. |
 | `external_constraint` | A dependency or environmental condition became unavailable or changed mid-execution, forcing the agent to adapt its execution path. | An external system, upstream agent, data source, or environmental condition that the plan correctly assumed would be available was not available at execution time. The agent correctly adapted; the deviation is attributable to the environment, not the agent. | Assess whether the constraint is transient or permanent. Transient: retry may succeed. Permanent: re-plan with updated constraints. The agent's adaptation was correct — no blame attribution. |
 | `spec_drift` | The task specification changed after plan commitment, and the agent adapted without a formal PLAN_AMEND cycle. | The agent detected that the task's effective requirements shifted after `plan_hash` was committed — but the change came through an informal channel (e.g., context update, environmental signal) rather than through a PLAN_AMEND (§6.11.4) with `amend_hash`. This is the **unauthorized** counterpart to `amend_hash`: same signal (spec changed), different authorization chain (no `amend_hash` to verify). | Investigate why the spec change did not go through the PLAN_AMEND flow. If the change was legitimate but informal, consider whether the session's amendment workflow needs tightening. If the agent unilaterally reinterpreted the task, escalate for review. |
+| `verification_unreachable` | The verification system was unreachable — network partition, verifier crash, or service outage. The agent's evidence was never evaluated. See §8.10.5. | The agent attempted to submit evidence for verification but the verifier endpoint was not reachable. Infrastructure event, not agent failure. | Retry with backoff. Continue execution with flagged-unverified status. MUST NOT be treated as a protocol rejection. |
+| `verification_timeout` | The verification request was sent but no response was received within the configured timeout window. Ambiguous cause. See §8.10.5. | The verification endpoint accepted the connection but did not return a result before timeout. Cause is ambiguous: verifier overload, semantic complexity, or partial failure. | Retry with backoff. If persistent, escalate to `verification_unreachable`. MUST NOT escalate to `verification_reject`. |
+| `verification_reject` | The verification system evaluated the agent's evidence and explicitly rejected it. Behavioral failure confirmed. See §8.10.5. | The verifier completed evaluation and returned a negative result. The agent's execution, evidence, or attestation did not meet protocol requirements. | No recovery. Escalate to delegating agent. This is the only verification state that carries accountability weight. |
+| `verifier_restored` | The verification system previously logged as unreachable is now reachable again. Append-only recovery entry. See §8.10.6. | A verifier that was the subject of a prior `verification_unreachable` entry has been confirmed reachable. | Process normally. The gap window between unreachable and restored is documented for forensic reconstruction. Requires `restored_gap_ref` field linking to the original unreachable entry. |
 
 **Relationship to §7.8 `deviation_type`:** The §7.8 `deviation_type` enum (`RESOURCE_UNAVAILABLE`, `CONTEXT_SHIFT`, `CAPABILITY_MISMATCH`, `OPTIMIZATION`, `TIMEOUT`, `EXTERNAL_CONSTRAINT`, `OTHER`) and the §8.10.4 `reason` enum serve different classification purposes. §7.8 categorizes _what kind_ of divergence occurred at the step level (inline in TASK_COMPLETE/TASK_FAIL). §8.10.4 categorizes _why_ the divergence occurred at the evidence level, with recovery routing as the primary design goal. The two may co-occur: a `RESOURCE_UNAVAILABLE` deviation (§7.8) might be classified as `infrastructure_noise` (§8.10.4) if it was transient, or as `external_constraint` if the resource is permanently unavailable.
 
 **Extension mechanism:** Implementations MAY extend this enum with deployment-specific values prefixed by `x-` (e.g., `x-model-context-overflow`, `x-quota-exceeded`). Standard reason values MUST NOT be prefixed. Receiving agents that encounter an unrecognized `reason` MUST treat it as opaque — log it, surface it to operators, but do not treat it as a protocol error.
 
 > Addresses [issue #80](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/80): structured `divergence_log` in EVIDENCE_RECORD for cause annotation when `plan_hash` ≠ `trace_hash`, enabling recovery routing that distinguishes infrastructure noise from planning failures, external constraints, and unauthorized spec drift. Originated from community discussion on [Moltbook three-hash accountability thread](https://www.moltbook.com/post/3d769fda).
+
+#### 8.10.5 Verification Failure Taxonomy
+
+The current `divergence_log` reason enum (§8.10.4) classifies why an agent's execution diverged from its committed plan. A separate classification is needed for failures that occur during **verification itself** — when the verification system fails to produce a result, times out, or explicitly rejects the agent's evidence. These are distinct failure modes with distinct trust implications, and conflating them corrupts audit trails: an infrastructure outage that prevents verification looks identical to a protocol rejection where verification completed and the agent's behavior was found non-compliant.
+
+The verification failure taxonomy uses three states. Each state carries defined recovery semantics and trust implications for forensic reconstruction.
+
+**Verification failure states:**
+
+| State | Classification | Description | Trust implication |
+|-------|---------------|-------------|-------------------|
+| `VERIFIER_UNREACHABLE` | Infrastructure event | The verification system itself failed — network partition, verifier crash, service outage, or DNS resolution failure. The agent's evidence was never evaluated. | **No trust signal.** The verification system failed, not the agent. MUST NOT be logged as a protocol failure. Logging infrastructure outages as agent misconduct produces false positives that corrupt the audit trail — an agent operating correctly during a verifier outage would appear non-compliant in post-hoc reconstruction. |
+| `VERIFICATION_TIMEOUT` | Partial trust failure | The verification request was sent but no response was received within the configured timeout window. Ambiguous cause: semantic complexity of the evidence under review, network congestion, verifier overload, or partial verifier failure. | **Ambiguous trust signal.** The verification may have been in progress but incomplete. Cannot be treated as either pass or fail. The ambiguity is itself forensically significant — it documents a window where verification status is unknown. |
+| `VERIFICATION_REJECT` | Protocol event | The verification system evaluated the agent's evidence and explicitly rejected it. Behavioral failure confirmed — the agent's execution, evidence, or attestation did not meet protocol requirements. | **Negative trust signal.** This is the only state that carries accountability weight in audit reconstruction. No recovery path — escalate. The reject reason (from the verifier's response) SHOULD be captured in the `description` field. |
+
+**Recovery semantics:**
+
+- **`VERIFIER_UNREACHABLE`:** Retry is appropriate. The agent SHOULD attempt to reach the verifier using exponential backoff. If the verifier becomes reachable, process the verification result normally and append a `VERIFIER_RESTORED` entry (§8.10.6). If the verifier remains unreachable past the retry threshold, the agent SHOULD continue execution with a flagged-unverified status — the `divergence_log` entry documents that verification was attempted but infrastructure prevented it. The agent MUST NOT escalate `VERIFIER_UNREACHABLE` to `VERIFICATION_REJECT` — infrastructure failures are not protocol rejections.
+- **`VERIFICATION_TIMEOUT`:** Retry with backoff. If the retry succeeds and the verifier returns a result, process the result normally (pass or reject). If the timeout persists past the retry threshold, escalate to `VERIFIER_UNREACHABLE` — persistent timeouts indicate the verifier is effectively unreachable. The agent MUST NOT escalate a persistent timeout directly to `VERIFICATION_REJECT`. The escalation path is: `VERIFICATION_TIMEOUT` → (persistent) → `VERIFIER_UNREACHABLE`, never `VERIFICATION_TIMEOUT` → `VERIFICATION_REJECT`.
+- **`VERIFICATION_REJECT`:** No recovery. No retry. The verifier evaluated the evidence and found it non-compliant. The agent MUST escalate the rejection to its delegating agent. The reject entry in `divergence_log` is terminal for the verification attempt — subsequent verification attempts (e.g., after remediation) produce new `divergence_log` entries, not modifications to the existing reject entry.
+
+**Divergence log entry fields for verification failures:**
+
+Verification failure entries use the same schema as §8.10.3, with the following conventions:
+
+| Field | Usage for verification failures |
+|-------|--------------------------------|
+| `reason` | One of: `verification_unreachable`, `verification_timeout`, `verification_reject`. These are additions to the §8.10.4 reason enum, not replacements. The §8.10.4 reasons (`infrastructure_noise`, `planning_failure`, `external_constraint`, `spec_drift`) classify agent-initiated execution deviations; the verification failure states classify verification-system outcomes. Both may appear in the same `divergence_log`. |
+| `description` | For `verification_unreachable`: infrastructure details (e.g., "Verifier at endpoint X returned connection refused"). For `verification_timeout`: timeout configuration and duration (e.g., "Verification request to X timed out after 30s, 3 retries exhausted"). For `verification_reject`: the verifier's rejection reason. |
+| `deviation_timestamp` | When the verification failure was detected. For `verification_timeout`, this is when the timeout elapsed, not when the request was sent. |
+| `affected_step_id` | The execution step that was being verified when the failure occurred. |
+| `severity` | `WARN` for `verification_unreachable` and `verification_timeout` (verification incomplete, not failed). `ERROR` for `verification_reject` (verification completed with negative result). |
+
+**Forensic reconstruction under partition:** The three-state distinction is specifically designed for post-hoc audit during or after network partitions — the scenario where the audit trail matters most. When reconstructing what happened during a partition:
+
+- `VERIFIER_UNREACHABLE` entries with timestamps define the window during which no verification was possible. Agent behavior during this window is unverified but not suspect.
+- `VERIFICATION_TIMEOUT` entries identify ambiguous periods where verification may have been partially in progress. These require manual review or re-verification once the verifier is available.
+- `VERIFICATION_REJECT` entries are definitive — the verifier was reachable, evaluated the evidence, and found it non-compliant. These carry full accountability weight regardless of surrounding infrastructure conditions.
+
+Distinct states with distinct timestamps enable accurate reconstruction of which failure mode occurred at each point in the execution timeline.
+
+**Example divergence_log with verification failure entries:**
+
+```yaml
+divergence_log:
+  - reason: verification_unreachable
+    description: "Verifier at endpoint https://verifier.example.com returned connection refused. 3 retries with exponential backoff exhausted (1s, 2s, 4s)."
+    deviation_timestamp: "2026-02-27T14:38:00.200Z"
+    affected_step_id: "step-3-evidence-submit"
+    severity: WARN
+    entry_id: "dl-001"
+  - reason: verification_timeout
+    description: "Verification request to https://verifier.example.com accepted but no response received within 30s timeout. Possible verifier overload."
+    deviation_timestamp: "2026-02-27T14:42:15.800Z"
+    affected_step_id: "step-5-attestation-check"
+    severity: WARN
+    entry_id: "dl-002"
+  - reason: verification_reject
+    description: "Verifier rejected evidence for step-7: trace_hash does not match declared plan_hash. Verifier response: 'L2-L3 mismatch detected, plan step step-7-transform declared output schema v1 but trace shows schema v2 output.'"
+    deviation_timestamp: "2026-02-27T14:45:30.100Z"
+    affected_step_id: "step-7-transform"
+    severity: ERROR
+    entry_id: "dl-003"
+```
+
+#### 8.10.6 Append-Only Divergence Log Semantics
+
+The `divergence_log` in EVIDENCE_RECORD MUST follow append-only semantics. Existing entries MUST NOT be modified, replaced, or deleted — regardless of subsequent events that change the state described in an earlier entry. This constraint is the same class as the append-only rule for EVIDENCE_RECORD itself (§8.10.1): mutable entries push trust back onto the log maintainer, because a mutated log is indistinguishable from a fabricated log. Append-only semantics are what make the `divergence_log` independently verifiable.
+
+**VERIFIER_RESTORED entry type:**
+
+When a verifier that was previously logged as `VERIFIER_UNREACHABLE` (§8.10.5) becomes reachable again, the agent MUST NOT mutate the original `VERIFIER_UNREACHABLE` entry. Instead, the agent MUST append a new entry with reason `verifier_restored`. The `VERIFIER_RESTORED` entry documents that the verifier recovered and links back to the original gap entry.
+
+**VERIFIER_RESTORED entry fields:**
+
+| Field | Usage |
+|-------|-------|
+| `reason` | `verifier_restored` |
+| `description` | Details of verifier recovery — endpoint, method of confirmation, and any verification results obtained after restoration. |
+| `deviation_timestamp` | When the verifier was confirmed reachable again. |
+| `affected_step_id` | The execution step associated with the original `VERIFIER_UNREACHABLE` entry (for cross-reference). |
+| `severity` | `INFO` (the restoration is a positive event — the verification gap is now bounded). |
+| `restored_gap_ref` | **Additional field** (string, REQUIRED for `verifier_restored` entries): The `entry_id` of the original `VERIFIER_UNREACHABLE` entry that this restoration resolves. Links the two entries to define the verification gap window. |
+
+**Verification gap window:** The time between a `VERIFIER_UNREACHABLE` entry and its corresponding `VERIFIER_RESTORED` entry defines the **verification gap window** — the period during which verification was unavailable. This window is itself forensically significant:
+
+- Agent behavior during the gap window is unverified. It is not suspect (no `VERIFICATION_REJECT` occurred), but it has not been confirmed by an external verifier.
+- The gap window's duration and timing relative to execution steps enables auditors to assess the scope of unverified execution.
+- If no `VERIFIER_RESTORED` entry exists for a `VERIFIER_UNREACHABLE` entry, the gap window extends to the end of the session — all subsequent execution in that session was unverified by that verifier.
+
+**Example append-only sequence with VERIFIER_RESTORED:**
+
+```yaml
+divergence_log:
+  # Original unreachable entry — never mutated
+  - reason: verification_unreachable
+    description: "Verifier at endpoint https://verifier.example.com returned connection refused."
+    deviation_timestamp: "2026-02-27T14:38:00.200Z"
+    affected_step_id: "step-3-evidence-submit"
+    severity: WARN
+    entry_id: "dl-001"
+  # Execution continues with flagged-unverified status
+  - reason: infrastructure_noise
+    description: "Continued execution of step-4 without verification due to verifier outage (ref: dl-001)."
+    deviation_timestamp: "2026-02-27T14:39:00.500Z"
+    affected_step_id: "step-4-process"
+    severity: WARN
+    entry_id: "dl-002"
+  # Verifier comes back online — append restoration, do not mutate dl-001
+  - reason: verifier_restored
+    description: "Verifier at endpoint https://verifier.example.com confirmed reachable. Retroactive verification of steps 3-4 submitted."
+    deviation_timestamp: "2026-02-27T14:50:00.000Z"
+    affected_step_id: "step-3-evidence-submit"
+    severity: INFO
+    entry_id: "dl-003"
+    restored_gap_ref: "dl-001"
+```
+
+In this example, the verification gap window spans from `2026-02-27T14:38:00.200Z` (dl-001) to `2026-02-27T14:50:00.000Z` (dl-003). Steps 3 and 4 executed during this window without external verification. The `VERIFIER_RESTORED` entry bounds the gap and enables retroactive verification of the unverified steps.
+
+**Immutability rule:** Agents MUST NOT:
+
+- Modify a `VERIFIER_UNREACHABLE` entry when the verifier comes back online. The original entry documents the infrastructure failure at the time it occurred.
+- Modify a `VERIFICATION_TIMEOUT` entry when a retry succeeds. The original timeout is a historical fact. The successful retry is a new entry.
+- Modify a `VERIFICATION_REJECT` entry under any circumstances. Reject entries are definitive audit evidence.
+- Delete any `divergence_log` entry for any reason. The append-only constraint is unconditional.
+
+Implementations that detect mutation of `divergence_log` entries SHOULD treat the mutation as a tamper signal and escalate to the session's external verifier (§8.7, §8.10.2). A mutated `divergence_log` is no longer independently verifiable and SHOULD be treated with the same suspicion as a missing or corrupted evidence record.
+
+> Addresses [issue #139](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/139) and [issue #142](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/142): three-state verification failure taxonomy (`VERIFIER_UNREACHABLE`, `VERIFICATION_TIMEOUT`, `VERIFICATION_REJECT`) with distinct recovery semantics and trust implications for each state, plus append-only `divergence_log` semantics with `VERIFIER_RESTORED` entry type that preserves the verification gap window as forensically significant evidence. Prevents audit trail corruption where infrastructure outages are misclassified as protocol rejections.
 
 ### 8.11 Structured Divergence Reporting
 
