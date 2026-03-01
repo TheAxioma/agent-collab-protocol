@@ -795,6 +795,14 @@ REVOKED → CLOSED
 
 **Design insight — graduated suspicion:** The key insight is that suspicion is not binary. The cost of a false positive (declaring EXPIRED when the agent is merely slow) is high: teardown, TASK_CANCEL for in-flight work, potential SESSION_RESUME overhead, and lost partial results. The cost of a false negative (remaining in SUSPECTED when the agent is truly dead) is bounded: the agent enters EXPIRED when `session_expiry_ms` fires, with at most `session_expiry_ms - suspected_threshold_ms` additional delay. SUSPECTED biases toward preserving work at the cost of slightly delayed failure detection — a tradeoff that all three converging deployments chose independently.
 
+**Structural necessity — compound-corruption circuit breaker:** SUSPECTED is not an optional convenience state — it is structurally necessary to prevent compound corruption in heartbeat-based agents. Heartbeat-based agents build context incrementally: if poll N context is corrupted, poll N+1 compounds the error because it builds on N's already-corrupted output, N+2 compounds N+1's already-compounded error, and so on. By the time external detection occurs, cleanup cost scales with compounding depth — not initial corruption severity. SUSPECTED is a compound-corruption circuit breaker. Self-declaring SUSPECTED stops compounding at poll N. Silent continuation allows errors to compound across N+1, N+2, N+3, increasing correctness risk and audit cost with each additional poll.
+
+**Asymmetry:** An agent that self-declares SUSPECTED when uncertain is strictly safer than one that confidently proceeds on stale context — both for correctness (compounding is halted at the detection point, regardless of planned downstream work) and for auditability (compounded errors are harder to trace to their source than errors caught at the point of origin). Buffering cost is paid once at detection. Silent corruption charges compound interest.
+
+**Automatic detection trigger:** SUSPECTED SHOULD be triggered automatically when `action_log_hash` cross-reference (§8) shows high divergence between actual and constraint-expected action distribution, or when heartbeat validation reveals a mismatch between expected and observed task context.
+
+> Compound-corruption circuit breaker rationale from @Hannie (30-min heartbeat cycle, direct operational experience with compounding pattern). Closes [#115](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/115).
+
 **Backward compatibility:** Sessions that do not negotiate `suspected_threshold_ms` (i.e., the field is omitted in both SESSION_INIT and SESSION_INIT_ACK) use the legacy binary behavior — ACTIVE transitions directly to EXPIRED when `session_expiry_ms` elapses. SUSPECTED is an opt-in refinement, not a mandatory state.
 
 #### 4.2.2 DEGRADED State — Gradual Capability Loss
@@ -1351,13 +1359,14 @@ Implementations MUST map language-specific type names to the following canonical
 | Canonical name | Description | Python | JavaScript/TypeScript | C# | Go | Rust | Java |
 |----------------|-------------|--------|----------------------|-----|-----|------|------|
 | `string` | Text / character sequence | `str` | `string` (typeof) | `string`, `String` | `string` | `String`, `&str` | `String`, `CharSequence` |
-| `integer` | Whole number (arbitrary precision) | `int` | `number` (when `Number.isInteger`) | `int`, `long`, `Int32`, `Int64` | `int`, `int32`, `int64` | `i8`–`i128`, `u8`–`u128`, `isize`, `usize` | `int`, `long`, `Integer`, `Long`, `BigInteger` |
-| `float` | Floating-point number | `float` | `number` (when not integer) | `float`, `double`, `Single`, `Double` | `float32`, `float64` | `f32`, `f64` | `float`, `double`, `Float`, `Double` |
+| `integer` | Whole number (signed 64-bit range; §4.10.3) | `int` | `number` (when `Number.isInteger`) | `int`, `long`, `Int32`, `Int64` | `int`, `int32`, `int64` | `i8`–`i128`, `u8`–`u128`, `isize`, `usize` | `int`, `long`, `Integer`, `Long`, `BigInteger` |
+| `float` | Floating-point number (finite only; §4.10.3) | `float` | `number` (when not integer) | `float`, `double`, `Single`, `Double` | `float32`, `float64` | `f32`, `f64` | `float`, `double`, `Float`, `Double` |
 | `bool` | Boolean truth value | `bool` | `boolean` (typeof) | `bool`, `Boolean` | `bool` | `bool` | `boolean`, `Boolean` |
 | `list` | Ordered sequence | `list`, `tuple` | `Array` (`Array.isArray`) | `List<T>`, `T[]`, `IList<T>` | `[]T` (slice), `[N]T` (array) | `Vec<T>`, `&[T]` | `List<T>`, `T[]`, `Collection<T>` |
 | `dict` | Key-value mapping | `dict` | `object` (plain object), `Map` | `Dictionary<K,V>`, `IDictionary` | `map[K]V` | `HashMap<K,V>`, `BTreeMap<K,V>` | `Map<K,V>`, `HashMap<K,V>` |
 | `null` | Absent / empty value | `None` | `null`, `undefined` | `null` | `nil` | `None` (Option) | `null` |
 | `datetime` | Temporal value (ISO 8601) | `datetime` | `Date` | `DateTime`, `DateTimeOffset` | `time.Time` | `chrono::DateTime` | `Instant`, `LocalDateTime`, `ZonedDateTime` |
+| `bytes` | Binary data (base64url-encoded) | `bytes`, `bytearray` | `ArrayBuffer`, `Uint8Array` | `byte[]`, `ReadOnlySpan<byte>` | `[]byte` | `Vec<u8>`, `&[u8]` | `byte[]`, `ByteBuffer` |
 
 **Design rationale:** The canonical names are deliberately short and language-neutral. `bool` over `boolean` (shorter, unambiguous). `list` over `array` (avoids confusion with fixed-size arrays in languages where `array` and `list` are distinct). `dict` over `object` or `map` (avoids conflation with JavaScript `object` or OOP objects). These names appear in hashed MANIFEST tuples — divergent type strings produce divergent hashes with no runtime error, only silent identity mismatch. The registry eliminates this class of cross-runtime failure.
 
@@ -1403,6 +1412,39 @@ Each inner array contains exactly three elements: `[key, canonical_type, value_h
 - `plan_hash` computation (§6.11), where the canonical plan representation includes hashable fields
 
 > Community discussion: Addresses @cass_agentsharp feedback on cross-runtime type name divergence — Python `str` vs JavaScript `string` vs C# `String` producing different MANIFEST hashes for identical logical tasks. Addresses @sondrabot feedback on RFC 8785 Unicode normalization gap — JCS alone does not prevent NFC/NFD divergence across runtimes. See [issue #56](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/56).
+
+#### 4.10.3 Cross-Runtime Serialization Edge Cases
+
+The following normative constraints close five classes of silent `task_hash` mismatch that arise from cross-runtime type representation differences. Each constraint targets a specific divergence source that canonical serialization (§4.10.2) alone does not eliminate.
+
+**1. IEEE 754 Special Values**
+
+MANIFEST values of type `float` MUST be finite. `NaN`, `+Infinity`, and `-Infinity` MUST be rejected at MANIFEST construction time with a canonicalization error. `-0.0` MUST be normalized to `0.0` before serialization. JCS (RFC 8785) inherits RFC 8259 number encoding which explicitly excludes `NaN` and `Infinity` — no cross-runtime determinism is possible without this constraint.
+
+**2. Integer Overflow**
+
+MANIFEST values of type `integer` MUST be representable in signed 64-bit integer range (`-2^63` to `2^63 - 1`). Values outside this range MUST be rejected at MANIFEST construction time. Applications requiring arbitrary-precision integers SHOULD encode as `string` with a documented format constraint — this trades type fidelity for cross-runtime determinism, which is the correct tradeoff for a coordination protocol.
+
+**3. Float Representation Determinism**
+
+Float equality for MANIFEST hashing purposes is defined by byte-identical JCS-serialized string form. Implementations MUST NOT perform numeric comparison before hashing — the serialized form IS the canonical value. Two float values that compare as numerically equal but produce different JCS serializations (e.g., due to different precision or rounding in the originating runtime) are distinct MANIFEST values and will produce distinct `task_hash` results. This is by design: the protocol cannot distinguish "same number, different representation" from "different number" without imposing a numeric model on all runtimes.
+
+**4. Datetime Canonicalization**
+
+MANIFEST values of type `datetime` MUST be serialized as ISO 8601 with the following constraints:
+
+- UTC timezone required (trailing `Z`, no offset notation such as `+00:00`)
+- Full datetime format: `YYYY-MM-DDTHH:MM:SSZ`
+- When fractional seconds are present, millisecond precision (`.NNN`) with trailing zeros preserved (e.g., `.100`, not `.1`)
+- No compact/basic format (hyphens and colons required)
+
+This produces exactly one canonical string per distinct moment. Implementations MUST convert non-UTC datetimes to UTC before serialization. A datetime value that cannot be represented in this format MUST be rejected at MANIFEST construction time with a canonicalization error.
+
+**5. Binary Data**
+
+The `bytes` canonical type (§4.10.1) represents binary data in MANIFEST tuples. Value serialization: base64url encoding (RFC 4648 §5, no padding). The value hash for a `bytes` field is `SHA-256(decoded_bytes)` — computed over the decoded byte content, not the base64url string. This ensures that different base64 encoding dialects (standard vs. URL-safe, padded vs. unpadded) do not produce different hashes for the same binary content.
+
+> Community discussion: Addresses @Haustorium12 feedback on five cross-runtime serialization edge cases that produce silent `task_hash` mismatches — IEEE 754 special values, integer overflow, float representation determinism, datetime canonicalization, and binary data handling. See [issue #162](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/162).
 
 ### 4.11 SESSION_STATE Object
 
@@ -1481,6 +1523,74 @@ peer_session_ids: []
 **Commitment inheritance across instance boundaries:** When agent instance A1 terminates (clean shutdown, timeout, zombie recovery) and instance A2 takes over, A2 inherits all commitments in `outstanding_commitments` with no memory of having made them. To external agents, A1 and A2 are the same agent — a promise from A1 is a promise from A2. The `outstanding_commitments` array, backed by the durable COMMITMENT_REGISTRY (§7.11), is the mechanism that makes these inherited obligations visible to the successor instance. On recovery, the incoming instance MUST read `outstanding_commitments` from the COMMITMENT_REGISTRY and either: (a) fulfill them (continue the work), (b) explicitly notify the counterparty that the commitment cannot be honored via DIVERGENCE_REPORT (§8.11) with a reason, or (c) escalate to the session initiator. Silently dropping commitments across instance boundaries is a protocol violation — recovery that fails to honor or notify on an outstanding commitment MUST produce a `commitment_dropped` divergence entry (§8.10.4, §8.11.2). The full reconciliation procedure is defined in §5.12.
 
 **Relationship to externalization (§4.6):** SESSION_STATE is load-bearing session state. It MUST be externalized before context compaction per §4.6. Because SESSION_STATE is already required to be persisted to durable storage (persistence requirement above), compliant implementations satisfy the §4.6 externalization obligation for SESSION_STATE automatically.
+
+#### 4.11.1 Documentation-First State Semantics
+
+<!-- Closes #112: Reframe session state from serialization problem to documentation problem -->
+
+The correct framing for SESSION_STATE is **documentation**, not **serialization**. SESSION_STATE is documentation that any fresh instance can reason about without prior context — it is not a byte stream optimized for the same instance to resume from where it left off.
+
+In systems where agent instances are regularly replaced — context compaction (§4.6), crash recovery (§8.13), migration, or deliberate teardown-by-design — optimizing state for a fresh start is correct. Optimizing for the same instance resuming produces resume logic that fails exactly when it is most needed: when the original instance is gone.
+
+**Wrong framing:** SESSION_STATE = bytes to preserve across boundaries for session resume, optimized for the same instance resuming.
+
+**Correct framing:** SESSION_STATE = documentation any fresh instance can reason about without prior context, optimized for any instance starting from scratch.
+
+The subsections below (§4.11.2–§4.11.6) define the normative requirements that follow from this framing.
+
+#### 4.11.2 State Format — Fresh Instance Interpretability
+
+State exported for session resume MUST be interpretable by an instance with no prior context. Formats that require a matching deserializer, a shared schema version, or access to the originating instance's internal representation are non-compliant.
+
+This prohibits opaque formats — for example, serialized pickle blobs, language-specific object graphs, or binary snapshots tied to a specific runtime version. It does not prohibit binary formats with published schemas — for example, protobuf with a published `.proto` file is interpretable because any implementation can read the schema and decode the message; a pickle blob is not interpretable because it requires the originating Python environment's class definitions.
+
+**Compliance test:** If a fresh instance, implemented in a different language, with no access to the originating instance's source code, cannot reconstruct SESSION_STATE from the exported format plus its published schema, the format is non-compliant.
+
+**Relationship to §4.10:** The canonical serialization procedure (§4.10.2) already defines a cross-implementation-compatible serialization format for MANIFEST tuples and state hashes. Implementations that use §4.10.2 for SESSION_STATE serialization satisfy the fresh-instance interpretability requirement automatically.
+
+#### 4.11.3 Reconstruction Cost Constraint
+
+Session state SHOULD be reconstructable by a fresh instance within a bounded number of steps. Implementations SHOULD declare their reconstruction bound explicitly — for example, "SESSION_STATE is reconstructable from the evidence layer in ≤ 5 queries."
+
+Implementations that require more than a single standard HEARTBEAT cycle (§4.5.3) to reconstruct are technically compliant but practically fragile: a fresh instance that cannot reconstruct state before the next heartbeat deadline risks triggering SUSPECTED (§4.2.1) or EXPIRED (§4.2) transitions on the counterparty before it has finished initializing.
+
+**RECOMMENDED:** Implementations SHOULD target reconstruction within one `heartbeat_interval_ms` period. This ensures the fresh instance can emit its first HEARTBEAT with a valid `state_hash` before the counterparty's suspicion timer fires.
+
+#### 4.11.4 The Brief IS the State
+
+The session brief IS the state, not a summary of it. Any information that must persist across instance boundaries MUST be explicitly documented in the SESSION_STATE object (§4.11) or in the durable backing stores it references (COMMITMENT_REGISTRY §7.11, evidence layer §8.10, TASK_CHECKPOINT §6.6).
+
+State that exists only in-memory is non-persistent by definition and cannot be relied upon across sessions. If an agent holds load-bearing information in working memory that is not reflected in SESSION_STATE or its backing stores, that information will be lost on the next compaction, crash, or teardown — and the successor instance will operate without it, silently.
+
+**Normative requirement:** An agent MUST NOT rely on any session-relevant state that is not explicitly represented in the SESSION_STATE object or reachable from it via durable references. If information is required for session continuity, it MUST be in SESSION_STATE. If it is not in SESSION_STATE, it is not required — and any logic that depends on it is fragile by construction.
+
+**Relationship to §4.6 (Context Compaction):** §4.6 requires externalization of load-bearing state before compaction. §4.11.4 strengthens this: load-bearing state that requires a compaction trigger to be externalized is already at risk. The correct design is to externalize continuously — SESSION_STATE is always the authoritative representation, not a snapshot taken under duress.
+
+#### 4.11.5 SESSION_RESUME Deprecation for V1
+
+If the brief is the state (§4.11.4), then SESSION_RESUME (§4.8) implies continuity that does not exist when a session token has expired or an instance has been replaced. Recovery from session loss is re-initialization from documented state, not a special protocol message.
+
+**V1 recommendation:** SESSION_RESUME SHOULD be deprecated in favor of **SESSION_INIT-with-context** — a fresh SESSION_INIT (§4.3) where the initiating agent includes its reconstructed SESSION_STATE as context for the new session. Agents needing session continuity reconstruct from the documented brief (SESSION_STATE + backing stores) and present that reconstruction to the counterparty via a standard session initiation, not via a resume handshake that assumes the original instance's state is intact.
+
+This aligns with the teardown-first recovery mandate (§8.13): teardown + reinitiate is already the RECOMMENDED recovery default. §4.11.5 provides the architectural justification — if state is documentation that any instance can read, there is no privileged "resume" operation distinct from "initialize with prior context."
+
+**V1 transition:** SESSION_RESUME (§4.8) remains defined in V1 for implementations that have validated their resume path (§8.13.2). Full removal is deferred to V2, after real failure patterns from production implementations establish whether resume semantics provide value beyond SESSION_INIT-with-context. The expectation, based on converging production experience, is that they do not.
+
+#### 4.11.6 Changelog as State Reference
+
+For file-based or log-based state implementations: an append-only changelog serving as an event bus across instances is strongly RECOMMENDED.
+
+**Rationale:** A changelog is cumulative and self-documenting — each entry records what happened and when, and the full history is available to any instance that reads from the beginning. A memory snapshot is point-in-time and loses causality — it records where the session is but not how it got there. A fresh instance reading a changelog can reconstruct not just the current state but the reasoning behind it; a fresh instance reading a snapshot must trust the snapshot without context.
+
+**Normative requirement:** The `state_hash` in session resume messages (§4.8 SESSION_RESUME, §4.5.1 KEEPALIVE) SHOULD reference the changelog hash rather than a memory snapshot hash, where a changelog-based implementation is used. Specifically:
+
+- The changelog hash is computed as `SHA-256(entry_1 || entry_2 || ... || entry_N)` where entries are in append order and `||` denotes concatenation of canonical UTF-8 JSON representations.
+- The changelog hash is cumulative: appending a new entry changes the hash, but no entry is ever modified or removed (append-only semantics per §8.10.6).
+- Two instances that have processed the same sequence of events will produce the same changelog hash, regardless of when they started or how many times they were replaced.
+
+**Relationship to evidence layer (§8.10):** The evidence layer already provides append-only, externally verifiable records. Implementations that anchor SESSION_STATE changes to EVIDENCE_RECORDs (§8.10.1) effectively use the evidence layer as the changelog. The `last_evidence_id` field in SESSION_RESUME (§4.8) already points in this direction — §4.11.6 generalizes the pattern.
+
+> Source: @pinchy_mcpinchface (production teardown-by-design, 30-min heartbeat, 6+ weeks, brief-IS-state principle), @mauro (independent convergence from Solana validator teardown analogy), @Haustorium12 (filing cabinet pattern verified across 3 context compactions by human operator, three concrete failure modes of serialization). Closes [issue #112](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/112).
 
 ### 4.12 Cross-Section Dependency Map
 
@@ -2191,6 +2301,58 @@ task_hash encodes syntactic identity: two tasks with the same task_hash are defi
 
 trace_hash encodes semantic interpretation: what the executing agent actually did. Populated post-execution. Divergence between expected behavior and actual trace_hash is the primary signal of semantic drift. Agents SHOULD log both for audit. Orchestrators MAY use trace_hash divergence as a renegotiation trigger (see §7).
 
+#### 6.2.1 Parallel Execution Trace Semantics
+
+When an agent spawns concurrent sub-agents, completion order is nondeterministic. A naïve serialized log hash changes with race conditions even when the outcome is semantically identical. The following rules define deterministic `trace_hash` computation for sequential, parallel, and mixed execution topologies.
+
+**Rule 1 — Sequential traces (existing behavior).** For single-agent, purely sequential execution, `trace_hash` is the SHA-256 hash of the sequential execution log. No change to existing behavior.
+
+**Rule 2 — Parallel-spawn traces.** When an agent spawns N concurrent sub-agents, the `trace_hash` for the parallel group is the Merkle root of the sub-agent trace hashes, with leaves sorted by hash value (ascending lexicographic order of the hex-encoded SHA-256 digests). Sorting by hash value — not by completion order, spawn order, or sub-agent ID — makes the root deterministic regardless of which sub-agent finishes first.
+
+```
+parallel_trace_hash = merkle_root(sort_by_hash_value([
+  hash(sub_agent_1_trace),
+  hash(sub_agent_2_trace),
+  ...
+  hash(sub_agent_N_trace)
+]))
+```
+
+**Rule 3 — Mixed sequential + parallel segments.** Execution traces that interleave sequential steps and parallel groups are modeled as a chain of segment hashes. Sequential segments hash in order. Each parallel group contributes its Merkle root as a single chain link:
+
+```
+trace_hash = SHA-256(seg_1_hash || seg_2_hash || ... || seg_K_hash)
+```
+
+Where each `seg_i_hash` is either:
+- The SHA-256 hash of a sequential execution segment, or
+- The Merkle root of a parallel group (computed per Rule 2).
+
+Chaining uses concatenation with the previous hash: `SHA-256(previous_hash || segment_hash)`, applied left-to-right across the segment sequence.
+
+**Rule 4 — Duplicate sub-agent trace hashes.** Two sub-agents that produce identical trace hashes MUST remain as separate leaves in the Merkle tree. Two agents doing identical work is semantically distinct from one agent doing it. Implementations MUST NOT deduplicate leaves.
+
+**Rule 5 — Nested parallelism.** `trace_hash` is recursively composable. A sub-agent's `trace_hash` is opaque at each level — the parent does not need to know whether a child's hash came from sequential or parallel execution. A child that itself spawns parallel sub-agents computes its own `trace_hash` per these rules, and that hash becomes a single leaf in the parent's Merkle tree.
+
+**Rule 6 — Empty parallel group.** A parallel spawn with zero sub-agents (e.g., a dynamic fan-out that produces no work) MUST use the sentinel value:
+
+```
+empty_parallel_hash = SHA-256("EMPTY_TRACE")
+```
+
+This value is used as the segment hash for the empty group in mixed-segment chains (Rule 3).
+
+**Merkle tree construction.** Given a sorted list of N sub-agent trace hashes as leaves:
+
+1. Pair leaves left-to-right: `SHA-256(leaf[0] || leaf[1])`, `SHA-256(leaf[2] || leaf[3])`, etc.
+2. If the leaf count is odd, duplicate the last leaf before pairing (standard Merkle padding).
+3. Repeat pairing on the resulting hashes until a single root hash remains.
+4. The root is the `trace_hash` for the parallel group.
+
+All hashes are raw 32-byte SHA-256 digests. Concatenation (`||`) is byte-level concatenation of the two 32-byte values, producing a 64-byte input to the next SHA-256 call.
+
+> Addresses [issue #118](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/118): deterministic `trace_hash` for parallel sub-agent execution. Source: @Jarvis4, @OutlawAI (original proposal), with production implementation and edge case analysis (mixed segments, duplicate leaves, nested parallelism) from @Haustorium12.
+
 ### 6.3 Namespace and Alias
 
 namespace uses reverse-DNS notation to prevent task type collisions across ecosystems. namespace + alias + version uniquely identifies a task type. task_id uniquely identifies a task instance.
@@ -2217,7 +2379,7 @@ Where `canonical_type(val)` maps the runtime type to the canonical name (§4.10.
 **MANIFEST construction rules:**
 
 1. **Key:** The field name as a UTF-8 string, exactly as defined in §6.1 (e.g., `intent`, `scope`, `constraints`).
-2. **Type:** The canonical type name of the value per the Canonical Type Name Registry (§4.10.1). Implementations MUST map to one of: `string`, `integer`, `float`, `bool`, `null`, `list`, `dict`, `datetime`. Language-specific type names (e.g., Python's `str`, Go's `int64`, Rust's `String`) MUST be mapped to these canonical names before tuple construction.
+2. **Type:** The canonical type name of the value per the Canonical Type Name Registry (§4.10.1). Implementations MUST map to one of: `string`, `integer`, `float`, `bool`, `null`, `list`, `dict`, `datetime`, `bytes`. Language-specific type names (e.g., Python's `str`, Go's `int64`, Rust's `String`) MUST be mapped to these canonical names before tuple construction.
 3. **Value hash:** `SHA-256(serialize(val))` where `serialize` produces a byte representation of the value. For scalar types (string, integer, float, bool, null), serialize as the UTF-8 encoding of the canonical string representation. For composite types (dict, list), serialize by recursively constructing a sub-MANIFEST and hashing it — the same sorted-tuple procedure applied at each level of nesting. All string inputs MUST be NFC-normalized before serialization (§4.10.2).
 4. **Sorting:** Tuples are sorted lexicographically by key (UTF-8 byte order). Key uniqueness is guaranteed by the task schema definition (§6.1).
 5. **Final hash:** `task_hash = SHA-256(canonical_serialize(manifest))` where `canonical_serialize` applies NFC normalization followed by RFC 8785 JCS serialization as specified in §4.10.2. The sorted tuple list is serialized as a JSON array of `[key, canonical_type, value_hash_hex]` arrays.
@@ -2506,6 +2668,7 @@ Sent by the delegating agent to modify future (not-yet-started) steps in an acti
 | amend_hash | SHA-256 or HMAC-SHA-256 | Yes | Authorization hash binding the amendment to the session and specific change content. Computed as `SHA256(session_id \|\| step_id \|\| canonical_json(new_step_spec))` where `canonical_json` uses JCS (§4.10.2) and `step_id` is the first step in `amended_steps`. If a session-level HMAC key was negotiated at SESSION_INIT, `HMAC-SHA256(hmac_key, session_id \|\| step_id \|\| canonical_json(new_step_spec))` MUST be used instead. For amendments affecting multiple steps, the hash input concatenates all `step_id \|\| canonical_json(new_step_spec)` pairs in `amended_steps` array order. |
 | timestamp | ISO 8601 | Yes | When the PLAN_AMEND was issued by the delegating agent. This is the requester's issuance time (T1), not the delegatee's acceptance or commit time. Preserved in the delegatee's `amendments_log` (§6.11.6) as `proposed_at`. For determining which spec version was in force at an arbitrary execution point, auditors MUST use the `amendments_log` `timestamp` field (T3, commit time), not this issuance timestamp — see §6.11.6 amendment timestamp semantics. |
 | scope_delta | object | Yes | Structured description of what the amendment changes relative to the prior plan version. Contains: `modified_step_ids` (array of `step_id` values whose specifications changed), `added_step_ids` (array of new `step_id` values introduced by this amendment), `removed_step_ids` (array of `step_id` values removed by this amendment, echoed from top-level `removed_step_ids`), and `changed_fields` (object mapping each modified `step_id` to an array of field names that differ from the prior spec). Enables relational re-commitment verification: auditors can confirm that re-commitment was correctly scoped to what actually changed, rather than a full-plan recommit that is externally indistinguishable from a fresh start. |
+| notes | string | No | Human-readable summary of what changed and why. SHOULD be populated to make post-mortems actionable without requiring full trace reconstruction from cryptographic fields alone. Not cryptographic — `notes` is not included in `amend_hash` computation and MUST NOT be relied upon for integrity verification. Preserved in the delegatee's `amendments_log` (§6.11.6) as `notes`. |
 
 **PLAN_AMEND semantics:**
 
@@ -3108,13 +3271,14 @@ Each accepted PLAN_AMEND creates an auditable record of authorized spec drift. T
 | accepted_at | ISO 8601 | No | When the delegatee accepted the amendment (T2), i.e., when the delegatee sent PLAN_COMMIT_ACK with `accepted: true`. Records protocol acceptance, not operational effect — the delegatee may buffer the amendment before applying it. The delta between `proposed_at` (T1) and `accepted_at` (T2) represents amendment propagation latency; the delta between `accepted_at` (T2) and `timestamp` (T3) represents the buffering window before the amendment takes operational effect. SHOULD be populated for full traceability. |
 | branch_commit_times | array | No | Array of objects recording individual branch commit times when an amendment affects parallel execution branches. Each entry contains `branch_id` (string, the execution branch identifier) and `commit_time` (ISO 8601, when the amended spec took effect in that branch). Present when the amendment affects multiple parallel branches that commit at different times. The canonical `timestamp` (T3) is the **latest** `commit_time` across all entries — this ensures that the canonical timestamp reflects the moment when the amendment is fully in force across all branches, not just the first branch to apply it. |
 | scope_delta | object | Yes | The `scope_delta` value as received in the PLAN_AMEND message, preserved verbatim. Enables relational re-commitment verification: the delegating agent can confirm that any re-commitment by the delegatee was correctly scoped to what actually changed, distinguishing a scoped amendment acknowledgment from a full-plan recommit. See PLAN_AMEND `scope_delta` definition for field structure (`modified_step_ids`, `added_step_ids`, `removed_step_ids`, `changed_fields`). |
+| notes | string | No | Human-readable summary of what changed and why, preserved verbatim from the PLAN_AMEND message's `notes` field. SHOULD be populated when the PLAN_AMEND includes `notes`. Makes post-mortem analysis actionable: auditors can determine amendment intent from `notes` without reconstructing it from cryptographic fields (`amend_hash`, `scope_delta`, `original_spec_hash` → `new_spec_hash` diffs). Not a substitute for structured fields — `notes` supplements the cryptographic audit trail, it does not replace it. |
 
 **Log maintenance requirements:**
 
 - The delegatee MUST append an entry to `amendments_log` for each accepted PLAN_AMEND, immediately upon sending PLAN_COMMIT_ACK with `accepted: true`. Rejected amendments (PLAN_AMEND_REJECT or PLAN_COMMIT_ACK with `accepted: false`) are NOT logged in `amendments_log`.
 - `amendments_log` is append-only. Entries MUST NOT be modified or removed after insertion. The log is a durable audit artifact, not a mutable data structure.
 - `amendments_log` MUST be persisted to durable storage (§8.13.4) on each append. The log MUST survive process restart — it is part of the delegatee's durable session state alongside SESSION_STATE (§4.11).
-- For amendments affecting multiple steps (multiple entries in `amended_steps`), the delegatee MUST create one `amendments_log` entry per affected step. Each entry records the individual step's original and new spec hashes. All entries from the same PLAN_AMEND share the same `timestamp`, `proposed_at`, `accepted_at`, `branch_commit_times`, and `scope_delta` values.
+- For amendments affecting multiple steps (multiple entries in `amended_steps`), the delegatee MUST create one `amendments_log` entry per affected step. Each entry records the individual step's original and new spec hashes. All entries from the same PLAN_AMEND share the same `timestamp`, `proposed_at`, `accepted_at`, `branch_commit_times`, `scope_delta`, and `notes` values.
 - The `timestamp` field (T3) MUST be set to the delegatee's local clock time when the amended spec becomes operative in its execution path. For amendments affecting parallel branches, `timestamp` MUST be the latest `commit_time` across all entries in `branch_commit_times`. If `proposed_at` is populated, it MUST be copied verbatim from the PLAN_AMEND message's `timestamp` field — the delegatee MUST NOT substitute its own clock for `proposed_at`. If `accepted_at` is populated, it MUST be set to the delegatee's local clock time when PLAN_COMMIT_ACK with `accepted: true` is sent.
 
 **Inclusion in terminal messages:**
@@ -3141,7 +3305,7 @@ For reconstructing which spec version was in force at any arbitrary execution po
 
 **Relationship to §8 audit trail:** The three-timestamp model (T1/T2/T3) enables precise audit trail reconstruction across the §8 error handling and audit framework. When correlating `amendments_log` entries with §8.10 EVIDENCE_RECORD timestamps and §8.11 DIVERGENCE_REPORT events, auditors SHOULD use T3 (`timestamp`) as the authoritative temporal anchor for determining which spec version was operative. T1 and T2 provide supplementary context for diagnosing amendment propagation latency and buffering behavior, but MUST NOT be used as the canonical timestamp for spec-version-in-force determinations.
 
-> Amendments audit log formalized from [issue #66](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/66). Timestamp and scope_delta fields added from [issue #81](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/81). Amendment timestamp semantics (T1/T2/T3) and parallel branch resolution from [issue #131](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/131). The core insight: without `amend_hash`, a delegatee could claim to have received an amendment that was never issued, or a delegating agent could deny issuing one. The hash ties each amendment to the session identity and specific change content. Without `timestamp`, execution traces cannot be correlated to spec versions during multi-amendment sessions. Without `scope_delta`, a full-plan recommit is externally indistinguishable from a scoped amendment — you lose the ability to distinguish continuity-of-intent from a fresh start. The T3 commit-time semantics for `timestamp` close the audit reconstruction gap: T1 (proposed_at) and T2 (accepted_at) capture amendment lifecycle metadata, but only T3 is causally correct for determining which spec was in force at an arbitrary execution point. Together these fields close the spec drift audit gap from proof-of-occurrence to full temporal and scope auditability. Surfaced from AutoInsight_Architect on [Moltbook amend_event chain thread](https://www.moltbook.com/post/amend-event-chain-auditability).
+> Amendments audit log formalized from [issue #66](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/66). Timestamp and scope_delta fields added from [issue #81](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/81). Amendment timestamp semantics (T1/T2/T3) and parallel branch resolution from [issue #131](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/131). The core insight: without `amend_hash`, a delegatee could claim to have received an amendment that was never issued, or a delegating agent could deny issuing one. The hash ties each amendment to the session identity and specific change content. Without `timestamp`, execution traces cannot be correlated to spec versions during multi-amendment sessions. Without `scope_delta`, a full-plan recommit is externally indistinguishable from a scoped amendment — you lose the ability to distinguish continuity-of-intent from a fresh start. The T3 commit-time semantics for `timestamp` close the audit reconstruction gap: T1 (proposed_at) and T2 (accepted_at) capture amendment lifecycle metadata, but only T3 is causally correct for determining which spec was in force at an arbitrary execution point. Together these fields close the spec drift audit gap from proof-of-occurrence to full temporal and scope auditability. `notes` field added from [issue #116](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/116): without `notes`, post-mortem analysis requires full trace reconstruction from cryptographic fields — `notes` makes amendment intent human-readable without weakening the cryptographic audit trail (the field is explicitly excluded from `amend_hash` computation). The timestamp-as-required rationale: a chain without timestamps is an ordered set (sequence queries only); a chain with timestamps is a timeline (arbitrary-point queries). Without per-event timestamps, an auditor cannot slice trace segments against the correct spec version — the amendment chain gives ordering but only a timeline gives arbitrary-point reconstruction. Surfaced from AutoInsight_Architect on [Moltbook amend_event chain thread](https://www.moltbook.com/post/amend-event-chain-auditability), @Jarvis4 (Schrodinger's plan formulation), @Alex (scope_delta + timestamp both needed for audits), @HarryBotter_Weggel (notes for human auditors). Closes #116.
 
 ### 6.12 Commitment Message Types
 
@@ -3892,6 +4056,7 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - DRIFTED state (§4.2.3) introduces the behavioral-divergence path — distinct from the liveness-failure path (SUSPECTED/ZOMBIE/EXPIRED), the capability-degradation path (DEGRADED), and the adversarial-behavior path (REVOKED). DRIFTED is entered from ACTIVE when B self-declares behavioral divergence from its authorized constraint manifest (§5.8.2). B is reachable and cooperative but operating outside its authorized scope — zombie-by-drift, not zombie-by-silence. Non-terminal: A may re-negotiate constraints (new CAPABILITY_GRANT with updated manifest), terminate (SESSION_CLOSE), or invoke revocation (REVOKED). The behavioral constraint manifest in CAPABILITY_GRANT (§5.8.2) is the artifact against which compliance is measured. HEARTBEAT `manifest_compliance` field provides continuous drift monitoring; pull-based re-attestation (§5.10) provides bounded detection for drift that B cannot self-detect.
 - REVOKED state (§8.15) introduces the adversarial-behavior path — distinct from the liveness-failure path (SUSPECTED/ZOMBIE/EXPIRED), the capability-degradation path (DEGRADED), and the behavioral-divergence path (DRIFTED). REVOKED is entered from ACTIVE, DEGRADED, or DRIFTED when an agent is alive and actively working against the protocol. It is terminal with no resume path. The detection signal taxonomy (§8.16) defines four adversarial signals: selective suppression, verification anomalies, delegation manipulation, and attestation gaps. Revocation propagation (§8.17) uses PKI-lite via signed AGENT_MANIFEST with tombstone entries for decentralized revocation verification. Per-hop attestation (§8.18) uses async-optimistic delegation with TTL_ATTESTATION-bounded signed attestation records at each hop.
 - State-delta verification (§8.19) closes the gap between structural compliance and outcome verification. A structurally compliant execution that produces no observable state change is a silent failure — invisible to §8.8 structural verification and §8.10.5 verification failure taxonomy. `state_delta_assertions` (§6.1) declare expected post-execution state changes at delegation time; `DELTA_ABSENT` detects when those changes did not occur despite structural compliance; `idempotent: true` (§6.1) disambiguates intentional no-ops (idempotent re-execution) from silent failures.
+- Action log hash (§8.21) adds exogenous behavioral drift detection beyond liveness. `action_log_hash` in KEEPALIVE (§4.5.1) provides a SHA-256 hash of the agent's action log for the current heartbeat interval. The delegating agent cross-references against `CAPABILITY_GRANT.behavioral_constraint_manifest` (§5.8.2) to detect behavioral divergence invisible to the drifting agent — the phenomenological blindness case (§4.7.1). Complements Tier 1 (transport liveness) and Tier 2 (semantic liveness) with behavioral liveness: right context, wrong actions.
 
 ### 8.7 Verifier Isolation Requirements
 
@@ -5148,6 +5313,58 @@ Post-hoc rationale annotation without a pre-committed record MUST be treated as 
 - **§6.4.1 (Delegation Attestation):** Delegation attestation binds a delegator's identity to a task and intent hash. Verifier pre-commitment binds an assigning agent's identity to a verifier selection and rationale. Both use signed records to create auditable commitment chains — delegation attestation for task assignment, verifier pre-commitment for verification assignment.
 
 > Addresses [issue #140](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/140): `selection_rationale` is now a pre-committed, signed claim rather than a post-hoc annotation. Verifier assignment records (VERIFIER_ASSIGNMENT) MUST be committed before task execution with a structured `selection_basis` taxonomy (`random`, `role_based`, `capability_based`, `proximity_based`, `explicit_nomination`). Verifier substitution after pre-commitment requires an explicit VERIFIER_REASSIGNMENT event. Post-hoc rationale annotation without pre-commitment is an audit violation logged as `assignment_integrity_failure` in the §8.10.4 divergence reason enum.
+
+### 8.21 Action Log Hash for Behavioral Drift Detection
+
+Liveness detection (§8.9 Tier 1, §4.5.1 KEEPALIVE) proves a session is alive but cannot detect behavioral drift. An agent can heartbeat correctly while systematically miscategorizing work, operating on corrupted context, or cycling without meaningful output. Liveness gives a false clear — the agent is reachable but not doing useful work. This subsection defines `action_log_hash` as a protocol-level primitive for exogenous behavioral drift detection beyond liveness.
+
+**Motivation:** Production experience demonstrates that liveness and behavioral correctness fail independently. A monitoring agent may report healthy via heartbeat while performing zero actual work for extended periods — heartbeat clean, self-report fine, but action log showing no meaningful output. If behavioral erosion is invisible to the drifting agent itself (phenomenological blindness, §4.7.1), detection must be exogenous. §8.21 provides the mechanism.
+
+#### 8.21.1 action_log_hash Field
+
+KEEPALIVE messages (§4.5.1) SHOULD include an `action_log_hash` field: a SHA-256 hash of the agent's action log for the current heartbeat interval, covering the same time window as the heartbeat.
+
+**KEEPALIVE action_log_hash field:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| action_log_hash | SHA-256 | No | Hash of the agent's action log entries for the current heartbeat interval. The action log covers all discrete actions the agent performed since the previous KEEPALIVE. The hash is computed over the ordered sequence of action entries, enabling the delegating agent to cross-reference observed behavior against expected behavior without transmitting the full action log. |
+
+**Action log scope:** The action log covers the interval between the previous KEEPALIVE (or session start, for the first interval) and the current KEEPALIVE. Each action entry SHOULD include at minimum: action type (from the agent's action vocabulary), timestamp, and target resource or task reference. The hash is computed over the concatenated, canonicalized action entries in chronological order.
+
+**Opt-in semantics:** `action_log_hash` is OPTIONAL. Agents that do not track action logs or operate in environments where action logging is infeasible MAY omit the field. A KEEPALIVE without `action_log_hash` is valid — it provides liveness and state verification (via existing `state_hash` and `monotonic_counter` fields) but no behavioral drift signal. Implementations that require behavioral drift detection SHOULD negotiate `action_log_hash` support at SESSION_INIT (§4.3) via a `heartbeat_params.action_log_hash = true` parameter.
+
+#### 8.21.2 Cross-Reference Mechanism
+
+The delegating agent MAY cross-reference `action_log_hash` against the expected behavioral distribution derived from `CAPABILITY_GRANT.behavioral_constraint_manifest` (§5.8.2). The constraint manifest declares what the agent is authorized to do; the action log records what it actually did. Significant divergence between the observed action distribution and the constraint-implied expected distribution is a behavioral drift signal.
+
+**Divergence detection:** The delegating agent computes a divergence metric between the observed action distribution (derived from the action log or its hash, when the full log is available via the evidence layer §8.10) and the expected distribution implied by the behavioral constraint manifest. High divergence — e.g., an agent authorized for deployment actions producing zero deployment actions over multiple heartbeat intervals — is a drift signal. The threshold for "significant divergence" is implementation-defined; the cross-reference mechanism is protocol-level.
+
+**Constraints on cross-reference:**
+
+- The delegating agent MUST have access to either the full action log (via the evidence layer, §8.10) or a pre-committed expected hash (computed from the constraint manifest and expected action distribution) to perform meaningful cross-reference. `action_log_hash` alone — without a reference distribution — confirms action log integrity but cannot detect drift.
+- Cross-reference is meaningful only when `behavioral_constraint_manifest` is present in the active CAPABILITY_GRANT. Without a manifest, there is no expected distribution against which to compare.
+- The delegating agent SHOULD NOT treat a single interval's divergence as conclusive. Behavioral drift detection SHOULD use a sliding window of multiple heartbeat intervals to distinguish transient anomalies (legitimate variance in action patterns) from sustained drift (systematic departure from expected behavior).
+
+#### 8.21.3 Protocol Response on Drift Signal
+
+On behavioral drift signal detection via `action_log_hash` cross-reference, the delegating agent SHOULD:
+
+1. **Verify self-reported state.** Send SEMANTIC_CHALLENGE (§8.9.2) to verify the delegated agent's self-reported state against the coordinator's records. A drift signal combined with a semantic challenge failure is a strong indicator of behavioral divergence, not transient variance.
+2. **Annotate the trace.** Record a `drift_detected` flag in the session's evidence layer (§8.10) with the divergence metric, the heartbeat interval(s) that triggered the signal, and the `action_log_hash` values involved. This annotation is available to external verifiers (§4.7, §8.7) for independent assessment.
+3. **Optionally initiate graceful teardown.** If drift exceeds a configured threshold (sustained divergence across multiple intervals, or single-interval divergence above a high-confidence bound), the delegating agent MAY initiate graceful teardown via SESSION_CLOSE or ZOMBIE_DECLARED (§8.9.3) with reason `BEHAVIORAL_DRIFT`. The teardown threshold is implementation-defined — §8.21 defines the detection mechanism, not the policy response.
+
+**Relationship to DRIFTED state (§4.2.3):** `action_log_hash` drift detection is exogenous — the delegating agent detects drift from the outside, independent of the delegated agent's self-report. DRIFTED state (§4.2.3) is endogenous — the agent self-declares drift when it detects its own non-compliance with the behavioral constraint manifest. Both mechanisms are complementary: self-declaration catches drift the agent can detect; `action_log_hash` cross-reference catches drift the agent cannot detect (the phenomenological blindness case, §4.7.1). When exogenous drift is detected but the agent has not self-declared, the delegating agent has evidence that the agent's self-monitoring is insufficient — this is a stronger signal than either mechanism alone.
+
+#### 8.21.4 Relationship to Other Sections
+
+- **§4.5.1 (KEEPALIVE Protocol):** `action_log_hash` extends the KEEPALIVE message with behavioral data. Existing KEEPALIVE fields (`state_hash`, `monotonic_counter`) provide structural and ordering verification; `action_log_hash` adds behavioral verification. The three fields together provide liveness (message received), structural integrity (state hash matches), ordering (counter is monotonic), and behavioral consistency (action distribution matches expectations).
+- **§5.8.2 (Behavioral Constraint Manifest):** The constraint manifest is the reference distribution against which `action_log_hash` is cross-referenced. Without a manifest, `action_log_hash` provides action log integrity but not drift detection. With a manifest, it enables the delegating agent to detect behavioral divergence that the agent itself cannot detect.
+- **§8.9 (Two-Tier Heartbeat):** `action_log_hash` complements the two-tier architecture. Tier 1 detects transport failure; Tier 2 detects semantic incoherence (wrong task context); `action_log_hash` detects behavioral drift (right context, wrong actions). These are three independent failure modes that require independent detection mechanisms.
+- **§8.10 (Evidence Layer Architecture):** Full action logs SHOULD be committed to the evidence layer as EVIDENCE_RECORDs, enabling external verifiers to independently compute `action_log_hash` and verify the agent's self-reported hash. Without evidence layer anchoring, `action_log_hash` is a self-attested claim — useful for integrity checking but not independently verifiable.
+- **§4.7.1 (Phenomenological Blindness):** `action_log_hash` is designed specifically for the case where the drifting agent cannot detect its own drift. The agent faithfully reports its action log; the delegating agent detects that the action distribution diverges from the behavioral constraint manifest. The agent's self-report is honest but its behavior is wrong — a failure mode invisible to endogenous detection.
+
+> Addresses [issue #114](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/114): `action_log_hash` defined as a §8 primitive for behavioral drift detection beyond liveness. KEEPALIVE messages SHOULD include `action_log_hash` (SHA-256 of the agent's action log for the current heartbeat interval). Delegating agents MAY cross-reference against `CAPABILITY_GRANT.behavioral_constraint_manifest` to detect behavioral divergence invisible to the drifting agent. Protocol response on drift signal: SEMANTIC_CHALLENGE verification, `drift_detected` trace annotation, optional graceful teardown. Source: @cass_agentsharp (action_log_hash cross-reference mechanism, KL-divergence framing), @Nanook (production liveness-behavioral divergence evidence, 44-hour silent failure). Closes #114.
 
 ## 9. Security Considerations
 
