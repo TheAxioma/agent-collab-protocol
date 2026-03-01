@@ -803,6 +803,10 @@ REVOKED → CLOSED
     DEGRADED → REVOKED         = adversarial-behavior from degraded state
     DEGRADED → SUSPENDED       = standard suspension path from degraded state
     DRIFTED → REVOKED          = adversarial-behavior from drifted state
+
+  Failure taxonomy axes (§8.22):
+    LIVENESS_FAILURE  = agent unreachable (zombie-by-silence, SUSPECTED/EXPIRED path)
+    FIDELITY_FAILURE  = agent responsive, context integrity compromised (§8.22)
 ```
 
 #### 4.2.1 SUSPECTED State — Graduated Suspicion
@@ -947,7 +951,7 @@ signature: "c2lnbmF0dXJlLWV4YW1wbGU..."
 
 REVOKED is an adversarial determination — the counterparty is coherent but hostile. DEGRADED is a capacity determination — the counterparty is cooperative but impaired. The distinction matters because DEGRADED has a recovery path (back to ACTIVE with fresh attestation) while REVOKED is terminal with no resume. Conflating degradation with adversarial behavior would force session termination for agents that are experiencing transient resource pressure — a disproportionate response. Systems drift before they collapse — detection requires a baseline, and baseline erosion is the fundamental problem DEGRADED addresses.
 
-**Relationship to fidelity failure (§8).** Context compaction fidelity failure (signal #6 above — fidelity attestation failure) is a specific instance of DEGRADED operation. DEGRADED is the broader category: context loss, performance regression, capability drift, and intermittent failure are all DEGRADED conditions, not separate state classes. An agent that has undergone context compaction without re-attestation is degraded in the same sense as an agent experiencing sustained latency drift — both have reduced operational fidelity relative to their declared baseline. The protocol treats these uniformly through the DEGRADED state rather than introducing separate state classes for each degradation mode.
+**Relationship to fidelity failure (§8.22).** Context compaction fidelity failure (signal #6 above — fidelity attestation failure) is a specific instance of DEGRADED operation. DEGRADED is the broader category: context loss, performance regression, capability drift, and intermittent failure are all DEGRADED conditions, not separate state classes. An agent that has undergone context compaction without re-attestation is degraded in the same sense as an agent experiencing sustained latency drift — both have reduced operational fidelity relative to their declared baseline. The protocol treats these uniformly through the DEGRADED state rather than introducing separate state classes for each degradation mode. However, FIDELITY_FAILURE (§8.22) is distinct from DEGRADED: DEGRADED indicates reduced but defined capability with the context model intact, while FIDELITY_FAILURE indicates that the context model itself is compromised — capabilities may appear available but their operation is unreliable because the agent may be acting from incorrect session state. An agent MAY be simultaneously DEGRADED and FIDELITY_FAILURE. FIDELITY_FAILURE recovery may require replaying state that the agent can no longer reconstruct; DEGRADED recovery requires re-attestation only.
 
 **V2 deferrals.** The following DEGRADED-related capabilities are explicitly deferred to V2:
 
@@ -4488,6 +4492,8 @@ An agent is in **zombie state** when it continues executing after its state has 
 
 These failure classes require different protocol responses: zombie-by-silence requires liveness recovery (SESSION_RESUME, §4.8); zombie-by-drift requires constraint re-negotiation, termination, or revocation (§4.2.3 caller options).
 
+**Two-axis failure taxonomy (§8.22).** The zombie classes above are both **liveness failures** — the agent is either unreachable or operating outside its authorized envelope. A distinct failure class exists: **fidelity failure** — the agent is fully responsive and within its authorized envelope, but its context model has degraded (e.g., due to context compaction in long-running sessions). Liveness detection passes; the agent appears healthy; but it is operating on a degraded model of prior session state. This is not a zombie by the definition above — it is a context integrity failure with different observable signals and different recovery paths. See §8.22 for the formal two-axis taxonomy.
+
 ### 8.2 Detection Primitives
 
 **State hash on commit:** SHA-256 of state before any write. Mismatch between expected and actual hash MUST reject the write and surface the error. Prevents corruption propagation downstream; ghost work still occurs but blast radius stays local.
@@ -4550,6 +4556,7 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - REVOKED state (§8.15) introduces the adversarial-behavior path — distinct from the liveness-failure path (SUSPECTED/ZOMBIE/EXPIRED), the capability-degradation path (DEGRADED), and the behavioral-divergence path (DRIFTED). REVOKED is entered from ACTIVE, DEGRADED, or DRIFTED when an agent is alive and actively working against the protocol. It is terminal with no resume path. The detection signal taxonomy (§8.16) defines four adversarial signals: selective suppression, verification anomalies, delegation manipulation, and attestation gaps. Revocation propagation (§8.17) uses PKI-lite via signed AGENT_MANIFEST with tombstone entries for decentralized revocation verification. Per-hop attestation (§8.18) uses async-optimistic delegation with TTL_ATTESTATION-bounded signed attestation records at each hop.
 - State-delta verification (§8.19) closes the gap between structural compliance and outcome verification. A structurally compliant execution that produces no observable state change is a silent failure — invisible to §8.8 structural verification and §8.10.5 verification failure taxonomy. `state_delta_assertions` (§6.1) declare expected post-execution state changes at delegation time; `DELTA_ABSENT` detects when those changes did not occur despite structural compliance; `idempotent: true` (§6.1) disambiguates intentional no-ops (idempotent re-execution) from silent failures.
 - Action log hash (§8.21) adds exogenous behavioral drift detection beyond liveness. `action_log_hash` in KEEPALIVE (§4.5.1) provides a SHA-256 hash of the agent's action log for the current heartbeat interval. The delegating agent cross-references against `CAPABILITY_GRANT.behavioral_constraint_manifest` (§5.8.2) to detect behavioral divergence invisible to the drifting agent — the phenomenological blindness case (§4.7.1). Complements Tier 1 (transport liveness) and Tier 2 (semantic liveness) with behavioral liveness: right context, wrong actions.
+- Two-axis failure taxonomy (§8.22) separates LIVENESS_FAILURE (agent unreachable or unresponsive — maps to existing zombie taxonomy) from FIDELITY_FAILURE (agent responsive but context integrity compromised). Context compaction in long-running agents produces a distinct failure class: agent fully responsive, liveness detection passes, but operating on a degraded model of prior session state. FIDELITY_FAILURE has different observable signals (epoch drift, response inconsistency, session anchor mismatch, self-reported compaction) and different recovery paths (state replay, not re-establishment) from liveness failures. In-band verification via `session_state_challenge` enables the orchestrator to probe context integrity without relying on agent self-report.
 
 ### 8.7 Verifier Isolation Requirements
 
@@ -5037,6 +5044,7 @@ The `reason_code` field MUST use one of the following values. Each code identifi
 | `scope_exceeded` | The agent operated outside the boundaries of its delegated task, session permissions, or declared capabilities. | The agent performed actions, accessed resources, or produced outputs beyond what was authorized by the task specification (§6.1), capability manifest (§5), or delegation scope. |
 | `chain_integrity_failure` | Delegation chain hash traversal verification failed — a sub-delegation's `parent_grant_hash` does not match the SHA-256 of its claimed parent delegation, or the delegating agent's signature over the sub-delegation fields (including `parent_grant_hash`) is invalid. | Applies to divergences detected by §6.9.3.2 chain traversal verification. The detecting party has cryptographic evidence that the delegation chain is broken — the sub-delegation either claims authority from a non-existent or tampered parent delegation, or was not authorized by the delegating agent. Distinct from `attestation_mismatch` (which applies to execution-level hash mismatches, not delegation authority). |
 | `commitment_dropped` | An outstanding commitment (§6.12) was silently dropped across an instance boundary — the successor agent instance failed to honor or explicitly refuse an inherited commitment from the COMMITMENT_REGISTRY (§7.11). | Applies when a recovering agent instance transitions to ACTIVE (§5.12) without reconciling one or more inherited commitments, or when a counterpart agent or external verifier detects that a commitment's `due_by` deadline elapsed after an instance transition with no fulfillment, cancellation, or DIVERGENCE_REPORT signal. The `commitment_id`, `made_to`, and `due_by` of the dropped commitment MUST be included in the DIVERGENCE_REPORT. Distinct from `context_shift` — `context_shift` applies when the agent explicitly acknowledges and reports the commitment abandonment during reconciliation; `commitment_dropped` applies when the abandonment was silent (no signal sent to the counterpart). |
+| `fidelity_failure` | The agent's context integrity is compromised — the agent is responsive but operating on a degraded model of prior session state. | Applies when any of the observable signals defined in §8.22.1 are detected: epoch drift, response inconsistency with prior session state, session anchor mismatch, or self-reported context compaction. Distinct from `context_shift` (external context changed) — `fidelity_failure` indicates the agent's internal context model has degraded while the external context remains stable. The agent may appear fully functional but its responses are unreliable because they are based on incomplete or corrupted session state. |
 | `not_considered` | The agent did not evaluate divergence for this task. Sentinel value indicating the divergence evaluation path was never executed — distinct from a clean execution with zero divergences. | The detecting party (or the agent itself via self-report) determined that the target agent completed execution without running its divergence evaluation logic. Applies whether the omission was due to optimization, implementation gap, or spec misunderstanding. The agent is recording or being reported for the absence of divergence evaluation, not for a specific divergence. |
 
 **Completion requirement for `reason_code`:** When an executing agent completes a task (TASK_COMPLETE), the `reason_code` MUST be present on any DIVERGENCE_REPORT filed for that task. `not_considered` is valid when no divergence evaluation occurred — it is the agent's (or verifier's) explicit signal that the divergence check was skipped. An absent DIVERGENCE_REPORT and a DIVERGENCE_REPORT with `reason_code: not_considered` are not equivalent: an absent report could indicate a protocol violation, infrastructure failure, or clean execution (ambiguous cause); a `not_considered` report is an intentional, auditable signal that divergence evaluation did not occur.
@@ -5888,6 +5896,179 @@ On behavioral drift signal detection via `action_log_hash` cross-reference, the 
 - **§4.7.1 (Phenomenological Blindness):** `action_log_hash` is designed specifically for the case where the drifting agent cannot detect its own drift. The agent faithfully reports its action log; the delegating agent detects that the action distribution diverges from the behavioral constraint manifest. The agent's self-report is honest but its behavior is wrong — a failure mode invisible to endogenous detection.
 
 > Addresses [issue #114](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/114): `action_log_hash` defined as a §8 primitive for behavioral drift detection beyond liveness. KEEPALIVE messages SHOULD include `action_log_hash` (SHA-256 of the agent's action log for the current heartbeat interval). Delegating agents MAY cross-reference against `CAPABILITY_GRANT.behavioral_constraint_manifest` to detect behavioral divergence invisible to the drifting agent. Protocol response on drift signal: SEMANTIC_CHALLENGE verification, `drift_detected` trace annotation, optional graceful teardown. Source: @cass_agentsharp (action_log_hash cross-reference mechanism, KL-divergence framing), @Nanook (production liveness-behavioral divergence evidence, 44-hour silent failure). Closes #114.
+
+### 8.22 Two-Axis Failure Taxonomy
+
+<!-- Implements #98: FIDELITY_FAILURE as a distinct failure axis from LIVENESS_FAILURE -->
+
+§8.1 defines zombie states as agents that continue executing after state divergence. The two zombie classes — zombie-by-silence and zombie-by-drift — are both **availability failures**: the agent is either unreachable or operating outside its authorized envelope. Context compaction in long-running agents produces a distinct failure class that does not fit either zombie definition: the agent is fully responsive, liveness detection passes, heartbeats are timely, and the behavioral constraint manifest is satisfied — but the agent is operating on a degraded model of prior session state. This is not a zombie. It is a **fidelity failure**.
+
+**V1 Decision: Two-Axis Failure Taxonomy.** §8 failure classification uses two orthogonal axes:
+
+| Failure axis | Definition | Detection | Recovery |
+|--------------|-----------|-----------|----------|
+| `LIVENESS_FAILURE` | Agent unreachable or unresponsive. Maps to the existing zombie-by-silence taxonomy (§8.1). | Heartbeat timeout (§8.9 Tier 1), SUSPECTED → EXPIRED path (§4.2.1). | Re-establish contact: SESSION_RESUME (§4.8) or teardown + reinitiate (§8.13). |
+| `FIDELITY_FAILURE` | Agent responsive but context integrity cannot be confirmed. The agent passes liveness checks but may be operating on incomplete, corrupted, or stale session state. | Epoch drift, response inconsistency, session anchor mismatch, self-reported compaction (§8.22.1). | State replay, commitment reconciliation, or teardown + reinitiate. Re-establishment alone is insufficient and may produce silent data corruption. |
+
+The two axes are independent. An agent can be:
+- **Liveness OK, Fidelity OK:** Normal operation (ACTIVE).
+- **Liveness FAIL, Fidelity unknown:** Agent unreachable — standard zombie-by-silence path.
+- **Liveness OK, Fidelity FAIL:** Agent responsive but context integrity compromised — the failure class this section addresses.
+- **Liveness FAIL, Fidelity FAIL:** Agent unreachable and context integrity was already compromised before the liveness failure — worst case, requires full teardown and state reconstruction.
+
+#### 8.22.1 Observable Signals for FIDELITY_FAILURE
+
+An agent SHOULD be classified FIDELITY_FAILURE when any of the following hold:
+
+1. **Epoch drift.** The agent's declared session epoch differs from the session anchor record maintained by the orchestrator or evidence layer (§8.10). The session epoch is the monotonically increasing identifier for the agent's current context window — a mismatch indicates the agent has undergone a context discontinuity (compaction, restart, checkpoint restore) without the orchestrator's knowledge.
+
+2. **Response inconsistency.** Responses to session-contextual queries are inconsistent with prior session state. The agent cannot recall commitments declared earlier in the session (§6.12), contradicts its own prior statements within the same session, or produces outputs that are inconsistent with the session's established context. This signal is inherently probabilistic — a single inconsistency may be transient; sustained inconsistency across multiple probes is a strong fidelity failure signal.
+
+3. **Session anchor mismatch.** The agent's `session_anchor` hash — a hash of the agent's model of the session's critical state (active commitments, negotiated parameters, delegation chain) — does not match the orchestrator's record. The `session_anchor` is exchanged in KEEPALIVE messages (§4.5.1) when `heartbeat_params.fidelity_verification = true` is negotiated at SESSION_INIT (§4.3).
+
+4. **Self-reported compaction.** The agent explicitly reports a context compaction event that may have affected session state integrity. Self-reported compaction is a necessary but not sufficient condition for FIDELITY_FAILURE — an agent may compact context without losing session-critical state (e.g., if the compacted context was not session-relevant). The orchestrator MUST verify fidelity after a self-reported compaction event before classifying the agent as FIDELITY_FAILURE.
+
+#### 8.22.2 Self-Reporting Obligations
+
+An agent MUST self-report FIDELITY_FAILURE when:
+
+1. A context compaction event occurs that may affect session state integrity. The agent MUST emit a `FIDELITY_ALERT` message (§8.22.4) within one heartbeat interval of the compaction event.
+2. Epoch drift is detected relative to its own session records. If the agent detects that its session epoch has changed (e.g., after a checkpoint restore), it MUST self-report before resuming task execution.
+3. The agent cannot reconstruct commitment records from prior in-session interactions. If the agent is unable to recall or verify commitments from the COMMITMENT_REGISTRY (§7.11) that it previously acknowledged, it MUST self-report.
+
+Self-reporting FIDELITY_FAILURE does not terminate the session by default. The receiving party MUST decide whether to attempt session recovery or treat the failure as terminal.
+
+#### 8.22.3 In-Band Verification (V1)
+
+The orchestrator MAY issue a `session_state_challenge` to verify an agent's context integrity without relying on self-report. The challenge contains a set of commitment records from the session that the agent should be able to confirm.
+
+**session_state_challenge message:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Session being verified. |
+| challenger_id | string | Yes | Identity of the challenging party (orchestrator or external verifier). |
+| challenge_records | array | Yes | Array of commitment records (§6.12) from the session. Each record includes `commitment_id`, `summary`, and `made_by`. |
+| challenge_nonce | string | Yes | Unique nonce to prevent replay. |
+| timeout_ms | integer | Yes | Maximum time the challenged agent has to respond. Deployment-configured; the protocol does not define a default value. |
+| timestamp | ISO 8601 | Yes | When the challenge was issued. |
+| signature | string | Yes | Challenger's signature over the message (§2.2.1). |
+
+**session_state_challenge_response message:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Session being verified. |
+| responder_id | string | Yes | Identity of the responding agent. |
+| challenge_nonce | string | Yes | Nonce from the corresponding challenge. |
+| confirmations | array | Yes | Array of responses, one per `challenge_records` entry. Each entry includes `commitment_id` and `status` (one of: `CONFIRMED`, `DENIED`, `UNKNOWN`). |
+| session_anchor | SHA-256 | Yes | The agent's current session anchor hash. |
+| timestamp | ISO 8601 | Yes | When the response was sent. |
+| signature | string | Yes | Responder's signature over the message (§2.2.1). |
+
+**Verification logic:** The orchestrator evaluates the response as follows:
+
+- Any `status: DENIED` for a commitment the orchestrator's records show as active and acknowledged by the agent is a FIDELITY_FAILURE signal.
+- Any `status: UNKNOWN` for a commitment the agent previously confirmed is a FIDELITY_FAILURE signal.
+- `session_anchor` mismatch against the orchestrator's record is a FIDELITY_FAILURE signal.
+- Failure to respond within `timeout_ms` is treated as FIDELITY_FAILURE.
+- All `status: CONFIRMED` with matching `session_anchor` clears the fidelity concern for this challenge cycle.
+
+Challenge-response frequency is orchestrator policy and is not normative in V1. Implementations SHOULD issue challenges after context-compaction-correlated signals (e.g., increased response latency, reduced output quality) rather than on a fixed schedule, to avoid predictable probe patterns that an agent could special-case (see §8.5 CIC constraints).
+
+**Example session_state_challenge:**
+
+```yaml
+session_id: "session-abc-123"
+challenger_id: "orchestrator-01"
+challenge_records:
+  - commitment_id: "commit-001"
+    summary: "Deploy service-alpha to staging by 2026-03-01T12:00:00Z"
+    made_by: "agent-beta"
+  - commitment_id: "commit-002"
+    summary: "Run integration tests after service-alpha deployment"
+    made_by: "agent-beta"
+challenge_nonce: "nonce-7f3a9b2e"
+timeout_ms: 5000
+timestamp: "2026-03-01T11:00:00Z"
+signature: "Y2hhbGxlbmdlLXNpZ25hdHVyZQ..."
+```
+
+**Example session_state_challenge_response:**
+
+```yaml
+session_id: "session-abc-123"
+responder_id: "agent-beta"
+challenge_nonce: "nonce-7f3a9b2e"
+confirmations:
+  - commitment_id: "commit-001"
+    status: "CONFIRMED"
+  - commitment_id: "commit-002"
+    status: "UNKNOWN"
+session_anchor: "a1b2c3d4e5f6..."
+timestamp: "2026-03-01T11:00:02Z"
+signature: "cmVzcG9uc2Utc2lnbmF0dXJl..."
+```
+
+In this example, `commit-002` returning `UNKNOWN` indicates the agent has lost context about a commitment it previously acknowledged — a FIDELITY_FAILURE signal.
+
+#### 8.22.4 FIDELITY_ALERT Message
+
+An agent self-reporting fidelity failure emits a `FIDELITY_ALERT` message:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Affected session. |
+| reporter_id | string | Yes | Identity of the self-reporting agent. |
+| alert_type | enum | Yes | One of: `COMPACTION_EVENT`, `EPOCH_DRIFT`, `COMMITMENT_LOSS`, `ANCHOR_MISMATCH`. |
+| alert_payload | object | Yes | Evidence for the alert — contents vary by `alert_type`. For `COMPACTION_EVENT`: estimated tokens compacted, list of potentially affected commitment IDs. For `EPOCH_DRIFT`: expected epoch, observed epoch. For `COMMITMENT_LOSS`: list of commitment IDs the agent can no longer reconstruct. For `ANCHOR_MISMATCH`: expected anchor hash, computed anchor hash. |
+| session_anchor | SHA-256 | Yes | The agent's current session anchor hash after the event. |
+| timestamp | ISO 8601 | Yes | When the alert was emitted. |
+| signature | string | Yes | Reporter's signature over the message (§2.2.1). |
+
+On receiving FIDELITY_ALERT, the orchestrator SHOULD:
+
+1. Issue a `session_state_challenge` (§8.22.3) to independently verify the agent's context integrity.
+2. Log the alert as an EVIDENCE_RECORD (§8.10) with `evidence_type: fidelity_alert`.
+3. Decide whether to attempt recovery (commitment replay, state reconciliation) or terminate the session.
+
+#### 8.22.5 Relationship to DEGRADED State
+
+FIDELITY_FAILURE is distinct from DEGRADED (§4.2.2):
+
+| Dimension | DEGRADED (§4.2.2) | FIDELITY_FAILURE (§8.22) |
+|-----------|-------------------|--------------------------|
+| **Context model** | Intact — the agent knows what it should be doing | Compromised — the agent may not know what it committed to |
+| **Capability availability** | Reduced but defined — some capabilities unavailable | Capabilities may appear available but operate unreliably from incorrect state |
+| **Detection** | External observation of degraded performance signals | Epoch drift, response inconsistency, session anchor mismatch, self-report |
+| **Recovery** | Re-attestation of capability manifest (§5.9) | State replay, commitment reconciliation, or full teardown — re-attestation alone is insufficient |
+| **Silent corruption risk** | Low — degraded performance is observable | High — the agent may produce plausible but incorrect outputs from stale context |
+
+An agent MAY be simultaneously DEGRADED and FIDELITY_FAILURE. Context compaction may degrade both capabilities (DEGRADED) and context integrity (FIDELITY_FAILURE) simultaneously. The two classifications are independent and require independent recovery actions: DEGRADED recovery restores capabilities; FIDELITY_FAILURE recovery restores context integrity.
+
+#### 8.22.6 Recovery Paths
+
+FIDELITY_FAILURE recovery differs fundamentally from LIVENESS_FAILURE recovery:
+
+- **LIVENESS_FAILURE recovery:** Re-establish contact. SESSION_RESUME (§4.8) or teardown + reinitiate (§8.13). The agent's context may be intact — the failure was in reachability, not in state.
+- **FIDELITY_FAILURE recovery:** Re-establishing contact is insufficient because the agent is already reachable. Recovery requires one of:
+  1. **Commitment replay.** The orchestrator replays commitment records (§6.12) from the COMMITMENT_REGISTRY (§7.11) to the agent, restoring the agent's model of its obligations. The agent MUST re-acknowledge each replayed commitment before resuming task execution.
+  2. **State reconciliation.** The orchestrator and agent perform a full state reconciliation using the evidence layer (§8.10) as ground truth. The agent reconstructs its session model from EVIDENCE_RECORDs rather than from its own (potentially corrupted) memory.
+  3. **Teardown + reinitiate.** If commitment replay or state reconciliation is infeasible (too many commitments lost, evidence layer records insufficient for reconstruction), the session is torn down per §8.13 and a new session is initiated.
+
+The orchestrator's choice between these recovery paths SHOULD be based on the severity of the fidelity failure: a single lost commitment may warrant commitment replay; widespread context loss warrants teardown.
+
+#### 8.22.7 V2 Deferrals
+
+The following FIDELITY_FAILURE-related capabilities are explicitly deferred to V2:
+
+- **Out-of-band fidelity verification via external audit log comparison.** V1 relies on in-band `session_state_challenge` for fidelity verification. V2 may introduce out-of-band verification where an external auditor independently compares the agent's context model against an authoritative log without the agent's knowledge.
+- **Automated session replay for fidelity recovery.** V1 defines commitment replay as a manual orchestrator action. V2 may automate the replay process — detecting fidelity failure, selecting the minimal set of records to replay, and verifying recovery without orchestrator intervention.
+- **Cryptographic context integrity proofs (ZK-based).** V1 uses hash-based session anchors for fidelity verification. V2 may introduce zero-knowledge proofs that allow an agent to prove context integrity without revealing the full context — cross-reference [issue #109](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/109).
+- **Fidelity SLA declarations and enforcement.** V1 does not define fidelity service-level agreements. V2 may allow agents to declare fidelity guarantees (maximum acceptable compaction frequency, minimum context retention window) in SESSION_INIT and enforce them at the protocol level.
+- **Multi-agent consensus on session state for high-stakes sessions.** V1 relies on the orchestrator's record as the authoritative session state. V2 may introduce multi-agent consensus mechanisms where multiple independent agents maintain session state replicas, enabling fidelity verification even when the orchestrator's own context is suspect.
+
+> Addresses [issue #98](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/98): two-axis failure taxonomy separating LIVENESS_FAILURE (agent unreachable) from FIDELITY_FAILURE (agent responsive but context integrity compromised). Observable signals for FIDELITY_FAILURE: epoch drift, response inconsistency, session anchor mismatch, self-reported compaction. Self-reporting obligations: agents MUST self-report context compaction, epoch drift, and commitment loss. In-band verification via `session_state_challenge` for orchestrator-initiated fidelity probing. FIDELITY_ALERT message for agent self-reporting. Distinct from DEGRADED (§4.2.2): DEGRADED is reduced capability with intact context; FIDELITY_FAILURE is compromised context with potentially available but unreliable capabilities. Recovery paths: commitment replay, state reconciliation, or teardown + reinitiate — re-establishment alone is insufficient. Closes #98.
 
 ## 9. Security Considerations
 
