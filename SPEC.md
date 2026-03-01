@@ -590,6 +590,14 @@ DEGRADED → REVOKED
          Same detection signals as ACTIVE → REVOKED
          On entry: same revocation semantics as ACTIVE → REVOKED (§8.15)
 
+DEGRADED → SUSPENDED
+  Guard: SESSION_SUSPEND sent by either participant from DEGRADED state
+         Standard suspension path applies — DEGRADED does not block suspension
+         In-flight tasks SHOULD be checkpointed (§6.6 TASK_CHECKPOINT)
+           before transition, same as ACTIVE → SUSPENDED
+         On resume (SESSION_RESUME §4.8), the session returns to DEGRADED
+           (not ACTIVE) unless degradation conditions have cleared
+
 DEGRADED → CLOSED
   Guard: SESSION_CLOSE sent by either participant from DEGRADED state
          OR coordinator escalates to orderly termination (§4.2.2)
@@ -727,26 +735,28 @@ REVOKED → CLOSED
 
               ┌────────────────────┐  latency /        ┌──────────┐
               │      ACTIVE        │─────────────────▶ │ DEGRADED │
-              └────────────────────┘  partial cap      └┬───┬───┬─┘
-                        ▲              loss / canary     │   │   │
-                        │              / drift / fidelity│   │   │
-                        │                                │   │   │
-                        │  conditions cleared +          │   │   │
-                        │  fresh attestation             │   │   │
-                        └────────────────────────────────┘   │   │
-                                                             │   │
-                         adversarial behavior (§8.16)        │   │
-                         ┌───────────────────────────────────┘   │
-                         ▼                                       │
-                    ┌─────────┐                                  │
-                    │ REVOKED │                                  │
-                    └────┬────┘           SESSION_CLOSE           │
-                         │ revocation    ┌───────────────────────┘
-                         │ propagated    │
-                         ▼               ▼
-                    ┌──────┐        ┌──────┐
-                    │CLOSED│        │CLOSED│
-                    └──────┘        └──────┘
+              └────────────────────┘  partial cap      └┬───┬───┬──┬─┘
+                        ▲              loss / canary     │   │   │  │
+                        │              / drift / fidelity│   │   │  │
+                        │                                │   │   │  │
+                        │  conditions cleared +          │   │   │  │
+                        │  fresh attestation             │   │   │  │
+                        └────────────────────────────────┘   │   │  │
+                                                             │   │  │
+                         adversarial behavior (§8.16)        │   │  │
+                         ┌───────────────────────────────────┘   │  │
+                         ▼                                       │  │
+                    ┌─────────┐                                  │  │
+                    │ REVOKED │                                  │  │
+                    └────┬────┘           SESSION_CLOSE           │  │
+                         │ revocation    ┌───────────────────────┘  │
+                         │ propagated    │    SESSION_SUSPEND        │
+                         ▼               ▼    ┌────────────────────┘
+                    ┌──────┐        ┌──────┐  │
+                    │CLOSED│        │CLOSED│  ▼
+                    └──────┘        └──────┘ ┌───────────┐
+                                             │ SUSPENDED │
+                                             └───────────┘
 
   Adversarial-behavior path (§8.15–§8.18):
 
@@ -791,6 +801,7 @@ REVOKED → CLOSED
     ACTIVE → DRIFTED           = behavioral-divergence path (B-declared, zombie-by-drift)
     ACTIVE → REVOKED           = adversarial-behavior path (explicit trigger)
     DEGRADED → REVOKED         = adversarial-behavior from degraded state
+    DEGRADED → SUSPENDED       = standard suspension path from degraded state
     DRIFTED → REVOKED          = adversarial-behavior from drifted state
 ```
 
@@ -878,10 +889,47 @@ REVOKED → CLOSED
 
 3. **Initiate orderly termination.** The coordinator sends SESSION_CLOSE to terminate the session. Standard SESSION_CLOSE semantics apply — in-flight tasks are completed, failed, or cancelled before teardown. This is an orderly exit, not an emergency revocation.
 
+**DEGRADED_DECLARED message.** DEGRADED declaration follows the same message flow as SESSION_SUSPEND: the declaring authority (external verifier or delegating agent) sends a signed DEGRADED_DECLARED message to the session. Self-declaration by the degraded agent is explicitly NOT sufficient — a compromised or context-degraded agent cannot be trusted to assess its own state accurately.
+
+**DEGRADED_DECLARED message:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Session transitioning to DEGRADED. |
+| declarator_id | string | Yes | Identity of the declaring authority (external verifier or delegating agent). |
+| target_agent_id | string | Yes | Identity of the agent determined to be degraded. |
+| signal_type | enum | Yes | One of: `LATENCY_DRIFT`, `CAPABILITY_LOSS`, `APP_SELF_REPORT`, `CANARY_FAILURE`, `BEHAVIORAL_DRIFT`, `FIDELITY_ATTESTATION_FAILURE`. |
+| signal_payload | object | Yes | Evidence for the triggering signal — contents vary by `signal_type`. |
+| timestamp | ISO 8601 | Yes | When the DEGRADED_DECLARED was sent. |
+| signature | string | Yes | Declarator's signature over the message (§2.2.1). |
+
+**Example DEGRADED_DECLARED:**
+
+```yaml
+session_id: "session-abc-123"
+declarator_id: "verifier-external-01"
+target_agent_id: "agent-beta"
+signal_type: "LATENCY_DRIFT"
+signal_payload:
+  baseline_latency_ms: 200
+  observed_latencies_ms: [450, 520, 480]
+  consecutive_violations: 3
+  threshold_multiplier: 2.0
+timestamp: "2026-03-01T10:30:00Z"
+signature: "c2lnbmF0dXJlLWV4YW1wbGU..."
+```
+
+**On receiving DEGRADED_DECLARED**, the target agent MUST:
+
+1. Transition to DEGRADED state and begin honoring DEGRADED protocol behavior (heartbeat continuation, `trust_state: DEGRADED` in KEEPALIVE, reduced sub-delegation scope).
+2. Continue honoring in-progress sessions. DEGRADED does not invalidate existing task delegations — the agent MUST continue executing accepted tasks.
+3. Log the declaration as an EVIDENCE_RECORD (§8.10) with `evidence_type: state_transition`.
+
 **DEGRADED exit conditions:**
 
 - **Back to ACTIVE:** The conditions that triggered DEGRADED entry clear. Latency returns to expected levels, capabilities are restored (via CAPABILITY_UPDATE), or the counterparty reports `app_status: ACTIVE` in HEARTBEAT. Recovery MUST include fresh attestation — the degraded agent MUST re-attest its capability manifest (§5.9) before the delegating agent or external verifier transitions the session back to ACTIVE. Stale attestation from pre-DEGRADED state is insufficient. No SESSION_RESUME is required — the session was never declared dead or suspected.
 - **Forward to REVOKED:** Adversarial behavior is detected while the session is in DEGRADED state (§8.16 detection signals), or degradation reaches a critical threshold and cannot be remediated — sustained detection signals across multiple sliding windows without recovery, at the delegating agent's discretion. The same revocation semantics apply as for ACTIVE → REVOKED (§8.15). DEGRADED does not shield against adversarial detection.
+- **Forward to SUSPENDED:** SESSION_SUSPEND sent by either participant from DEGRADED state. Standard suspension semantics apply — in-flight tasks SHOULD be checkpointed before transition. On resume via SESSION_RESUME (§4.8), the session returns to DEGRADED (not ACTIVE) unless the degradation conditions have independently cleared and the agent has re-attested.
 - **Forward to CLOSED:** The coordinator initiates orderly termination via SESSION_CLOSE, or session TTL expires. Standard closure semantics apply.
 
 **Why DEGRADED is distinct from SUSPECTED:**
@@ -892,12 +940,21 @@ REVOKED → CLOSED
 | **Task delegation** | MUST NOT delegate new tasks | MAY delegate with reduced expectations |
 | **Heartbeat status** | Heartbeats absent or delayed | Heartbeats present and timely |
 | **Recovery** | Automatic on heartbeat receipt | Requires fresh attestation after degradation signals clear |
-| **Terminal path** | → EXPIRED (timeout) | → REVOKED (adversarial or critical threshold) or → CLOSED (orderly) |
+| **Terminal path** | → EXPIRED (timeout) | → REVOKED (adversarial or critical threshold), → SUSPENDED (standard suspension), or → CLOSED (orderly) |
 | **Declaration authority** | Local and independent (each side evaluates) | External verifier or delegating agent; self-declaration advisory only |
 
 **Why DEGRADED is distinct from REVOKED:**
 
 REVOKED is an adversarial determination — the counterparty is coherent but hostile. DEGRADED is a capacity determination — the counterparty is cooperative but impaired. The distinction matters because DEGRADED has a recovery path (back to ACTIVE with fresh attestation) while REVOKED is terminal with no resume. Conflating degradation with adversarial behavior would force session termination for agents that are experiencing transient resource pressure — a disproportionate response. Systems drift before they collapse — detection requires a baseline, and baseline erosion is the fundamental problem DEGRADED addresses.
+
+**Relationship to fidelity failure (§8).** Context compaction fidelity failure (signal #6 above — fidelity attestation failure) is a specific instance of DEGRADED operation. DEGRADED is the broader category: context loss, performance regression, capability drift, and intermittent failure are all DEGRADED conditions, not separate state classes. An agent that has undergone context compaction without re-attestation is degraded in the same sense as an agent experiencing sustained latency drift — both have reduced operational fidelity relative to their declared baseline. The protocol treats these uniformly through the DEGRADED state rather than introducing separate state classes for each degradation mode.
+
+**V2 deferrals.** The following DEGRADED-related capabilities are explicitly deferred to V2:
+
+- **Automated DEGRADED detection without external verifier.** V1 requires an external verifier (§4.7.2) or the delegating agent to declare DEGRADED. Automated self-detection with protocol-level confidence scoring is a V2 capability.
+- **Baseline tracking and drift metrics at the protocol level.** V1 defines signal classes but defers numeric thresholds and baseline tracking mechanisms to deployment configuration. V2 may standardize baseline declaration in SESSION_INIT and drift metric computation at the protocol level.
+- **Quorum-based DEGRADED escalation.** V1 relies on single-verifier or delegating-agent authority. Requiring agreement from multiple independent verifiers before DEGRADED declaration is a V2 design direction.
+- **DEGRADED → ACTIVE recovery verification beyond re-attestation.** V1 requires fresh capability manifest re-attestation (§5.9) for recovery. V2 may introduce additional recovery verification steps — canary task completion, behavioral consistency checks across a recovery window, or graduated trust restoration.
 
 **Backward compatibility:** DEGRADED detection via `app_status` self-report requires `heartbeat_params.application_liveness = true` (§4.3.1). Sessions that do not negotiate application liveness can still enter DEGRADED via latency monitoring, partial capability loss detection, or Tier 2 protocol-level signals — these are observable without heartbeat extensions. DEGRADED is an opt-in state for sessions that want explicit degradation tracking; sessions without degradation monitoring continue using the existing ACTIVE → CLOSED path for sessions that become unproductive.
 
@@ -4468,7 +4525,7 @@ The protocol's goal is not to prevent zombie states. It is to make them **detect
 - Structured divergence reporting (§8.11) defines DIVERGENCE_REPORT as a standalone protocol message with a required `reason_code` taxonomy, enabling verifiers to classify divergences programmatically rather than parsing free-text descriptions. Complements the inline `divergence_log` (§7.8) which covers plan-execution divergence.
 - Teardown-first recovery mandate (§8.13) formalizes teardown + reinitiate as the default recovery protocol. Agents MUST NOT resume from serialized in-memory state; recovery reads canonical state from durable persistent storage, reconciles against the evidence layer (§8.10), and initiates a fresh SESSION_INIT. Task idempotency (§7.10) is the prerequisite enabling safe replay after teardown.
 - SUSPECTED state and heartbeat negotiation prerequisites (§8.14) documents that SUSPECTED state detection via task hash mismatch requires `heartbeat_params.task_hash_verification = true` negotiated at SESSION_INIT (§4.3.1). Without this negotiation, HEARTBEAT messages carry no task context and task-context drift detection is unavailable. Application-level self-report of SUSPECTED or DEGRADED requires `heartbeat_params.application_liveness = true`.
-- DEGRADED state (§4.2.2) introduces the capability-degradation path — an intermediate state between ACTIVE and terminal states for sessions experiencing gradual capability loss (sustained latency, partial capability loss, application self-reported degradation). DEGRADED is recoverable (back to ACTIVE when conditions clear) and permits task delegation with reduced expectations. Transitions: ACTIVE → DEGRADED, DEGRADED → ACTIVE, DEGRADED → REVOKED, DEGRADED → CLOSED.
+- DEGRADED state (§4.2.2) introduces the capability-degradation path — an intermediate state between ACTIVE and terminal states for sessions experiencing gradual capability loss (sustained latency, partial capability loss, application self-reported degradation). DEGRADED is recoverable (back to ACTIVE when conditions clear) and permits task delegation with reduced expectations. Context compaction fidelity failure is a specific instance of DEGRADED operation — DEGRADED is the broader category subsuming context loss, performance regression, capability drift, and intermittent failure. Declaration requires an external verifier or delegating agent via DEGRADED_DECLARED message. Transitions: ACTIVE → DEGRADED, DEGRADED → ACTIVE, DEGRADED → REVOKED, DEGRADED → SUSPENDED, DEGRADED → CLOSED.
 - DRIFTED state (§4.2.3) introduces the behavioral-divergence path — distinct from the liveness-failure path (SUSPECTED/ZOMBIE/EXPIRED), the capability-degradation path (DEGRADED), and the adversarial-behavior path (REVOKED). DRIFTED is entered from ACTIVE when B self-declares behavioral divergence from its authorized constraint manifest (§5.8.2). B is reachable and cooperative but operating outside its authorized scope — zombie-by-drift, not zombie-by-silence. Non-terminal: A may re-negotiate constraints (new CAPABILITY_GRANT with updated manifest), terminate (SESSION_CLOSE), or invoke revocation (REVOKED). The behavioral constraint manifest in CAPABILITY_GRANT (§5.8.2) is the artifact against which compliance is measured. HEARTBEAT `manifest_compliance` field provides continuous drift monitoring; pull-based re-attestation (§5.10) provides bounded detection for drift that B cannot self-detect.
 - REVOKED state (§8.15) introduces the adversarial-behavior path — distinct from the liveness-failure path (SUSPECTED/ZOMBIE/EXPIRED), the capability-degradation path (DEGRADED), and the behavioral-divergence path (DRIFTED). REVOKED is entered from ACTIVE, DEGRADED, or DRIFTED when an agent is alive and actively working against the protocol. It is terminal with no resume path. The detection signal taxonomy (§8.16) defines four adversarial signals: selective suppression, verification anomalies, delegation manipulation, and attestation gaps. Revocation propagation (§8.17) uses PKI-lite via signed AGENT_MANIFEST with tombstone entries for decentralized revocation verification. Per-hop attestation (§8.18) uses async-optimistic delegation with TTL_ATTESTATION-bounded signed attestation records at each hop.
 - State-delta verification (§8.19) closes the gap between structural compliance and outcome verification. A structurally compliant execution that produces no observable state change is a silent failure — invisible to §8.8 structural verification and §8.10.5 verification failure taxonomy. `state_delta_assertions` (§6.1) declare expected post-execution state changes at delegation time; `DELTA_ABSENT` detects when those changes did not occur despite structural compliance; `idempotent: true` (§6.1) disambiguates intentional no-ops (idempotent re-execution) from silent failures.
