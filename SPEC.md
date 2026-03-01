@@ -216,6 +216,7 @@ AGENT_MANIFEST is distinct from CAPABILITY_MANIFEST (§5.1). The relationship be
 | platform | string | Yes | Platform where the agent is registered. MUST match the `platform` field in the agent's §2 identity object. The `(name, platform)` pair is the V1 identity handle. |
 | pubkey | string | No | Public key for cryptographic identity verification (§2.2.1). When present, the manifest MUST be signed with the corresponding private key. |
 | capabilities | array | Yes | List of capability summaries the agent supports (see §3.1.1). This is a registry-level overview — the full capability detail is declared via CAPABILITY_MANIFEST (§5.1) at session establishment. |
+| canonical_self_url | URI | Yes | Stable, publicly resolvable URL where this agent's AGENT_MANIFEST can be fetched directly — independent of any introduction path or intermediary routing. This is the agent's identity anchor for verification: when agent C receives an introduction claiming "agent A is at URL X," C MUST be able to fetch A's manifest from A's `canonical_self_url` and verify A's signature without relying on the introducing agent's representation. The URL MUST be under the publishing agent's control and MUST NOT depend on any other agent's infrastructure for resolution. See §8.17.4 for introduction verification requirements. |
 | endpoint | URI | Yes | Reachable endpoint for initiating contact. Format is deployment-specific (HTTPS URL, WebSocket URI, Nostr relay address, message queue). MUST be sufficient for a discovering agent to initiate a SESSION_INIT. |
 | protocol_version | semver | Yes | Protocol version the agent implements (§10). Enables version filtering during discovery — a querying agent can exclude agents on incompatible protocol versions before initiating contact. |
 | schema_version | semver | Yes | Schema version the agent supports (§10.1). |
@@ -232,6 +233,7 @@ AGENT_MANIFEST is distinct from CAPABILITY_MANIFEST (§5.1). The relationship be
 name: "agent-alpha"
 platform: "github"
 pubkey: "dGhpcyBpcyBhIHB1YmxpYyBrZXk..."
+canonical_self_url: "https://agents.example.com/alpha/manifest"
 capabilities:
   - capability_id: "cap:example.code.execute@1"
   - capability_id: "cap:example.web.search@1"
@@ -5045,6 +5047,7 @@ Each agent publishes a signed manifest of its current session state. The manifes
 |-------|------|----------|-------------|
 | agent_id | string | Yes | §2 identity handle of the publishing agent. |
 | pubkey | string | Yes | Public key of the publishing agent (§2.2.1). |
+| canonical_self_url | URI | Yes | Stable, publicly resolvable URL for this manifest (§3.1). MUST match the `canonical_self_url` in the agent's registry-scoped AGENT_MANIFEST. |
 | active_sessions | array | Yes | List of session_id values the agent considers currently ACTIVE. |
 | tombstones | array | Yes | List of tombstone entries for revoked sessions. See §8.17.2. |
 | manifest_version | integer | Yes | Monotonically increasing version number. Each manifest update increments this value. Peers MUST reject manifests with a version lower than the highest version they have previously seen for the same agent_id — prevents replay of stale manifests. |
@@ -5072,6 +5075,7 @@ A tombstone is a manifest entry that marks a specific session as revoked due to 
 ```yaml
 agent_id: "coordinator-prime"
 pubkey: "dGhpcyBpcyBhIHB1YmxpYyBrZXk..."
+canonical_self_url: "https://agents.example.com/coordinator-prime/manifest"
 active_sessions:
   - "session-43"
   - "session-44"
@@ -5102,9 +5106,30 @@ timestamp: "2026-02-28T10:15:01.000Z"
 - C can fetch A's updated manifest directly from A's manifest endpoint, bypassing B entirely.
 - B cannot block the manifest update from being published — the manifest is hosted at A's endpoint, not B's.
 
-**Limitation:** This mechanism depends on C knowing A's manifest endpoint. If C's only knowledge of A comes through B, and B provided a fabricated or omitted endpoint, C cannot independently verify the revocation. This is a known limitation of the PKI-lite model. Full mitigation requires a gossip protocol or registry (deferred to V2).
+**Limitation:** This mechanism depends on C knowing A's manifest endpoint. If C's only knowledge of A comes through B, and B provided a fabricated or omitted endpoint, C cannot independently verify the revocation. This is a known limitation of the PKI-lite model — the fabrication case is addressed by the introduction verification procedure (§8.17.4), which requires C to verify A's `canonical_self_url` independently. The omission case — B never providing A's endpoint at all — is a named V1 out-of-scope threat (§9.13). Full omission mitigation requires a gossip protocol or distributed registry (deferred to V2).
 
 **Relationship to §9.8 (Revocation Trust).** §9.8 documents the advisory nature of REVOKE signals and the Byzantine propagation problem for cooperative revocation. §8.17 addresses a different failure mode — adversarial revocation, where the agent being revoked is the one that would normally propagate the signal. The signed manifest approach converts revocation from a relay-dependent signal (§9.8) to a publisher-verifiable record — any peer can verify the revocation by checking the manifest signature, without trusting the relay path.
+
+#### 8.17.4 Introduction Verification
+
+<!-- Implements #103: Introductions are claims, not trusted facts. -->
+
+Introductions are claims, not trusted facts. When agent B introduces agent A to agent C — by providing A's manifest URL, identity handle, or capability claims — C MUST treat all introduction content as unverified assertions from B, not as authoritative statements about A.
+
+**Forgery threat (resolved by signature verification).** B may misrepresent A's manifest contents — declaring capabilities A does not have, providing a fabricated manifest, or presenting a stale version of A's manifest. This is defeated by the existing signature verification mechanism: A's AGENT_MANIFEST is signed with A's private key (§3.1 `signature` field), and C can verify the signature against A's `pubkey`. B cannot forge A's signature on A's own manifest.
+
+**Introduction verification procedure (REQUIRED).** When C receives an introduction containing a manifest URL for agent A:
+
+1. C MUST fetch A's manifest directly from the provided URL.
+2. C MUST verify the manifest signature against A's declared `pubkey` (§2.2.1). If verification fails, C MUST reject the introduction.
+3. C MUST verify that the `canonical_self_url` field (§3.1) in the fetched manifest matches the URL from which the manifest was retrieved. A mismatch indicates that the manifest is being served from a location other than A's declared canonical location — possible evidence of a relay or interception. C MUST reject the introduction on `canonical_self_url` mismatch.
+4. C MUST NOT accept B's representation of A's manifest contents as authoritative. The verification step is mandatory, not advisory — an unverified introduction carries no trust signal.
+
+**Post-verification trust.** Once C has independently verified A's manifest at A's `canonical_self_url`, C holds A's canonical identity anchor. Subsequent interactions between C and A do not depend on B's continued participation. B can delay but not fabricate A's current state once C has resolved A's canonical identity.
+
+**Omission threat (V1 out-of-scope).** The omission attack — B never telling C that A exists, or B suppressing updates to A's manifest URL — is not addressable by any cryptographic primitive. B cannot forge A's manifest, but B can choose never to introduce A to C at all. This is a named V1 out-of-scope threat. No V1 mechanism detects or prevents introduction omission when B is C's sole discovery vector for A. V2 design question: a distributed lookup mechanism (DNS-like or DHT-based) for canonical agent identity resolution independent of any single introduction vector. See §9.13.
+
+> Community discussion with @melonclaw on adversarial delegation chains. "Introductions are claims, not trusted facts" primitive and discovery hygiene gap emerged as the next open problem after §8.17 forgery protection. Closes #103.
 
 ### 8.18 Per-Hop Attestation
 
@@ -5581,6 +5606,7 @@ The `external_ref` field (§8.10.1) mitigates this limitation by anchoring evide
 - Delegation chain integrity (§6.9.3) ensures sub-delegations are structurally bound to their parent delegations via `parent_grant_hash` embedding and delegating agent signatures. Chain traversal verification (§6.9.3.2) proceeds by hash traversal from terminal to root delegation — each link verified by hash match and signature validity. `chain_integrity_failure` (§8.11.2) is the audit reason code for delegation chains that fail hash traversal verification. Delegation depth limits (§6.9.3.3) bound chain verification to O(max_delegation_depth) steps.
 - Trust annotation types (§9.10) define the closed enum of protocol-level trust claims. Schema attestation (§9.1) addresses who vouched for a schema's honesty; trust annotations address under what trust basis an agent acted. Trust annotations are included in `trace_hash` computation (§6.2), making the trust basis auditable through the existing hash verification mechanism. The genesis publication hash (§9.10.4) applies the same independence criteria as §8 audit media — the audited party must not control the publication medium.
 - Amendment ceremonies (§9.11) specify how the trust annotation enum (§9.10.2) may be modified after genesis. The amendment hash chain (§9.11.5) extends the genesis publication hash (§9.10.4) across the enum's full lifecycle. Backwards compatibility (§9.11.6) ensures that enum changes do not strand deployed agents — unknown annotation types are forwarded without interpretation, never rejected. Classification dispute resolution (§9.12) ensures that tier classification disputes default to Tier 2 (conservative) and that any participant can escalate a proposed Tier 1 amendment to Tier 2 review.
+- Introduction verification (§8.17.4) specifies that introductions are claims, not trusted facts — C MUST independently verify A's manifest when B introduces A. Introduction omission (§9.13) documents the residual threat that cryptographic verification cannot address: B suppressing the introduction entirely. `canonical_self_url` (§3.1) provides the identity anchor that makes independent verification possible.
 
 ### 9.7 Open Questions
 
@@ -6106,6 +6132,39 @@ Unresolved disputes default to Tier 2. If at any point during the dispute resolu
 The default-to-Tier-2 principle also applies when no dispute is raised but the observable criteria are ambiguous. A proposer who is uncertain whether a change is Tier 1 or Tier 2 SHOULD classify it as Tier 2. The cost asymmetry is clear: a Tier 2 ceremony for a cosmetic change wastes time; a Tier 1 process for a semantic change compromises governance integrity.
 
 > Addresses [issue #155](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/155): observable tier criteria and classification dispute resolution for amendment governance. Adds observable criteria for Tier 1 (cosmetic) and Tier 2 (semantic) classification based on implementation-observable behavioral impact rather than proposer intent. Adds worked examples at the tier boundary (constraining clarifications, precedence-implying reordering, cross-reference corrections). Specifies classification dispute resolution (§9.12) with unconditional escalation rights, suspension of Tier 1 process during disputes, re-justification procedure, automatic Tier 2 on repeated escalation or non-response, and conservative default-to-Tier-2 for unresolved disputes. Closes #155.
+
+### 9.13 Introduction Omission Threat
+
+<!-- Implements #103: Named V1 out-of-scope threat for introduction omission. -->
+
+§8.17.4 establishes that introductions are claims, not trusted facts, and specifies the verification procedure that defeats forgery — an introducing agent B cannot forge A's manifest signature or misrepresent A's capabilities once C independently verifies A's manifest at A's `canonical_self_url`. This section documents the residual threat that signature verification cannot address: **omission**.
+
+#### 9.13.1 Threat Description
+
+In a delegation chain A → B → C, agent B may be C's sole discovery vector for A. If B never introduces A to C — or introduces A with a stale or incorrect `canonical_self_url` — C has no mechanism to discover A's existence or verify A's current state. This is fundamentally different from forgery:
+
+- **Forgery** requires B to produce a cryptographic artifact (a manifest) that passes A's signature verification. Defeated by §8.17.4 verification procedure.
+- **Omission** requires B to do nothing — or to selectively delay introduction. No cryptographic primitive can force B to transmit information B chooses to withhold.
+
+The omission threat is particularly acute when B is a coordinator or gateway agent through which multiple agents are introduced. B's omission of a single introduction is invisible to both the omitted agent and the agent that never learns of the omission.
+
+#### 9.13.2 V1 Scope
+
+Introduction omission is a **named V1 out-of-scope threat**. V1 provides no detection or mitigation mechanism for the case where B is C's sole discovery vector for A and B suppresses the introduction entirely.
+
+**Why V1 cannot address this:** Any V1 mitigation would require either (a) a registry or distributed lookup mechanism that C can query independently of B (which §3 registries partially provide but do not mandate for all topologies), or (b) a protocol-level requirement that coordinators enumerate all known agents to all participants (which would leak topology information and create scaling problems). Neither is appropriate for V1's scope.
+
+**Partial V1 mitigation via registries:** When agents publish AGENT_MANIFESTs to registries (§3), C can discover A through registry QUERY operations (§3.2.1) without relying on B's introduction. This is a deployment-level mitigation, not a protocol guarantee — it depends on both A and C using the same registry (or federated registries), and on A's manifest being published before C needs to discover it.
+
+#### 9.13.3 V2 Design Direction
+
+V2 SHOULD investigate a distributed lookup mechanism for canonical agent identity resolution independent of any single introduction vector. Candidate approaches:
+
+- **DHT-based agent directory.** Agents publish their `canonical_self_url` (§3.1) to a distributed hash table keyed by `(name, platform)` identity handle. Any agent can resolve any other agent's canonical URL without relying on a specific intermediary.
+- **DNS-like resolution.** A hierarchical naming system where `canonical_self_url` resolution follows a deterministic path (e.g., platform-scoped well-known URLs) that C can attempt without prior introduction.
+- **Gossip-based manifest propagation.** Agents periodically broadcast their `canonical_self_url` to known peers. Over time, the network converges toward full awareness. Probabilistic, not guaranteed — a deliberately isolated agent may never receive the broadcast.
+
+The V2 design question is not "should agents be discoverable without introduction?" (yes) but "what is the minimum infrastructure required to make independent discovery reliable without centralizing the discovery mechanism?"
 
 ## 10. Versioning
 
