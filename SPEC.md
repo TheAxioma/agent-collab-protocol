@@ -686,8 +686,21 @@ ACTIVE → REVOKED
 ACTIVE → CLOSED
   Guard: SESSION_CLOSE sent by either participant
          AND no in-flight tasks (all tasks completed, failed, or cancelled)
+         AND no outstanding commitments (outstanding_commitments is empty)
          OR SESSION_CLOSE with force=true (immediate teardown,
-            in-flight tasks treated as failed)
+            in-flight tasks treated as failed, commitment_manifest
+            attached if commitments remain — §4.11.7)
+
+ACTIVE → SUSPENDED (commitment-blocked close)
+  Guard: SESSION_CLOSE sent by either participant
+         AND no in-flight tasks
+         AND outstanding_commitments is non-empty
+         The session MUST NOT transition to CLOSED when outstanding
+         commitments remain — it transitions to SUSPENDED with the
+         commitment manifest preserved for potential resume
+         (cross-reference §4.8 SESSION_RESUME, §5.12)
+         The receiving party MUST NOT treat the session as cleanly
+         terminated while COMMITMENTS_OUTSTANDING is set
 
 EXPIRED → ACTIVE
   Guard: SESSION_RESUME sent with state_hash and recovery_reason (§4.8)
@@ -1521,6 +1534,8 @@ SESSION_RESUME is the single recovery mechanism for all session interruptions �
 | sender_id | string | Yes | Identity of the suspending agent. |
 | reason | string | No | Why the session is being suspended. |
 | expected_resume_after | ISO 8601 | No | Hint for when the suspending agent expects to resume. Informational only — the counterparty is not obligated to wait. |
+| commitments_outstanding | boolean | Yes | `true` if the suspending agent has any outstanding commitments (§6.12) that remain unfulfilled at the time of suspension. `false` if all commitments have been fulfilled or cancelled. The receiving party MUST NOT treat the session as cleanly suspended if `commitments_outstanding` is `true` without explicit resolution of the commitment manifest. |
+| commitment_manifest | array | Conditional | Required when `commitments_outstanding` is `true`. Array of outstanding commitment records, each containing: `commitment_id` (UUID v4), `description` (string — from `commitment_spec`), `deadline_ms` (integer — expected delivery timestamp as Unix epoch milliseconds, derived from `due_by`; null if open-ended), `confirmation_token` (string — token from the original COMMITMENT message). The manifest is a snapshot of the agent's outstanding obligations at suspension time, enabling the counterparty or orchestrator to track, transfer, or resolve commitments during the suspension period. |
 | timestamp | ISO 8601 | Yes | When the SESSION_SUSPEND was sent. |
 
 **SESSION_CLOSE:**
@@ -1533,6 +1548,8 @@ SESSION_RESUME is the single recovery mechanism for all session interruptions �
 | reason | string | No | Why the session is being closed. |
 | force | boolean | No | If `true`, close immediately without waiting for in-flight tasks. In-flight tasks are treated as failed. Default: `false`. |
 | amendments_log | array | No | Array of amendment audit entries recording each accepted PLAN_AMEND during the session (see §6.11.6). The delegatee MUST include `amendments_log` in SESSION_CLOSE when any PLAN_AMEND was accepted during the session. The delegating agent SHOULD re-verify all `amend_hash` values on receipt. |
+| commitments_outstanding | boolean | Yes | `true` if the closing agent has any outstanding commitments (§6.12) that remain unfulfilled at session close. `false` if all commitments have been fulfilled or cancelled. The receiving party MUST NOT treat the session as cleanly terminated if `commitments_outstanding` is `true` without explicit resolution of the commitment manifest. |
+| commitment_manifest | array | Conditional | Required when `commitments_outstanding` is `true`. Array of outstanding commitment records, each containing: `commitment_id` (UUID v4), `description` (string — from `commitment_spec`), `deadline_ms` (integer — expected delivery timestamp as Unix epoch milliseconds, derived from `due_by`; null if open-ended), `confirmation_token` (string — token from the original COMMITMENT message). The manifest is a snapshot of the agent's outstanding obligations at close time, enabling the counterparty or orchestrator to track, transfer, or resolve commitments after session termination. |
 | timestamp | ISO 8601 | Yes | When the SESSION_CLOSE was sent. |
 
 ### 4.10 MANIFEST Canonicalization
@@ -1645,7 +1662,7 @@ Each agent MUST maintain a local SESSION_STATE object for every session it parti
 | session_id | string | Yes | The session identifier (from SESSION_INIT §4.3). Links this state object to a specific session. |
 | last_heartbeat_at | ISO 8601 | Yes | Timestamp of the most recent HEARTBEAT (§4.5.3) or KEEPALIVE (§4.5.1) received from the counterparty. Initialized to the SESSION_INIT_ACK timestamp at session establishment. Used by the local expiry timer — if `now() - last_heartbeat_at > session_expiry_ms`, the session transitions to EXPIRED (§4.2). |
 | current_task_id | string &#124; null | Yes | The `task_id` (§6.1) of the task currently being executed or coordinated within this session. `null` when no task is in flight. For coordinators, this is the most recently delegated task that has not yet reached a terminal state (TASK_COMPLETE, TASK_FAIL, TASK_CANCEL). For workers, this is the most recently accepted task (TASK_ACCEPT) that has not yet reached a terminal state. |
-| outstanding_commitments | array | Yes | List of outstanding commitments (§6.12) made by this agent that have not been fulfilled or cancelled. Each entry carries the minimum fields needed for commitment inheritance across instance boundaries: `commitment_id` (UUID v4 — unique identifier), `made_to` (string — §2 identity handle of the counterpart agent), `description` (string — what was promised, from `commitment_spec`), `made_at` (ISO 8601 — when the commitment was created), `due_by` (ISO 8601 — deadline for fulfillment, if specified; null if open-ended), `context_ref` (string — `task_id` or session context where the commitment was made). Initialized to `[]` at session establishment. Synchronized from the COMMITMENT_REGISTRY (§7.11) — the SESSION_STATE array is the in-session view of the durable registry. On instance termination and recovery, the incoming instance MUST reconstruct this array from the COMMITMENT_REGISTRY before transitioning to ACTIVE (§5.12). |
+| outstanding_commitments | array | Yes | List of outstanding commitments (§6.12) made by this agent that have not been fulfilled or cancelled. Each entry carries the minimum fields needed for commitment inheritance across instance boundaries: `commitment_id` (UUID v4 — unique identifier), `made_to` (string — §2 identity handle of the counterpart agent), `description` (string — what was promised, from `commitment_spec`), `made_at` (ISO 8601 — when the commitment was created), `due_by` (ISO 8601 — deadline for fulfillment, if specified; null if open-ended), `context_ref` (string — `task_id` or session context where the commitment was made), `confirmation_token` (string — opaque token exchanged when the commitment was made, used to correlate the commitment with the counterpart's acknowledgement record; generated by the committing agent and included in the COMMITMENT message §6.12). Initialized to `[]` at session establishment. Synchronized from the COMMITMENT_REGISTRY (§7.11) — the SESSION_STATE array is the in-session view of the durable registry. On instance termination and recovery, the incoming instance MUST reconstruct this array from the COMMITMENT_REGISTRY before transitioning to ACTIVE (§5.12). |
 
 **Update semantics:**
 
@@ -1688,6 +1705,7 @@ outstanding_commitments:
     made_at: "2026-02-27T10:00:00Z"
     due_by: "2026-02-28T18:00:00Z"
     context_ref: "task-001"
+    confirmation_token: "tok-7a8b9c0d-e1f2-3456-7890-abcdef012345"
 last_task_completed_at: null
 peer_session_ids:
   - "660f9511-f30c-52e5-b827-557766551111"
@@ -1705,7 +1723,7 @@ last_task_completed_at: "2026-02-27T10:34:50Z"
 peer_session_ids: []
 ```
 
-**Relationship to state_hash:** The `state_hash` reported in KEEPALIVE (§4.5.1) and SESSION_RESUME (§4.8) MUST be computed over the SESSION_STATE object's required fields using the canonical serialization procedure (§4.10.2). This anchors the state hash to a well-defined, cross-implementation-compatible structure rather than to implementation-specific internal state.
+**Relationship to state_hash:** The `state_hash` reported in KEEPALIVE (§4.5.1) and SESSION_RESUME (§4.8) MUST be computed over the SESSION_STATE object's required fields — including `outstanding_commitments` — using the canonical serialization procedure (§4.10.2). This anchors the state hash to a well-defined, cross-implementation-compatible structure rather than to implementation-specific internal state. Because `outstanding_commitments` is a required field, commitment state changes (additions, removals, fulfillments) are automatically reflected in the `state_hash`, enabling counterparty detection of commitment divergence via hash mismatch.
 
 **Commitment inheritance across instance boundaries:** When agent instance A1 terminates (clean shutdown, timeout, zombie recovery) and instance A2 takes over, A2 inherits all commitments in `outstanding_commitments` with no memory of having made them. To external agents, A1 and A2 are the same agent — a promise from A1 is a promise from A2. The `outstanding_commitments` array, backed by the durable COMMITMENT_REGISTRY (§7.11), is the mechanism that makes these inherited obligations visible to the successor instance. On recovery, the incoming instance MUST read `outstanding_commitments` from the COMMITMENT_REGISTRY and either: (a) fulfill them (continue the work), (b) explicitly notify the counterparty that the commitment cannot be honored via DIVERGENCE_REPORT (§8.11) with a reason, or (c) escalate to the session initiator. Silently dropping commitments across instance boundaries is a protocol violation — recovery that fails to honor or notify on an outstanding commitment MUST produce a `commitment_dropped` divergence entry (§8.10.4, §8.11.2). The full reconciliation procedure is defined in §5.12.
 
@@ -1778,6 +1796,51 @@ For file-based or log-based state implementations: an append-only changelog serv
 **Relationship to evidence layer (§8.10):** The evidence layer already provides append-only, externally verifiable records. Implementations that anchor SESSION_STATE changes to EVIDENCE_RECORDs (§8.10.1) effectively use the evidence layer as the changelog. The `last_evidence_id` field in SESSION_RESUME (§4.8) already points in this direction — §4.11.6 generalizes the pattern.
 
 > Source: @pinchy_mcpinchface (production teardown-by-design, 30-min heartbeat, 6+ weeks, brief-IS-state principle), @mauro (independent convergence from Solana validator teardown analogy), @Haustorium12 (filing cabinet pattern verified across 3 context compactions by human operator, three concrete failure modes of serialization). Closes [issue #112](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/112).
+
+#### 4.11.7 Commitment Manifest on Session Termination
+
+<!-- Implements #100: Outstanding commitments as session state — commitment manifest on session termination -->
+
+When a session is interrupted, terminated, or suspended, outstanding agent commitments are a silent coordination failure mode: orchestrators do not know what sub-agents committed to, and session teardown does not account for in-flight obligations. The commitment manifest requirement closes this gap by making outstanding obligations protocol-visible at every session exit point.
+
+**Normative requirements:**
+
+An agent MUST maintain its commitment records as part of SESSION_STATE (§4.11 `outstanding_commitments`). On SESSION_CLOSE (§4.9), FIDELITY_FAILURE (§8.22), or transition to SUSPENDED, the agent MUST:
+
+1. Set `commitments_outstanding` to `true` if any outstanding commitments remain unfulfilled.
+2. Attach a `commitment_manifest` listing all non-fulfilled commitments. Each manifest entry contains:
+   - `commitment_id`: UUID v4 — unique identifier for this commitment
+   - `description`: string — what the agent committed to deliver (from `commitment_spec`)
+   - `deadline_ms`: integer — expected delivery timestamp as Unix epoch milliseconds (derived from `due_by`); null if open-ended
+   - `confirmation_token`: string — token exchanged when commitment was made (from the original COMMITMENT message §6.12)
+
+**Clean termination guard:**
+
+The receiving party MUST NOT treat a session as cleanly terminated if `commitments_outstanding` is `true` without explicit resolution. Explicit resolution requires one of:
+- Each outstanding commitment is fulfilled (task completion satisfies the promise)
+- Each outstanding commitment is explicitly cancelled via COMMITMENT_CANCEL (§6.12)
+- Each outstanding commitment is explicitly abandoned via DIVERGENCE_REPORT (§8.11)
+- The orchestrator acknowledges the commitment manifest and assumes responsibility for tracking the outstanding obligations
+
+**Commitment-blocked close (ACTIVE → SUSPENDED):**
+
+A session with outstanding commitments MUST NOT transition to CLOSED — it MUST transition to SUSPENDED with the commitment manifest preserved for potential resume (cross-reference §4.8 SESSION_RESUME, §5.12 INITIALIZING commitment reconciliation). This prevents silent commitment abandonment: a CLOSED session is terminal, and any uncommitted obligations would be silently lost. A SUSPENDED session preserves the commitment manifest in SESSION_STATE, enabling a successor instance to discover and resolve the outstanding obligations during reconciliation.
+
+The exception is `force=true` on SESSION_CLOSE: forced close transitions directly to CLOSED but MUST include the commitment manifest in the SESSION_CLOSE message, transferring tracking responsibility to the receiving party. The receiving party MUST log the commitment manifest as an EVIDENCE_RECORD (§8.10) and MUST NOT discard the outstanding obligations.
+
+**session_anchor inclusion:**
+
+Commitment records MUST be included in `session_anchor` hash computation (§8.22.1). The `session_anchor` is computed over a canonical representation of the session's critical state — `outstanding_commitments` is part of that critical state. A session_anchor that does not reflect the current commitment landscape creates a fidelity gap where commitment state changes (additions, removals, fulfillments) are invisible to the orchestrator's verification logic.
+
+**V2 deferrals:**
+
+The following commitment manifest capabilities are deferred to V2:
+- Commitment arbitration — resolving disputes when the committing agent and counterpart disagree on commitment status
+- Inheritance across session resume — automatic commitment transfer when a SUSPENDED session is resumed by a different agent instance
+- Cross-agent commitment chain tracking — tracking commitments that span multiple agents in a delegation chain
+- SLA enforcement — protocol-level enforcement of commitment deadlines with automated escalation
+
+> Addresses [issue #100](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/100): outstanding commitments as session state — commitment manifest on session termination, COMMITMENTS_OUTSTANDING flag, commitment-blocked close guard, session_anchor inclusion, confirmation_token for commitment correlation. Closes #100.
 
 ### 4.12 Cross-Section Dependency Map
 
@@ -3624,6 +3687,7 @@ Sent by the committing agent to register a promise with the counterpart agent. A
 | commitment_type | enum | Yes | Classification of what is being promised. One of: `reply` (the agent promises to respond to a specific message or query), `task_completion` (the agent promises to complete a specific task or subtask), `state_delivery` (the agent promises to deliver a specific state artifact or data), `presence` (the agent promises to remain available for a specified duration). |
 | due_by | ISO 8601 | Yes | Deadline by which the commitment must be fulfilled. After this timestamp, the counterpart agent MAY treat the commitment as violated. The committing agent SHOULD either fulfill the commitment or send COMMITMENT_CANCEL before `due_by` elapses. |
 | commitment_spec | string | No | Free-form description of what was promised. Provides human-readable context beyond what `commitment_type` conveys — specific message to reply to, specific artifact to deliver, specific task to complete, or specific availability window. |
+| confirmation_token | string | Yes | Opaque token generated by the committing agent at commitment creation time. Used to correlate the commitment across session boundaries, agent instance replacements, and commitment manifest exchanges. The counterpart agent MUST store this token alongside its record of the commitment. On session termination or suspension, the `confirmation_token` is included in the commitment manifest (§4.9) to enable unambiguous matching between the committing agent's record and the counterpart's record. Format: implementation-specific (UUID v4 RECOMMENDED). |
 | timestamp | ISO 8601 | Yes | When the COMMITMENT was sent. |
 
 **COMMITMENT semantics:**
@@ -3643,6 +3707,7 @@ counterpart_agent_id: "agent-beta"
 commitment_type: task_completion
 due_by: "2026-02-28T18:00:00.000Z"
 commitment_spec: "Complete code review of module-X and deliver structured review artifact"
+confirmation_token: "tok-7a8b9c0d-e1f2-3456-7890-abcdef012345"
 timestamp: "2026-02-28T14:30:00.000Z"
 ```
 
@@ -4483,6 +4548,7 @@ The COMMITMENT_REGISTRY is a list of active COMMITMENT entries. Each entry corre
 | commitment_type | enum | Yes | One of: `reply`, `task_completion`, `state_delivery`, `presence`. |
 | due_by | ISO 8601 | Yes | Deadline for commitment fulfillment. |
 | commitment_spec | string | No | Free-form description of the promise. |
+| confirmation_token | string | Yes | Opaque token from the original COMMITMENT message (§6.12). Preserved through the registry lifecycle to enable commitment correlation across session boundaries and agent instance replacements. |
 | created_at | ISO 8601 | Yes | Timestamp when the COMMITMENT was originally sent. |
 
 #### 7.11.2 Registry Lifecycle
@@ -5963,7 +6029,7 @@ An agent SHOULD be classified FIDELITY_FAILURE when any of the following hold:
 
 2. **Response inconsistency.** Responses to session-contextual queries are inconsistent with prior session state. The agent cannot recall commitments declared earlier in the session (§6.12), contradicts its own prior statements within the same session, or produces outputs that are inconsistent with the session's established context. This signal is inherently probabilistic — a single inconsistency may be transient; sustained inconsistency across multiple probes is a strong fidelity failure signal.
 
-3. **Session anchor mismatch.** The agent's `session_anchor` hash — a hash of the agent's model of the session's critical state (active commitments, negotiated parameters, delegation chain) — does not match the orchestrator's record. The `session_anchor` is exchanged in KEEPALIVE messages (§4.5.1) when `heartbeat_params.fidelity_verification = true` is negotiated at SESSION_INIT (§4.3).
+3. **Session anchor mismatch.** The agent's `session_anchor` hash — a hash of the agent's model of the session's critical state (active commitments, negotiated parameters, delegation chain) — does not match the orchestrator's record. The `session_anchor` is exchanged in KEEPALIVE messages (§4.5.1) when `heartbeat_params.fidelity_verification = true` is negotiated at SESSION_INIT (§4.3). Commitment records are part of session state and MUST be included in session_anchor hashes: the `session_anchor` MUST be computed over a canonical representation that includes the full `outstanding_commitments` array from SESSION_STATE (§4.11), including each commitment's `commitment_id` and `confirmation_token`. A session_anchor that omits commitment records is non-compliant — commitment state changes (additions, removals, fulfillments) that are not reflected in the session_anchor create a silent fidelity gap where the orchestrator's commitment model diverges from the agent's without detection.
 
 4. **Self-reported compaction.** The agent explicitly reports a context compaction event that may have affected session state integrity. Self-reported compaction is a necessary but not sufficient condition for FIDELITY_FAILURE — an agent may compact context without losing session-critical state (e.g., if the compacted context was not session-relevant). The orchestrator MUST verify fidelity after a self-reported compaction event before classifying the agent as FIDELITY_FAILURE.
 
@@ -6062,14 +6128,19 @@ An agent self-reporting fidelity failure emits a `FIDELITY_ALERT` message:
 | alert_type | enum | Yes | One of: `COMPACTION_EVENT`, `EPOCH_DRIFT`, `COMMITMENT_LOSS`, `ANCHOR_MISMATCH`. |
 | alert_payload | object | Yes | Evidence for the alert — contents vary by `alert_type`. For `COMPACTION_EVENT`: estimated tokens compacted, list of potentially affected commitment IDs. For `EPOCH_DRIFT`: expected epoch, observed epoch. For `COMMITMENT_LOSS`: list of commitment IDs the agent can no longer reconstruct. For `ANCHOR_MISMATCH`: expected anchor hash, computed anchor hash. |
 | session_anchor | SHA-256 | Yes | The agent's current session anchor hash after the event. |
+| commitments_outstanding | boolean | Yes | `true` if the agent has any outstanding commitments (§6.12) that remain unfulfilled. |
+| commitment_manifest | array | Conditional | Required when `commitments_outstanding` is `true`. Array of outstanding commitment records (same schema as §4.9 SESSION_SUSPEND `commitment_manifest`). |
 | timestamp | ISO 8601 | Yes | When the alert was emitted. |
 | signature | string | Yes | Reporter's signature over the message (§2.2.1). |
+
+On emitting FIDELITY_ALERT, the agent MUST include `commitments_outstanding: true` and attach a `commitment_manifest` (same schema as §4.9 SESSION_SUSPEND) if any outstanding commitments remain unfulfilled. The orchestrator MUST NOT consider a FIDELITY_ALERT resolved while `commitments_outstanding` is `true` without explicit commitment reconciliation.
 
 On receiving FIDELITY_ALERT, the orchestrator SHOULD:
 
 1. Issue a `session_state_challenge` (§8.22.3) to independently verify the agent's context integrity.
 2. Log the alert as an EVIDENCE_RECORD (§8.10) with `evidence_type: fidelity_alert`.
-3. Decide whether to attempt recovery (commitment replay, state reconciliation) or terminate the session.
+3. If `commitments_outstanding` is `true`, verify the commitment manifest against the orchestrator's own COMMITMENT_REGISTRY records before deciding on recovery path.
+4. Decide whether to attempt recovery (commitment replay, state reconciliation) or terminate the session.
 
 #### 8.22.5 Relationship to DEGRADED State
 
