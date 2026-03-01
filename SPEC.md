@@ -984,6 +984,7 @@ The distinction matters because the appropriate response differs: zombie-by-sile
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Active session identifier. |
+| correlation_id | UUID v4 | Yes | Unique identifier for this message (§4.14.4). Fresh UUID v4 — DRIFT_DECLARED is unidirectional, not a response. |
 | agent_id | string | Yes | §2 identity handle of the agent declaring drift. |
 | constraint_manifest_id | UUID v4 | Yes | The `constraint_manifest_id` of the behavioral constraint manifest (§5.8.2) from which the agent has diverged. Binds the drift declaration to a specific authorized manifest. |
 | drift_reason | string | Yes | Human-readable explanation of what changed — scope creep detected, execution context changed, resource boundary exceeded, model swap occurred, plugin unloaded, etc. |
@@ -1239,6 +1240,7 @@ KEEPALIVE is a protocol-layer heartbeat. It is negotiated at session start — t
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Active session identifier. |
+| correlation_id | UUID v4 | Yes | Unique identifier for this message (§4.14.4). Fresh UUID v4 — KEEPALIVE is unidirectional, not a response. |
 | sender_id | string | Yes | Identity of the sending agent. |
 | state_hash | SHA-256 | Yes | Hash of the sender's current session state. Enables incremental state verification without full SESSION_RESUME. |
 | monotonic_counter | integer | Yes | Sender's current sequence number. Gaps indicate missed messages. |
@@ -1278,6 +1280,7 @@ HEARTBEAT is a minimal wire-protocol message for session liveness. It is distinc
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Active session identifier. |
+| correlation_id | UUID v4 | Yes | Unique identifier for this message (§4.14.4). Fresh UUID v4 — HEARTBEAT is unidirectional, not a response. |
 | timestamp | ISO 8601 | Yes | When the HEARTBEAT was sent. Receivers SHOULD reject HEARTBEAT messages with timestamps more than `session_expiry_ms` in the past. |
 | sequence | integer | Yes | Monotonically increasing sequence number. Starts at 0 at session establishment. Gaps indicate missed messages but do not trigger expiry — only the absence of any HEARTBEAT within `session_expiry_ms` triggers expiry. |
 | current_task_hash | SHA-256 | Conditional | SHA-256 hash of the agent's current task specification (§6.1). **Required** when `heartbeat_params.task_hash_verification` was negotiated to `true` in SESSION_INIT / SESSION_INIT_ACK (§4.3.1). MUST be omitted when `task_hash_verification` is `false` or was not negotiated. The counterparty compares this hash against its own record of the task specification — a mismatch indicates the agent has lost or corrupted its task context (context compaction zombie per §8.9). If the agent has no active task, the value MUST be the SHA-256 of the empty string. See §8.9 and §8.14 for the relationship between task hash mismatch and SUSPECTED state detection. |
@@ -1414,6 +1417,7 @@ SESSION_RESUME is the recovery handshake for sessions in SUSPENDED, COMPACTED, o
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Session to resume. |
+| correlation_id | UUID v4 | Yes | Unique identifier for this resume request (§4.14.4). STATE_HASH_ACK MUST echo this value. |
 | sender_id | string | Yes | Identity of the resuming agent. |
 | identity_object | object | Yes | Full §2 identity object — identity re-verification is mandatory (§2.3.3). |
 | state_hash | SHA-256 | Yes | Hash of the resuming agent's current session state. MUST reference the most recent EVIDENCE_RECORD (§8.10) — not a memory summary. This ensures the state hash is anchored to the evidence layer rather than to compactable agent memory, breaking the recursive self-attestation loop where agents verify their own claims about their own state. |
@@ -1428,6 +1432,7 @@ SESSION_RESUME is the recovery handshake for sessions in SUSPENDED, COMPACTED, o
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Echoed from SESSION_RESUME. |
+| correlation_id | UUID v4 | Yes | Echoed from SESSION_RESUME (§4.14.4). |
 | result | enum | Yes | `match` or `mismatch`. |
 | current_epoch | integer | Yes | The counterparty's current lease_epoch. |
 | reason | string | No | On mismatch: explanation of what diverged (state hash, epoch, identity). |
@@ -1469,6 +1474,7 @@ SESSION_RESUME is the single recovery mechanism for all session interruptions �
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Session to suspend. |
+| correlation_id | UUID v4 | Yes | Unique identifier for this message (§4.14.4). |
 | sender_id | string | Yes | Identity of the suspending agent. |
 | reason | string | No | Why the session is being suspended. |
 | expected_resume_after | ISO 8601 | No | Hint for when the suspending agent expects to resume. Informational only — the counterparty is not obligated to wait. |
@@ -1479,6 +1485,7 @@ SESSION_RESUME is the single recovery mechanism for all session interruptions �
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Session to close. |
+| correlation_id | UUID v4 | Yes | Unique identifier for this message (§4.14.4). |
 | sender_id | string | Yes | Identity of the closing agent. |
 | reason | string | No | Why the session is being closed. |
 | force | boolean | No | If `true`, close immediately without waiting for in-flight tasks. In-flight tasks are treated as failed. Default: `false`. |
@@ -2114,6 +2121,7 @@ CAPABILITY_REQUEST is the protocol mechanism for mid-task dynamic capability dis
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | task_id | UUID v4 | Yes | The active task requiring the new capability |
+| correlation_id | UUID v4 | Yes | Unique identifier for request-response correlation (§4.14.4). Response messages (CAPABILITY_REQUEST_APPROVED, CAPABILITY_REQUEST_DENIED) MUST echo this value. |
 | session_id | string | Yes | Active session identifier |
 | agent_id | string | Yes | Identity of the requesting agent |
 | requested_capabilities | array | Yes | Capability_ids the task needs but the agent does not currently have authorized for this task |
@@ -2146,6 +2154,7 @@ CAPABILITY_REQUEST (§5.8) handles task-side discovery of new capability needs. 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Active session identifier. |
+| correlation_id | UUID v4 | Yes | Unique identifier for this message (§4.14.4). Fresh UUID v4 — CAPABILITY_UPDATE is unidirectional, not a response. |
 | agent_id | string | Yes | Identity of the agent whose capabilities changed. |
 | removed | array | Yes | Capability IDs (§5.1.1 format) that are no longer available. Empty array `[]` if no capabilities were removed. |
 | added | array | No | Capability IDs (§5.1.1 format) that are newly available. Empty array or omitted if no capabilities were added. |
@@ -2240,6 +2249,7 @@ Re-issuing a CAPABILITY_GRANT to extend authorization is semantically ambiguous 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | renew_id | UUID v4 | Yes | Unique identifier for this renewal instance. |
+| correlation_id | UUID v4 | Yes | Unique identifier for request-response correlation (§4.14.4). |
 | original_grant_id | UUID v4 | Yes | The `grant_id` of the CAPABILITY_GRANT being renewed. Binds the renewal to a specific prior grant for audit trail continuity. |
 | task_id | UUID v4 | Yes | The task for which capabilities are being renewed. MUST match the `task_id` of the original grant. |
 | session_id | string | Yes | Active session identifier. |
@@ -2804,6 +2814,7 @@ Sent by the delegatee to confirm it will execute the task.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | task_id | UUID v4 | Yes | Echoed from TASK_ASSIGN |
+| correlation_id | UUID v4 | Yes | Echoed from TASK_ASSIGN. Enables the delegator to match this acceptance to the originating delegation request (§4.14.4). |
 | request_id | UUID v4 | Yes | Echoed from TASK_ASSIGN. Enables the delegator to correlate the acceptance with the specific delegation-initiation attempt. |
 | session_id | string | Yes | Echoed from TASK_ASSIGN |
 | accepted_at | ISO 8601 | Yes | Timestamp of acceptance |
@@ -2817,6 +2828,7 @@ Sent by the delegatee to the coordinator after TASK_ACCEPT (and after SESSION_IN
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | task_id | UUID v4 | Yes | Echoed from TASK_ASSIGN |
+| correlation_id | UUID v4 | Yes | Unique identifier for this message (§4.14.4). |
 | session_id | string | Yes | Echoed from TASK_ASSIGN |
 | plan_hash | SHA-256 | Yes | Hash of the delegatee's canonical plan representation. MUST be deterministic for the same logical plan. Recommended: SHA-256 of canonical UTF-8 JSON. The canonical representation is implementation-defined but MUST be documented in the agent's capability manifest (§5.1). |
 | task_hash_ref | SHA-256 | Yes | The `task_hash` (§6.1) of the task this plan was made against. Binds the plan commitment to a specific task version — any task modification invalidates the prior commitment and requires a new PLAN_COMMIT. |
@@ -2943,6 +2955,7 @@ Sent by the delegatee to decline the task.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | task_id | UUID v4 | Yes | Echoed from TASK_ASSIGN |
+| correlation_id | UUID v4 | Yes | Echoed from TASK_ASSIGN. Enables the delegator to match this rejection to the originating delegation request (§4.14.4). |
 | request_id | UUID v4 | Yes | Echoed from TASK_ASSIGN. Enables the delegator to correlate the rejection with the specific delegation-initiation attempt. |
 | session_id | string | Yes | Echoed from TASK_ASSIGN |
 | reason | string | Yes | Why the task was rejected (insufficient capabilities, resource limits, trust level incompatible, etc.) |
@@ -2956,6 +2969,7 @@ Optionally sent by the delegatee during execution. Serves as both a progress upd
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | task_id | UUID v4 | Yes | Echoed from TASK_ASSIGN |
+| correlation_id | UUID v4 | Yes | Unique identifier for this message (§4.14.4). Fresh UUID v4 — TASK_PROGRESS is unidirectional, not a response. |
 | session_id | string | Yes | Echoed from TASK_ASSIGN |
 | progress | object | No | Structured progress data (percentage, subtask status, etc.) |
 | current_step_id | string | No | The `step_id` (from the active PLAN_COMMIT's `steps` array) of the step currently being executed. Present when PLAN_COMMIT with steps is active. When `current_step_id` changes from a previous TASK_PROGRESS, this signals that the previous step's end boundary has been crossed. |
@@ -2972,6 +2986,7 @@ Sent by the delegatee when the task finishes successfully.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | task_id | UUID v4 | Yes | Echoed from TASK_ASSIGN |
+| correlation_id | UUID v4 | Yes | Unique identifier for this message (§4.14.4). Fresh UUID v4 — TASK_COMPLETE is unidirectional, not a response. |
 | session_id | string | Yes | Echoed from TASK_ASSIGN |
 | result | object or string | Yes | Structured result conforming to `expected_output_format`, or a resource reference (URI) to the result |
 | trace_hash | SHA-256 | Yes | Post-execution hash of the actual execution trace (§6.2) |
@@ -2992,6 +3007,7 @@ Sent by the delegatee when the task cannot be completed.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | task_id | UUID v4 | Yes | Echoed from TASK_ASSIGN |
+| correlation_id | UUID v4 | Yes | Unique identifier for this message (§4.14.4). Fresh UUID v4 — TASK_FAIL is unidirectional, not a response. |
 | session_id | string | Yes | Echoed from TASK_ASSIGN |
 | error | object | Yes | Structured error: `code` (string), `message` (string), `details` (object, optional) |
 | partial_results | object or null | No | Whatever partial output is available; null if nothing was produced |
@@ -3013,6 +3029,7 @@ Optionally sent by the delegatee during execution to persist recoverable state. 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | task_id | UUID v4 | Yes | Task instance being checkpointed |
+| correlation_id | UUID v4 | Yes | Unique identifier for this message (§4.14.4). Fresh UUID v4 — TASK_CHECKPOINT is unidirectional, not a response. |
 | session_id | string | Yes | Active session identifier |
 | checkpoint_id | UUID v4 | Yes | Unique identifier for this checkpoint (enables ordered recovery) |
 | state | object | Yes | Serializable task state snapshot at this point |
@@ -3033,6 +3050,7 @@ Sent by the delegating agent to explicitly cancel an in-flight task. TASK_CANCEL
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | task_id | UUID v4 | Yes | Task to cancel |
+| correlation_id | UUID v4 | Yes | Unique identifier for this cancellation request (§4.14.4). |
 | session_id | string | Yes | Active session identifier |
 | reason | string | Yes | Why the task is being cancelled. Standard reasons: `session_expired` (parent session entered EXPIRED, §4.2), `cancelled_upstream` (upstream delegator cancelled), `superseded` (task replaced by a new assignment), `coordinator_decision` (general cancellation by delegator) |
 | cancelled_at | ISO 8601 | Yes | Timestamp of cancellation |
@@ -3802,6 +3820,7 @@ REVOCATION_MODE_ESCALATE is sent by the delegating agent (A) to the delegatee (B
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | The active session identifier. MUST reference an ACTIVE session between A and B. |
+| correlation_id | UUID v4 | Yes | Unique identifier for this escalation request (§4.14.4). REVOCATION_MODE_ESCALATE_ACK MUST echo this value. |
 | task_id | UUID v4 | Yes | The task whose revocation mode is being escalated. Correlates with the original TASK_ASSIGN. |
 | new_mode | enum | Yes | The revocation mode to activate. One of: `sync`, `gossip`. MUST be strictly stricter than the current mode (see §6.15.3 for the strictness ordering). |
 | effective_from | enum | Yes | When the new mode takes effect. Value: `next_operation` — the mode change applies from B's next operation forward. The escalation is not retroactive: operations already committed under the prior mode are not re-evaluated. |
@@ -3828,6 +3847,7 @@ REVOCATION_MODE_ESCALATE_ACK is sent by the delegatee (B) to acknowledge the mod
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Echoed from REVOCATION_MODE_ESCALATE. |
+| correlation_id | UUID v4 | Yes | Echoed from REVOCATION_MODE_ESCALATE (§4.14.4). |
 | task_id | UUID v4 | Yes | Echoed from REVOCATION_MODE_ESCALATE. |
 | prior_mode | enum | Yes | The revocation mode that was in effect before the escalation. One of: `sync`, `gossip`. |
 | new_mode | enum | Yes | Echoed from REVOCATION_MODE_ESCALATE. Confirms the mode B has activated. |
@@ -4575,6 +4595,7 @@ Tier 1 is a lightweight ping/pong mechanism for detecting network-level disconne
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Active session identifier. |
+| correlation_id | UUID v4 | Yes | Unique identifier for this ping request (§4.14.4). |
 | timestamp | ISO 8601 | Yes | When the HEARTBEAT_PING was sent. |
 | sequence | integer | Yes | Monotonically increasing sequence number. Starts at 0 at session establishment. |
 
@@ -4583,6 +4604,7 @@ Tier 1 is a lightweight ping/pong mechanism for detecting network-level disconne
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Active session identifier. |
+| correlation_id | UUID v4 | Yes | Echoed from the corresponding HEARTBEAT_PING (§4.14.4). |
 | ping_sequence | integer | Yes | Echoed `sequence` from the corresponding HEARTBEAT_PING. Enables correlation of pong to ping for round-trip latency measurement. |
 | timestamp | ISO 8601 | Yes | When the HEARTBEAT_PONG was sent. |
 
@@ -4605,6 +4627,7 @@ Tier 2 is an expensive, periodic challenge-response mechanism for detecting agen
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Active session identifier. |
+| correlation_id | UUID v4 | Yes | Unique identifier for this challenge request (§4.14.4). SEMANTIC_RESPONSE MUST echo this value. |
 | task_hash | SHA-256 | Yes | Hash of the current task specification (§6.1) as known by the challenger. The challenged agent MUST be able to reproduce this hash from its own task context. |
 | checkpoint_ref | string | Yes | Reference to the most recent TASK_CHECKPOINT (§6.6) or state commitment the challenger considers current. Format: checkpoint identifier or hash. |
 | challenge_nonce | string | Yes | Random nonce to prevent replay of cached responses. The challenged agent MUST include this nonce in the hash computation for its response. |
@@ -4615,6 +4638,7 @@ Tier 2 is an expensive, periodic challenge-response mechanism for detecting agen
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Active session identifier. |
+| correlation_id | UUID v4 | Yes | Echoed from the corresponding SEMANTIC_CHALLENGE (§4.14.4). |
 | current_state_hash | SHA-256 | Yes | Hash of the agent's current working state, computed as `SHA-256(task_hash ‖ local_state_snapshot ‖ challenge_nonce)`. The inclusion of `challenge_nonce` prevents replaying a previously valid response. |
 | checkpoint_ref | string | Yes | Echoed or updated checkpoint reference. If the agent has advanced beyond the challenger's `checkpoint_ref`, it returns the more recent checkpoint. |
 | plan_hash | SHA-256 | No | The `plan_hash` from the agent's most recent PLAN_COMMIT (§6.6, §6.11) for the challenged task. When present, adds a third verification axis: the coordinator can detect mid-task execution drift against the original plan commitment, not just against the task specification. Coordinators SHOULD cross-reference this with the stored PLAN_COMMIT to verify the agent still holds the correct plan context. |
@@ -4641,6 +4665,7 @@ When Tier 2 semantic verification fails, the coordinator sends ZOMBIE_DECLARED t
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Active session identifier. |
+| correlation_id | UUID v4 | Yes | Unique identifier for this message (§4.14.4). |
 | target_agent_id | string | Yes | §2 identity handle of the agent declared as zombie. |
 | reason | enum | Yes | `SEMANTIC_HASH_MISMATCH` — state hash did not match expected value. `SEMANTIC_RESPONSE_TIMEOUT` — agent failed to respond to SEMANTIC_CHALLENGE within `semantic_check_interval_ms`. `CHECKPOINT_UNRECOGNIZED` — agent's `checkpoint_ref` does not correspond to any known checkpoint. |
 | expected_state_hash | SHA-256 | No | The hash the coordinator expected (for diagnostic purposes). Omitted when reason is `SEMANTIC_RESPONSE_TIMEOUT`. |
@@ -4968,6 +4993,7 @@ DIVERGENCE_REPORT is sent when a divergence is detected between expected and act
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Session in which the divergence was detected. |
+| correlation_id | UUID v4 | Yes | Unique identifier for this message (§4.14.4). |
 | report_id | UUID v4 | Yes | Unique identifier for this divergence report. |
 | source_agent_id | string | Yes | §2 identity handle of the agent that detected the divergence. |
 | target_agent_id | string | Yes | §2 identity handle of the agent whose behavior diverged. |
@@ -5256,6 +5282,7 @@ When an agent or coordinator determines that a counterparty has exhibited advers
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Session being revoked. |
+| correlation_id | UUID v4 | Yes | Unique identifier for this message (§4.14.4). |
 | target_agent_id | string | Yes | §2 identity handle of the adversarial agent. |
 | detection_signals | array | Yes | List of detection signal types (§8.16) that triggered the revocation. Each entry specifies the signal class and occurrence count. |
 | evidence_refs | array | Yes | References to EVIDENCE_RECORDs (§8.10) documenting the adversarial behavior. At least one evidence reference is REQUIRED — revocation without evidence is a protocol violation. |
