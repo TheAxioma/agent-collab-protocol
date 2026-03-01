@@ -1618,6 +1618,7 @@ SESSION_RESUME is the single recovery mechanism for all session interruptions �
 | amendments_log | array | No | Array of amendment audit entries recording each accepted PLAN_AMEND during the session (see §6.11.6). The delegatee MUST include `amendments_log` in SESSION_CLOSE when any PLAN_AMEND was accepted during the session. The delegating agent SHOULD re-verify all `amend_hash` values on receipt. |
 | commitments_outstanding | boolean | Yes | `true` if the closing agent has any outstanding commitments (§6.12) that remain unfulfilled at session close. `false` if all commitments have been fulfilled or cancelled. The receiving party MUST NOT treat the session as cleanly terminated if `commitments_outstanding` is `true` without explicit resolution of the commitment manifest. |
 | commitment_manifest | array | Conditional | Required when `commitments_outstanding` is `true`. Array of outstanding commitment records, each containing: `commitment_id` (UUID v4), `description` (string — from `commitment_spec`), `deadline_ms` (integer — expected delivery timestamp as Unix epoch milliseconds, derived from `due_by`; null if open-ended), `confirmation_token` (string — token from the original COMMITMENT message). The manifest is a snapshot of the agent's outstanding obligations at close time, enabling the counterparty or orchestrator to track, transfer, or resolve commitments after session termination. |
+| pending_tasks | array | Conditional | Applicable when session state was SUSPENDED at teardown time. Array of task descriptors for tasks that were in-flight at suspension time. See §4.9.2 for field schema, population rules, and receiver obligations. Agents MUST populate `pending_tasks` when tearing down from SUSPENDED state and have knowledge of in-flight work. Agents MAY omit the field when no tasks were pending at suspension (clean suspension). |
 | timestamp | ISO 8601 | Yes | When the SESSION_CLOSE was sent. |
 
 #### 4.9.1 SESSION_RESUME Authority and SESSION_DENY
@@ -1729,6 +1730,7 @@ signature: "c2Vzc2lvbi1kZW55LXNpZw..."
 - §8.22 FIDELITY_FAILURE: context compaction as source of `STATE_UNAVAILABLE`
 - §4.15 bilateral SESSION_CANCEL: alternative clean termination path from SUSPENDED
 - §4.11 commitment manifest: resuming party MUST re-confirm outstanding commitments in SESSION_RESUME
+- §4.9.2 pending_tasks inventory: when teardown from SUSPENDED triggers SESSION_CLOSE, the `pending_tasks` field communicates in-flight task state
 
 **V2 deferrals:**
 
@@ -1740,6 +1742,84 @@ The following SESSION_RESUME authority capabilities are deferred to V2:
 - Negotiated `suspension_ttl` extension without teardown
 
 > Addresses [issue #174](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/174): SESSION_RESUME authority, session_anchor verification, suspension_ttl enforcement, SESSION_DENY with structured reason codes. Closes #174.
+
+#### 4.9.2 Pending Tasks Inventory on Teardown from SUSPENDED State
+
+<!-- Implements #182: pending_tasks field on SESSION_CLOSE for teardown from SUSPENDED state -->
+
+When a session transitions from SUSPENDED to CLOSED (via SESSION_CLOSE or `suspension_ttl` expiry), the terminating party may have knowledge of tasks that were in-flight at the time of suspension. Without a standard mechanism to communicate this inventory, the session issuer, orchestrator, or any agent inheriting responsibility for the session's unfinished work faces an information gap — they cannot distinguish a clean suspension (no pending work) from a dirty one (work was in progress).
+
+**`pending_tasks` field schema:**
+
+Each entry in the `pending_tasks` array is a task descriptor with the following fields:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| task_id | UUID v4 | Yes | Unique identifier for the in-flight task. |
+| task_type | string | Yes | Task type from the session's declared capability set (§5.1). |
+| status | enum | Yes | One of: `pending` (queued but not started), `in_progress` (actively executing at suspension time), `blocked` (waiting on a dependency or external input). |
+| started_at | ISO 8601 | No | When the task began execution. Applicable for `in_progress` and `blocked` tasks. |
+| progress_notes | string | No | Free-text description of the task's progress at suspension time. Useful for handoff to a replacement agent or for compensation planning. |
+| compensation_required | boolean | No | `true` if the task performed irrevocable work that may require compensation (§6.16.6) upon abandonment. Default: `false`. |
+
+**Population rules:**
+
+1. Agents MUST populate `pending_tasks` when issuing SESSION_CLOSE from SUSPENDED state and the agent has knowledge of in-flight work at the time of suspension.
+2. Agents MAY omit `pending_tasks` when no tasks were pending at suspension time (clean suspension — all tasks completed or cancelled before SESSION_SUSPEND was issued).
+3. The `task_type` field MUST reference a type from the session's declared capability set (§5.1). Unknown task types indicate a protocol violation.
+4. The `status` field reflects the task's state at the time of the original SESSION_SUSPEND, not at the time of SESSION_CLOSE. The purpose is to communicate what was in-flight when the session was frozen, not what has happened since.
+
+**Receiver obligations:**
+
+1. Receivers SHOULD treat `pending_tasks` presence as a trigger for task resumption negotiation or compensation workflows. Cross-reference §6.16.6 Compensation Semantics for tasks where `compensation_required` is `true`.
+2. Receivers SHOULD log `pending_tasks` as part of the SESSION_CLOSE EVIDENCE_RECORD (§8.10) to preserve the inventory for post-hoc analysis.
+3. Receivers MUST NOT silently discard `pending_tasks` — the inventory represents work that may need to be reassigned, resumed in a new session, or compensated.
+
+**Audit warning for omission:**
+
+When a SESSION_CLOSE is issued from SUSPENDED state without `pending_tasks`, and in-flight tasks were plausibly present (e.g., the session had active task delegations before suspension, or the SESSION_SUSPEND included `commitments_outstanding: true`), implementations SHOULD emit a `SESSION_TEARDOWN_PENDING_TASKS_OMITTED` audit warning event (§6.13.4). This signals a potential information gap to monitoring infrastructure without blocking the teardown.
+
+**Example SESSION_CLOSE from SUSPENDED state with pending_tasks:**
+
+```yaml
+session_id: "session-abc-123"
+correlation_id: "g70df43e-8bff-4605-d890-3h35e6f6g712"
+sender_id: "agent-alpha"
+reason: "suspension_ttl expired, resumption not possible"
+force: false
+commitments_outstanding: true
+commitment_manifest:
+  - commitment_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+    description: "Deliver code review for module X"
+    deadline_ms: 1740860400000
+    confirmation_token: "tok_review_module_x"
+pending_tasks:
+  - task_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+    task_type: "code_review"
+    status: "in_progress"
+    started_at: "2026-03-01T11:30:00Z"
+    progress_notes: "Reviewed 3 of 7 files in module X"
+    compensation_required: false
+  - task_id: "c3d4e5f6-a7b8-9012-cdef-123456789012"
+    task_type: "dependency_audit"
+    status: "pending"
+    compensation_required: false
+  - task_id: "d4e5f6a7-b8c9-0123-defa-234567890123"
+    task_type: "database_migration"
+    status: "blocked"
+    started_at: "2026-03-01T11:45:00Z"
+    progress_notes: "Migration step 2 of 5 committed, awaiting lock release"
+    compensation_required: true
+timestamp: "2026-03-01T13:00:05Z"
+```
+
+**Cross-references:**
+
+- §4.9 SESSION_SUSPEND: `commitments_outstanding` and `commitment_manifest` capture obligation-level state; `pending_tasks` captures task-level state. Both are needed for complete handoff.
+- §6.16.6 Compensation Semantics: tasks with `compensation_required: true` feed into the compensation workflow. The `pending_tasks` inventory provides the task-level context that compensation hooks need to determine remediation scope.
+- §8.13 Teardown-First Recovery: teardown-first recovery reads canonical state from durable storage. `pending_tasks` provides the task inventory that a recovering agent or replacement session needs to determine what work remains.
+
+> Addresses [issue #182](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/182): `pending_tasks` inventory field on SESSION_CLOSE for teardown from SUSPENDED state. Adds task descriptor schema, population rules, receiver obligations, `SESSION_TEARDOWN_PENDING_TASKS_OMITTED` audit warning, and cross-references to §6.16.6 and §8.13. Closes #182.
 
 ### 4.10 MANIFEST Canonicalization
 
@@ -4185,10 +4265,11 @@ Explicit revocation and mid-session mode escalation introduce three audit event 
 | `IN_FLIGHT_COMPLETED_DURING_GRACE` | An in-flight operation completed during the grace period between revocation receipt and `takes_effect_at` enforcement (§6.16.3) | `revocation_id`, `grant_id`, `task_id`, `operation_started_at`, `operation_completed_at`, `takes_effect_at`, identity of the executing agent |
 | `COMPENSATION_REQUIRED` | Irrevocable work was committed after `effective_from` and requires compensation (§6.16.6) | `revocation_id`, `grant_id`, `task_id`, `operation_id`, `committed_at`, `effective_from`, `compensation_status` (`pending`, `completed`, `failed`), identity of the executing agent |
 | `GRANT_CHAIN_INTEGRITY_FAILURE` | CAPABILITY_GRANT chain verification failed — a sub-grant's `parent_grant_hash` does not match the computed SHA-256 of the resolved parent grant, or the parent grant could not be resolved (§5.8.2) | `grant_id` (failing sub-grant), `parent_grant_id`, `claimed_parent_grant_hash`, `computed_parent_grant_hash` (if parent was resolvable), `failure_reason` (`hash_mismatch`, `parent_unresolvable`, `signature_invalid`), timestamp of detection, identity of the detecting agent |
+| `SESSION_TEARDOWN_PENDING_TASKS_OMITTED` | SESSION_CLOSE issued from SUSPENDED state without `pending_tasks` when in-flight tasks were plausibly present (§4.9.2) — audit warning indicating a potential information gap for task resumption or compensation | `session_id`, `sender_id`, `prior_session_state` (`SUSPENDED`), `commitments_outstanding` (from SESSION_CLOSE), `suspension_had_active_tasks` (boolean — `true` if the session had active task delegations before suspension), timestamp of teardown, identity of the closing agent |
 
 **`EXPLICIT_REVOCATION` is a distinct class from TTL expiry.** When a grant is rejected because `current_time > valid_until` (§5.8.2), the rejection reason is temporal expiry — the grant aged out. When a grant is rejected because a valid revocation token exists, the rejection reason is active revocation by the issuer. These are different failure modes with different causes, different attribution, and different recovery paths. The audit trail MUST distinguish them.
 
-**EVIDENCE_RECORD integration:** `EXPLICIT_REVOCATION` and `REVOCATION_TOKEN_INVALID` events SHOULD be recorded as EVIDENCE_RECORDs (§8.10.1) with `evidence_type: error_event`. The `payload_hash` SHOULD be computed over the revocation token contents (valid or invalid) to enable independent verification of the audit entry. `IN_FLIGHT_COMPLETED_DURING_GRACE` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: state_snapshot`, capturing the operation's authorization context and completion timestamp relative to the `takes_effect_at` deadline. `COMPENSATION_REQUIRED` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: error_event`, capturing the irrevocable operation's commit timestamp relative to `effective_from` and the compensation status lifecycle (`pending` → `completed` or `failed`). `GRANT_CHAIN_INTEGRITY_FAILURE` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: error_event`, capturing the failing sub-grant's `grant_id`, `parent_grant_id`, both the claimed and computed parent grant hashes, and the specific failure reason (`hash_mismatch`, `parent_unresolvable`, or `signature_invalid`).
+**EVIDENCE_RECORD integration:** `EXPLICIT_REVOCATION` and `REVOCATION_TOKEN_INVALID` events SHOULD be recorded as EVIDENCE_RECORDs (§8.10.1) with `evidence_type: error_event`. The `payload_hash` SHOULD be computed over the revocation token contents (valid or invalid) to enable independent verification of the audit entry. `IN_FLIGHT_COMPLETED_DURING_GRACE` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: state_snapshot`, capturing the operation's authorization context and completion timestamp relative to the `takes_effect_at` deadline. `COMPENSATION_REQUIRED` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: error_event`, capturing the irrevocable operation's commit timestamp relative to `effective_from` and the compensation status lifecycle (`pending` → `completed` or `failed`). `GRANT_CHAIN_INTEGRITY_FAILURE` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: error_event`, capturing the failing sub-grant's `grant_id`, `parent_grant_id`, both the claimed and computed parent grant hashes, and the specific failure reason (`hash_mismatch`, `parent_unresolvable`, or `signature_invalid`). `SESSION_TEARDOWN_PENDING_TASKS_OMITTED` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: error_event`, capturing the `session_id`, prior session state (`SUSPENDED`), whether commitments were outstanding, and whether the session had active task delegations before suspension — enabling post-hoc identification of teardowns that may have lost task inventory information.
 
 **Receiver-recorded `propagated_at` timestamp:** On receiving a valid revocation token, the receiving agent MUST record a `propagated_at` timestamp — the agent's local clock time at the moment of token receipt. `propagated_at` is NOT a field on the revocation token itself (it cannot be — the issuer does not know when the receiver will receive the token). It is receiver-local state that MUST be persisted alongside the cached revocation token. `propagated_at` enables: (a) measuring actual propagation latency (`propagated_at - revoked_at`) against the declared `propagation_window_ms`; (b) determining whether good faith protection applies (§6.13.6) — operations committed before `propagated_at` are candidates for good faith protection; (c) audit trail correlation — the `EXPLICIT_REVOCATION` audit event (above) includes `propagated_at` to record when the enforcing agent learned of the revocation.
 
@@ -4559,6 +4640,8 @@ B discovers irrevocable work committed after effective_from:
 ```
 
 **Relationship to good faith protection (§6.13.6):** Good faith protection determines *fault attribution* — who is responsible for the cost of irrevocable work committed during the propagation window. Compensation semantics determine *remediation* — what to do about the irrevocable work regardless of fault. Both apply simultaneously: an agent may be protected from blame (good faith) while still requiring compensation (the work exists and must be addressed).
+
+**Relationship to pending_tasks inventory (§4.9.2):** When a session is torn down from SUSPENDED state, in-flight tasks with `compensation_required: true` in the `pending_tasks` inventory (§4.9.2) feed into the compensation workflow defined here. The `pending_tasks` inventory provides the task-level context — which tasks were in-flight, what progress was made, and whether irrevocable work was committed — that compensation hooks need to determine remediation scope. Agents receiving a SESSION_CLOSE with `pending_tasks` entries where `compensation_required` is `true` SHOULD initiate the compensation flow (§6.16.6) for those tasks.
 
 > Implements [issue #94](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/94): compensation semantics for irrevocable work committed past `effective_from`. Adds `COMPENSATION_REQUIRED` audit event, compensation endpoint declaration in capability manifest, idempotency requirement for compensation operations, and compensation flow for propagation-gap and race-condition commits. Closes #94.
 
@@ -5689,6 +5772,7 @@ The recovering agent's state reconstruction depends on storage that survives pro
 - **§8.4 (Coordination Patterns):** The teardown-by-default pattern described in §8.4 is formalized here as a normative requirement, not just a coordination preference.
 - **§8.5 (Named Considerations):** The "Teardown over resume from production" consideration is the empirical motivation for this section's normative requirements.
 - **§8.10 (Evidence Layer):** The evidence layer provides the durable, externally verifiable state that the recovering agent reads during state reconstruction — replacing the compactable in-memory state that teardown-first explicitly prohibits.
+- **§4.9.2 (Pending Tasks Inventory):** When teardown occurs from SUSPENDED state, the `pending_tasks` field on SESSION_CLOSE provides the task inventory that a recovering agent or replacement session needs to determine what work remains. This complements teardown-first recovery by making the pre-suspension task landscape protocol-visible at the teardown boundary.
 
 #### 8.13.6 Crossed Steps Survive Teardown-First Recovery
 
