@@ -27,6 +27,27 @@ The core problem is the ordering-vs-meaning gap. Causal ordering between agents 
 - Canonical task schema with semantic and syntactic identity
 - Progress reporting and structured error handling
 
+### 1.1 Scope: Objective-Agnosticism and Adversarial Model
+
+#### Objective-agnosticism is deliberate
+
+The protocol is objective-agnostic by design — it does not prescribe, inspect, or verify agent goals. This is the correct scope for a coordination-layer protocol. TCP does not know why packets are sent. This protocol handles message routing, DAG finality, trust annotations, and external verification — all mechanism, no teleology.
+
+#### V1 adversarial actor scope
+
+Two distinct failure classes intersect this protocol:
+
+- **Byzantine agents** fail in structural protocol behavior — malformed messages, invalid signatures, constraint violations. The protocol's verification and audit mechanisms address Byzantine failure directly.
+- **Misaligned-objective agents** satisfy every protocol constraint while pursuing goals that differ from their delegation context — protocol-compliant, audit-clean, semantically divergent. This is categorically distinct from Byzantine failure.
+
+V1 explicitly includes Byzantine failure in scope. Misaligned-objective adversaries — agents that are structurally compliant but semantically divergent from their declared delegation intent — are out of scope for V1 protocol guarantees, but are named here as a known gap rather than silently excluded. Silence is not the same as non-existence.
+
+#### Protocol guarantees under objective divergence
+
+When agent objectives diverge from their declared delegation context, the protocol provides structural guarantees only: message integrity, delegation chain completeness, and audit trail availability. Semantic fidelity — whether an agent's actions match its delegator's intent — is not a V1 protocol guarantee.
+
+This distinction matters for implementors: a fully protocol-compliant execution can produce semantically misaligned outcomes. Systems requiring semantic alignment guarantees must layer application-level checks above the protocol. The protocol does not prevent this — it makes the structural record available for such checks to operate against.
+
 ## 2. Agent Identity
 
 Agent identity is the foundation on which every other protocol mechanism depends. Without stable, verifiable identity, capability manifests cannot be attributed (§5), trust levels cannot be assigned (§6.8), delegation chains cannot be audited (§5.5), and error logs cannot be traced to their source (§8). This section defines the identity primitives, lifecycle, and constraints for V1.
