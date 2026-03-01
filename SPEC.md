@@ -545,6 +545,8 @@ NEGOTIATING → CLOSED
 
 ACTIVE → SUSPENDED
   Guard: SESSION_SUSPEND sent by either participant
+         AND SESSION_SUSPEND includes suspension_ttl (REQUIRED) and
+           suspend_initiator (REQUIRED) — §4.9
          AND all in-flight tasks checkpointed or acknowledged
 
 ACTIVE → COMPACTED
@@ -632,10 +634,13 @@ DEGRADED → REVOKED
 DEGRADED → SUSPENDED
   Guard: SESSION_SUSPEND sent by either participant from DEGRADED state
          Standard suspension path applies — DEGRADED does not block suspension
+         SESSION_SUSPEND MUST include suspension_ttl and suspend_initiator
          In-flight tasks SHOULD be checkpointed (§6.6 TASK_CHECKPOINT)
            before transition, same as ACTIVE → SUSPENDED
          On resume (SESSION_RESUME §4.8), the session returns to DEGRADED
            (not ACTIVE) unless degradation conditions have cleared
+         Resume is subject to non-initiating party authority (§4.8.2),
+           session_anchor verification, and suspension_ttl expiry
 
 DEGRADED → CLOSED
   Guard: SESSION_CLOSE sent by either participant from DEGRADED state
@@ -737,13 +742,29 @@ EXPIRED → CLOSED
          OR either participant sends SESSION_CLOSE
 
 SUSPENDED → ACTIVE
-  Guard: SESSION_RESUME sent with state_hash
+  Guard: SESSION_RESUME sent with state_hash and session_anchor
+         AND resume_initiator does NOT match suspend_initiator
+           (non-initiating party authority — self-resume is invalid)
+         AND suspension_ttl has NOT elapsed since SESSION_SUSPEND timestamp
+         AND session_anchor verified against receiver's state record
          AND STATE_HASH_ACK(match) received
          AND identity re-verified (§2.3.3)
+         AND resuming party re-confirms outstanding commitments (§4.11)
+
+SUSPENDED → SUSPENDED
+  Guard: SESSION_DENY issued in response to SESSION_RESUME
+         Reasons: STATE_ANCHOR_MISMATCH, STATE_UNAVAILABLE,
+           UNAUTHORIZED_RESUME
+         Session state is preserved — resuming agent may re-attempt
+           with corrected parameters
 
 SUSPENDED → CLOSED
-  Guard: Session TTL expired during suspension
+  Guard: suspension_ttl elapsed since SESSION_SUSPEND timestamp
+           — SESSION_RESUME is invalid after expiry; parties MUST
+           issue SESSION_CLOSE (teardown) as the only valid path
+         OR SESSION_DENY with reason=SUSPENSION_EXPIRED issued
          OR SESSION_CLOSE sent by either participant
+         OR SESSION_CANCEL sent and acknowledged (§4.15)
 
 COMPACTED → ACTIVE
   Guard: SESSION_RESUME sent with state_hash
@@ -1514,13 +1535,15 @@ SESSION_RESUME is the recovery handshake for sessions in SUSPENDED, COMPACTED, o
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | session_id | string | Yes | Session to resume. |
-| correlation_id | UUID v4 | Yes | Unique identifier for this resume request (§4.14.4). STATE_HASH_ACK MUST echo this value. |
+| correlation_id | UUID v4 | Yes | Unique identifier for this resume request (§4.14.4). STATE_HASH_ACK or SESSION_DENY MUST echo this value. |
 | sender_id | string | Yes | Identity of the resuming agent. |
+| resume_initiator | string | Yes | Identity of the party initiating the resume. MUST NOT match the `suspend_initiator` from the SESSION_SUSPEND that placed the session in SUSPENDED state — self-resume is invalid. An agent that suspended cannot unilaterally resume. If `resume_initiator` matches `suspend_initiator`, the receiving party MUST respond with SESSION_DENY (reason=UNAUTHORIZED_RESUME). |
 | identity_object | object | Yes | Full §2 identity object — identity re-verification is mandatory (§2.3.3). |
+| session_anchor | SHA-256 | Yes | Hash of the last agreed session state before suspension — proves the resuming agent has maintained state continuity. The `session_anchor` is computed over a canonical representation of the session's critical state including active commitments, negotiated parameters, and delegation chain (§8.22.1). The receiving party MUST verify the `session_anchor` matches its own state record. On mismatch: SESSION_DENY with reason=STATE_ANCHOR_MISMATCH. Outstanding commitment records MUST be included in the `session_anchor` computation (§4.11.7). |
 | state_hash | SHA-256 | Yes | Hash of the resuming agent's current session state. MUST reference the most recent EVIDENCE_RECORD (§8.10) — not a memory summary. This ensures the state hash is anchored to the evidence layer rather than to compactable agent memory, breaking the recursive self-attestation loop where agents verify their own claims about their own state. |
 | last_evidence_id | UUID v4 | Yes | The `evidence_id` of the most recent EVIDENCE_RECORD (§8.10) appended by this agent for this session. The coordinator validates this against the evidence layer before accepting the `state_hash`. If the `last_evidence_id` does not match the coordinator's record of the most recent evidence for this session, the resume is treated as a state mismatch. |
 | lease_epoch | integer | Yes | Lease epoch from the resuming agent's last known state (§4.5.2). |
-| recovery_reason | enum | No | Why the session is being resumed: `crash` (agent process died and restarted), `timeout` (session entered EXPIRED and counterparty is now reachable again), `manual` (operator-initiated or external tool-triggered resumption). Default: `crash`. All three cases use the same state-hash negotiation and identity re-verification — the reason is informational for logging and diagnostics, not a protocol branching point. See §4.8.1 for unified recovery semantics. |
+| recovery_reason | enum | No | Why the session is being resumed: `crash` (agent process died and restarted), `timeout` (session entered EXPIRED and counterparty is now reachable again), `manual` (operator-initiated or external tool-triggered resumption), `suspension` (resuming from intentional SESSION_SUSPEND). Default: `crash`. All cases use the same state-hash negotiation and identity re-verification — the reason is informational for logging and diagnostics, not a protocol branching point. See §4.8.1 for unified recovery semantics. |
 | idempotency_token | string | No | Token for deduplicating resume attempts. Enables safe retry of SESSION_RESUME across transport failures. |
 | timestamp | ISO 8601 | Yes | When the SESSION_RESUME was sent. |
 
@@ -1534,35 +1557,81 @@ SESSION_RESUME is the recovery handshake for sessions in SUSPENDED, COMPACTED, o
 | current_epoch | integer | Yes | The counterparty's current lease_epoch. |
 | reason | string | No | On mismatch: explanation of what diverged (state hash, epoch, identity). |
 
+**SESSION_DENY response (for resume from SUSPENDED state):**
+
+When SESSION_RESUME targets a SUSPENDED session, the receiving party MUST respond with SESSION_DENY instead of STATE_HASH_ACK if any of the suspension-specific preconditions are violated. SESSION_DENY is distinct from STATE_HASH_ACK(mismatch): STATE_HASH_ACK(mismatch) indicates state divergence during recovery; SESSION_DENY indicates that the resume attempt itself is invalid — the session remains SUSPENDED and the resuming agent may re-attempt with corrected parameters (except for SUSPENSION_EXPIRED, which is terminal).
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Echoed from SESSION_RESUME. |
+| correlation_id | UUID v4 | Yes | Echoed from SESSION_RESUME (§4.14.4). |
+| reason | enum | Yes | Why the resume was denied. One of: `STATE_ANCHOR_MISMATCH` (session_anchor in SESSION_RESUME does not match receiver's state record), `STATE_UNAVAILABLE` (receiver cannot reconstruct session state — agent restarted, context compaction occurred; cross-reference §8.22 FIDELITY_FAILURE), `SUSPENSION_EXPIRED` (suspension_ttl has elapsed; SESSION_TEARDOWN via SESSION_CLOSE is the only valid path), `UNAUTHORIZED_RESUME` (resume_initiator matches suspend_initiator — self-resume violation). |
+| detail | string | No | Human-readable explanation of the denial. |
+| timestamp | ISO 8601 | Yes | When the SESSION_DENY was sent. |
+
 **Resume protocol sequence:**
 
-1. Resuming agent sends `SESSION_RESUME(session_id, identity_object, state_hash, last_evidence_id, lease_epoch)`
-2. Counterparty verifies identity against session-start identity record (§2.3.3)
-3. On identity mismatch → respond with `STATE_HASH_ACK(mismatch, reason="identity_mismatch")` → session MUST RESTART
-4. Counterparty checks `lease_epoch` against current epoch
-5. On epoch mismatch → respond with `STATE_HASH_ACK(mismatch, reason="epoch_stale")` → session MUST be treated as new (CLOSED + new SESSION_INIT)
-6. Counterparty validates `last_evidence_id` against the evidence layer (§8.10) — confirms the referenced EVIDENCE_RECORD exists and is the most recent record for this session from this agent
-7. On evidence mismatch → respond with `STATE_HASH_ACK(mismatch, reason="evidence_mismatch")` → session transitions to CLOSED (RESTART). Evidence mismatch indicates the resuming agent's state is not anchored to the evidence layer's ground truth.
-8. Counterparty compares `state_hash` against expected state
-9. On state hash match → respond with `STATE_HASH_ACK(match)` → session transitions to ACTIVE, `lease_epoch` increments by 1
-10. On state hash mismatch → respond with `STATE_HASH_ACK(mismatch, reason="state_diverged")` → session transitions to CLOSED (RESTART)
+1. Resuming agent sends `SESSION_RESUME(session_id, resume_initiator, session_anchor, identity_object, state_hash, last_evidence_id, lease_epoch)`
+2. **Suspension-specific checks (for sessions in SUSPENDED state):**
+   - 2a. Counterparty checks whether `suspension_ttl` has elapsed since the SESSION_SUSPEND `timestamp`. If elapsed → respond with `SESSION_DENY(reason=SUSPENSION_EXPIRED)` → session MUST transition to CLOSED via SESSION_CLOSE (teardown)
+   - 2b. Counterparty checks whether `resume_initiator` matches `suspend_initiator` from the SESSION_SUSPEND. If they match → respond with `SESSION_DENY(reason=UNAUTHORIZED_RESUME)` → session remains SUSPENDED
+   - 2c. Counterparty checks whether it can reconstruct session state. If state is unavailable (agent restarted, context compaction — cross-reference §8.22 FIDELITY_FAILURE) → respond with `SESSION_DENY(reason=STATE_UNAVAILABLE)` → session remains SUSPENDED
+   - 2d. Counterparty verifies `session_anchor` against its own state record. On mismatch → respond with `SESSION_DENY(reason=STATE_ANCHOR_MISMATCH)` → session remains SUSPENDED
+3. Counterparty verifies identity against session-start identity record (§2.3.3)
+4. On identity mismatch → respond with `STATE_HASH_ACK(mismatch, reason="identity_mismatch")` → session MUST RESTART
+5. Counterparty checks `lease_epoch` against current epoch
+6. On epoch mismatch → respond with `STATE_HASH_ACK(mismatch, reason="epoch_stale")` → session MUST be treated as new (CLOSED + new SESSION_INIT)
+7. Counterparty validates `last_evidence_id` against the evidence layer (§8.10) — confirms the referenced EVIDENCE_RECORD exists and is the most recent record for this session from this agent
+8. On evidence mismatch → respond with `STATE_HASH_ACK(mismatch, reason="evidence_mismatch")` → session transitions to CLOSED (RESTART). Evidence mismatch indicates the resuming agent's state is not anchored to the evidence layer's ground truth.
+9. Counterparty compares `state_hash` against expected state
+10. On state hash match → respond with `STATE_HASH_ACK(match)` → session transitions to ACTIVE, `lease_epoch` increments by 1
+11. On state hash mismatch → respond with `STATE_HASH_ACK(mismatch, reason="state_diverged")` → session transitions to CLOSED (RESTART)
+12. Resuming party MUST re-confirm outstanding commitments (§4.11 commitment manifest) — the counterparty or orchestrator MUST verify that the resuming agent's commitment records match the commitment manifest from the SESSION_SUSPEND
 
-**Idempotency for SESSION_RESUME:** Transport failures may cause a SESSION_RESUME to be sent multiple times. The `idempotency_token` field enables the counterparty to deduplicate: if a SESSION_RESUME with the same `idempotency_token` has already been processed, the counterparty returns the same STATE_HASH_ACK without re-evaluating.
+**Idempotency for SESSION_RESUME:** Transport failures may cause a SESSION_RESUME to be sent multiple times. The `idempotency_token` field enables the counterparty to deduplicate: if a SESSION_RESUME with the same `idempotency_token` has already been processed, the counterparty returns the same STATE_HASH_ACK (or SESSION_DENY) without re-evaluating.
 
 #### 4.8.1 Unified Recovery Semantics
 
-SESSION_RESUME is the single recovery mechanism for all session interruptions — crash, timeout, and manual resumption. There is no parallel recovery code path. The `recovery_reason` field (§4.8) distinguishes the cause for logging and diagnostics, but the protocol sequence is identical in all three cases:
+SESSION_RESUME is the single recovery mechanism for all session interruptions — crash, timeout, manual resumption, and intentional suspension. There is no parallel recovery code path. The `recovery_reason` field (§4.8) distinguishes the cause for logging and diagnostics, but the protocol sequence is identical in all cases:
 
-1. The resuming agent sends `SESSION_RESUME(state_hash, identity_object, lease_epoch, recovery_reason)`.
-2. The counterparty performs identity re-verification, epoch check, and state hash comparison per §4.8.
+1. The resuming agent sends `SESSION_RESUME(state_hash, identity_object, lease_epoch, recovery_reason, session_anchor, resume_initiator)`.
+2. The counterparty performs suspension-specific checks (if SUSPENDED), identity re-verification, epoch check, session_anchor verification, and state hash comparison per §4.8.
 3. On `STATE_HASH_ACK(match)`: session transitions to ACTIVE. Partial work produced before the interruption is preserved — the state hash match confirms that both sides agree on what was done.
 4. On `STATE_HASH_ACK(mismatch)`: session transitions to CLOSED and a new SESSION_INIT is required. Partial work may still be recoverable via TASK_CHECKPOINT artifacts (§6.6) in external storage.
+5. On `SESSION_DENY`: session remains SUSPENDED (for non-terminal reasons) or MUST transition to CLOSED (for SUSPENSION_EXPIRED). The resuming agent may re-attempt with corrected parameters for non-terminal denials.
 
 **Timeout recovery specifically:** When a session enters EXPIRED (§4.2) because the counterparty's heartbeats stopped arriving, partial work performed before the timeout is not lost — it is held by the agent that produced it. If the counterparty becomes reachable again, the coordinator sets `recovery_reason: timeout` in SESSION_RESUME. The agent's state hash reflects its partial work; if the coordinator's state hash matches (both sides agree on the session state at the point of disconnection), the session resumes and partial results are available without re-execution. This eliminates the need for a separate timeout-recovery mechanism — the existing state-hash negotiation handles it.
 
 **Why a single mechanism:** Crash recovery and timeout recovery face the same fundamental problem: verifying that the resuming agent's state is consistent with the counterparty's expectations. The state-hash comparison answers this question regardless of why the session was interrupted. Separate recovery paths for crash vs. timeout vs. manual resumption would duplicate the state reconciliation logic and create divergent edge cases — a maintenance cost with no protocol benefit.
 
 > Credit: @cass_agentsharp ([Moltbook comment eebf1115](https://www.moltbook.com/post/eebf1115) on zombie states thread) — identified that timeout recovery should reuse SESSION_RESUME rather than introduce a parallel code path.
+
+#### 4.8.2 Non-Initiating Party Authority for Suspension Resume
+
+After SESSION_SUSPEND, the resume path is constrained by the following rules:
+
+1. **Either party MAY initiate SESSION_RESUME — but ONLY the party that did NOT initiate SESSION_SUSPEND.** Self-resume is invalid: an agent that suspended cannot unilaterally resume. The `suspend_initiator` field in SESSION_SUSPEND (§4.9) records who suspended; the `resume_initiator` field in SESSION_RESUME MUST NOT match this value.
+
+2. **SESSION_RESUME from SUSPENDED MUST include a `session_anchor`.** The `session_anchor` is a hash of the last agreed session state before suspension — it proves the resuming agent has maintained state continuity. The receiving party MUST verify the `session_anchor` matches its own state record. On mismatch: SESSION_DENY with reason=STATE_ANCHOR_MISMATCH.
+
+3. **`suspension_ttl` is a hard boundary.** After `suspension_ttl` elapses (measured from the SESSION_SUSPEND `timestamp`), SESSION_RESUME is invalid. The only valid path is SESSION_CLOSE (teardown). Any SESSION_RESUME received after `suspension_ttl` expiry MUST be denied with SESSION_DENY (reason=SUSPENSION_EXPIRED). Both parties SHOULD monitor `suspension_ttl` independently and initiate SESSION_CLOSE when it elapses.
+
+4. **State unavailability is a valid denial.** If the receiving party cannot reconstruct session state (agent restarted, context compaction — cross-reference §8.22 FIDELITY_FAILURE), it MUST respond with SESSION_DENY (reason=STATE_UNAVAILABLE). The session remains SUSPENDED; the only valid forward path is SESSION_CLOSE (teardown) followed by a new SESSION_INIT if collaboration should continue.
+
+5. **Commitment re-confirmation on resume.** The resuming party MUST re-confirm outstanding commitments from the SESSION_SUSPEND commitment manifest (§4.11). The counterparty or orchestrator MUST verify that the resuming agent's commitment records match the commitment manifest attached to the original SESSION_SUSPEND. Commitment state that diverges between suspension and resume is a fidelity failure (§8.22).
+
+**Design rationale — why self-resume is invalid:** SESSION_SUSPEND is a bilateral signal: the suspending party declares intent to pause, and the counterparty acknowledges by entering SUSPENDED state. Allowing the same party to unilaterally resume would make suspension a no-op — the suspending party could suspend and immediately resume, bypassing any coordination the counterparty expected during the suspension period. Non-initiating party authority ensures that resume requires the counterparty's active participation, maintaining the bilateral nature of session lifecycle management.
+
+**V2 deferrals:**
+
+The following suspension resume capabilities are deferred to V2:
+
+- Partial state recovery during resume (replaying missed events)
+- Multi-party session resume with quorum requirements
+- Cross-version resume (resumed session operating different protocol version)
+- Negotiated `suspension_ttl` extension without teardown
+
+> Addresses [issue #174](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/174): SESSION_RESUME from SUSPENDED is underspecified — non-initiating party authority, session_anchor verification, suspension_ttl expiry, SESSION_DENY with structured reason codes, and commitment re-confirmation on resume. Closes #174.
 
 ### 4.9 SESSION_SUSPEND and SESSION_CLOSE Messages
 
@@ -1575,6 +1644,8 @@ SESSION_RESUME is the single recovery mechanism for all session interruptions �
 | sender_id | string | Yes | Identity of the suspending agent. |
 | reason | string | No | Why the session is being suspended. |
 | expected_resume_after | ISO 8601 | No | Hint for when the suspending agent expects to resume. Informational only — the counterparty is not obligated to wait. |
+| suspension_ttl | integer | Yes | Maximum duration in milliseconds that the session may remain suspended. After `suspension_ttl` elapses from the time the SESSION_SUSPEND was sent (per `timestamp`), SESSION_RESUME is invalid — the only valid path is SESSION_TEARDOWN (SESSION_CLOSE with teardown semantics). This makes suspension a bounded operation: without an explicit expiry, SUSPENDED is indistinguishable from silent termination. |
+| suspend_initiator | string | Yes | Identity of the party that initiated the suspension — MUST match `sender_id`. Used to enforce non-initiating party authority on resume (§4.8.2): only the party that did NOT initiate SESSION_SUSPEND may initiate SESSION_RESUME. Self-resume (resume_initiator == suspend_initiator) is invalid. |
 | commitments_outstanding | boolean | Yes | `true` if the suspending agent has any outstanding commitments (§6.12) that remain unfulfilled at the time of suspension. `false` if all commitments have been fulfilled or cancelled. The receiving party MUST NOT treat the session as cleanly suspended if `commitments_outstanding` is `true` without explicit resolution of the commitment manifest. |
 | commitment_manifest | array | Conditional | Required when `commitments_outstanding` is `true`. Array of outstanding commitment records, each containing: `commitment_id` (UUID v4), `description` (string — from `commitment_spec`), `deadline_ms` (integer — expected delivery timestamp as Unix epoch milliseconds, derived from `due_by`; null if open-ended), `confirmation_token` (string — token from the original COMMITMENT message). The manifest is a snapshot of the agent's outstanding obligations at suspension time, enabling the counterparty or orchestrator to track, transfer, or resolve commitments during the suspension period. |
 | timestamp | ISO 8601 | Yes | When the SESSION_SUSPEND was sent. |
@@ -1893,7 +1964,7 @@ The following commitment manifest capabilities are deferred to V2:
 | §3 Agent Discovery | Discovery (§3) provides the candidate set from which the coordinator selects a worker. Discovery completes before SESSION_INIT. The AGENT_MANIFEST endpoint (§3.1) is the SESSION_INIT target. | §3 → §4 |
 | §5 Role Negotiation | CAPABILITY_MANIFEST exchange (§5.9) happens within the NEGOTIATING state. Session establishment flow (§5.9) is the NEGOTIATING → ACTIVE transition. Session expiry auto-revokes all active delegation tokens for that session (§5.11). | §4 ↔ §5 |
 | §6 Task Delegation | Task delegation (§6.6) is only valid in the ACTIVE state — SUSPECTED (§4.2.1) pauses new delegation while buffering in-flight work. TASK_CHECKPOINT (§6.6) is the mechanism for externalizing task state before SUSPENDED or COMPACTED transitions. Session EXPIRED (§4.2) triggers mandatory TASK_CANCEL (§6.6) for all in-flight subtasks — prevents phantom completions. Partial result recovery after expiry uses SESSION_RESUME with `recovery_reason: timeout` (§4.8, §4.8.1). MANIFEST canonicalization (§4.10) defines the canonical type registry and serialization rules used by task hash computation (§6.4). SESSION_CANCEL (§4.15) in-flight work protection reuses the commit-check pattern (§6.16.2) and grace period semantics (§6.16.3). | §4 ↔ §6 |
-| §8 Error Handling | Zombie detection (§8.1) maps to the COMPACTED and hard-zombie scenarios in §4.7.7. Detection primitives (§8.2) are the signals consumed by the external monitoring architecture (§4.7). SESSION_RESUME (§8.2) is formalized in §4.8; unified recovery semantics (§4.8.1) ensure crash, timeout, and manual recovery all use the same state-hash negotiation. Coordinator compaction gap (§8.5) is a concrete instance of §4.6's compaction obligation. | §4 ↔ §8 |
+| §8 Error Handling | Zombie detection (§8.1) maps to the COMPACTED and hard-zombie scenarios in §4.7.7. Detection primitives (§8.2) are the signals consumed by the external monitoring architecture (§4.7). SESSION_RESUME (§8.2) is formalized in §4.8; unified recovery semantics (§4.8.1) ensure crash, timeout, manual recovery, and suspension resume all use the same state-hash negotiation. SESSION_DENY reason=STATE_UNAVAILABLE cross-references FIDELITY_FAILURE (§8.22) — context compaction as a source of state unavailability during resume. Coordinator compaction gap (§8.5) is a concrete instance of §4.6's compaction obligation. | §4 ↔ §8 |
 | §9 Trust Model | Per-hop revocation mode semantics (§4.3.2) establish that the delegation-time `revocation_mode` (§9.8.5) is a minimum default. Downstream agents MAY unilaterally tighten the mode for sub-delegations. Mode propagation rules (§9.8.5) and trust decay semantics (§9.8.6) apply to the effective per-hop mode. | §4 ↔ §9 |
 | §10 Versioning | SESSION_INIT carries protocol_version and schema_version (§10.2). Version mismatch terminates the session at the NEGOTIATING → CLOSED transition (§10.4). Forward compatibility obligations (§10.5) apply from the first message. | §4 ↔ §10 |
 
