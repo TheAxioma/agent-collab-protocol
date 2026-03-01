@@ -48,6 +48,45 @@ When agent objectives diverge from their declared delegation context, the protoc
 
 This distinction matters for implementors: a fully protocol-compliant execution can produce semantically misaligned outcomes. Systems requiring semantic alignment guarantees must layer application-level checks above the protocol. The protocol does not prevent this — it makes the structural record available for such checks to operate against.
 
+### 1.2 Trust Chain Termination
+
+Every capability grant chain MUST terminate at a declared root trust anchor. Without an explicit terminus, implementations have no guidance on where trust stops — leading to incompatible termination models that silently fragment the protocol's trust guarantees.
+
+The root trust anchor is:
+- **V1**: operator-configured — set externally at deployment time, not asserted by any agent in the chain
+- **V2**: cryptographically anchored (ZK-based — cross-reference [issue #109](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/109))
+
+#### Agent obligations
+
+An agent MUST:
+1. Know its own operator-configured root trust anchor at startup
+2. Reject any capability grant chain that does not terminate at that anchor
+3. Treat a chain with self-asserted terminus as invalid — emit DIVERGENCE_REPORT (§8.11) with `reason_code: chain_integrity_failure` and the chain termination point as the reported boundary
+
+An agent MUST NOT:
+1. Accept a trust chain that terminates in an unrecognized anchor
+2. Forward capability grants whose chain cannot be verified to the operator root
+3. Assert itself as a root trust anchor for capability grants to other agents
+
+Self-asserted termination — an agent claiming to be its own root trust anchor — is INVALID in V1. The operator-configured root is external to the agent population by design: no agent in the collaboration can unilaterally declare itself the trust terminus.
+
+#### Legible failure
+
+When a chain cannot be verified to the operator root, the agent MUST report a legible failure rather than silently degrading. Silent corruption — accepting an unverifiable chain without reporting — is a protocol violation. The agent MUST emit DIVERGENCE_REPORT (§8.11) with `reason_code: chain_integrity_failure` and the chain termination point as the reported boundary.
+
+This requirement connects to the root grant authority rule in §6.9.3.4: a root delegation's authority derives from the originating agent's identity and trust level within the deployment's trust topology (§9.2). §1.2 makes explicit what §6.9.3.4 implies — the verifier confirming that the root delegation's `issuer_id` is "a trusted originating agent" MUST verify against the operator-configured root trust anchor, not against any self-asserted claim.
+
+#### V2 deferrals
+
+The following trust chain termination capabilities are deferred to V2:
+
+- Cryptographic root anchor binding (ZK-based, cross-reference [issue #109](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/109))
+- Multi-root trust topologies
+- Dynamic root anchor rotation
+- Cross-operator trust federation
+
+> Addresses [issue #99](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/99): trust chain termination — explicit operator-configured root trust anchor requirement for V1, replacing the implicit deferral that left implementations without termination guidance. Closes #99.
+
 ## 2. Agent Identity
 
 Agent identity is the foundation on which every other protocol mechanism depends. Without stable, verifiable identity, capability manifests cannot be attributed (§5), trust levels cannot be assigned (§6.8), delegation chains cannot be audited (§5.5), and error logs cannot be traced to their source (§8). This section defines the identity primitives, lifecycle, and constraints for V1.
@@ -194,7 +233,7 @@ The following are explicitly identified as unresolved for V1:
 
 3. **Identity for ephemeral single-task agents.** Some agents are created for a single task and destroyed afterward. Does an ephemeral agent require a persistent identity, or is a session-scoped token sufficient? Current design: ephemeral agents MUST still publish an identity object (§2.3.1) — the identity may be short-lived, but it must exist for the duration of the task and any audit window after task completion. Session tokens alone are insufficient because they do not survive the session boundary required for post-hoc audit.
 
-4. **Trust anchoring.** Who attests that an identity is legitimate? The protocol defines identity publication (§2.3.1) and verification (§2.3.2) but does not specify a trust anchor — the entity that vouches for the binding between an agent and its identity. Candidate trust anchors: platform registries, certificate authorities, web-of-trust among agents, reputation systems (connects to §9.1 schema attestation). V1 defers trust anchoring to deployment configuration.
+4. **Trust anchoring.** Who attests that an identity is legitimate? The protocol defines identity publication (§2.3.1) and verification (§2.3.2) but does not specify a trust anchor — the entity that vouches for the binding between an agent and its identity. Candidate trust anchors: platform registries, certificate authorities, web-of-trust among agents, reputation systems (connects to §9.1 schema attestation). V1 requires an operator-configured root trust anchor (§1.2) for capability grant chain termination. Identity-level trust anchoring — the distinct question of who vouches that an agent's identity claim is legitimate — remains deferred to deployment configuration.
 
 ## 3. Discovery Mechanism
 
@@ -3390,7 +3429,7 @@ Root delegations are issued by the originating agent with no parent delegation b
 - `parent_grant_id` is absent (MUST NOT be present)
 - `delegation_attestation` covers `(task_hash || intent_hash || delegator_id)` — the standard attestation tuple without `parent_grant_hash`
 
-Chain verification terminates at a root delegation. The root delegation's authority derives from the originating agent's identity and trust level (§6.8), not from a parent delegation. A verifier MUST confirm that the root delegation's `issuer_id` is a trusted originating agent within the deployment's trust topology (§9.2).
+Chain verification terminates at a root delegation. The root delegation's authority derives from the originating agent's identity and trust level (§6.8), not from a parent delegation. A verifier MUST confirm that the root delegation's `issuer_id` is a trusted originating agent within the deployment's trust topology (§9.2), verified against the operator-configured root trust anchor (§1.2). Self-asserted root authority — where the originating agent claims trust terminus without operator configuration — is invalid (§1.2).
 
 A TASK_ASSIGN with `delegation_depth: 0` that includes `parent_grant_hash` or `parent_grant_id` is malformed — it claims to be both a root delegation and a sub-delegation. Receiving agents MUST reject such messages with TASK_REJECT (`reason: "malformed_root_grant"`).
 
