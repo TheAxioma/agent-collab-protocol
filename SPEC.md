@@ -1723,7 +1723,7 @@ CAPABILITY_GRANT is the message type that carries the authorized capability set 
 
 **Temporal enforcement semantics:**
 
-- **Expiry is self-enforcing.** The receiving agent is responsible for enforcing `valid_until`. When `current_time > valid_until`, the grant MUST be treated as revoked — the agent MUST stop exercising the granted capabilities for the associated task. This is distinct from requester-initiated revocation (§6): expiry is time-based and self-enforcing at the receiving agent; revocation is an explicit delegator action propagated through the delegation chain.
+- **Expiry is self-enforcing.** The receiving agent is responsible for enforcing `valid_until`. When `current_time > valid_until`, the grant MUST be treated as revoked — the agent MUST stop exercising the granted capabilities for the associated task. This is distinct from requester-initiated revocation (§6.13): expiry is time-based and self-enforcing at the receiving agent; revocation is an explicit delegator action via signed revocation token (§6.13.1) propagated through the delegation chain.
 - **Session-scoped default.** When `valid_until` is absent, the grant is valid for the duration of the session. Session termination (§4.9 SESSION_CLOSE) or session expiry (§4.2 EXPIRED state) implicitly revokes all grants without explicit `valid_until`. Receiving agents MUST log a warning when processing a grant without `valid_until` to surface the implicit session-scoped assumption for audit.
 - **Clock skew detection.** When `granted_at` is present, the receiving agent SHOULD compare it against its local clock. If `granted_at` is more than 30 seconds in the future, the agent MUST reject the grant — the clock divergence exceeds safe tolerance. If `granted_at` is between 0 and 30 seconds in the future, the agent MAY accept the grant but MUST log a warning indicating clock skew was detected and the tolerance window was applied. Clock skew tolerance of 30 seconds is production-validated by the HIBI reserve asset protocol.
 - **Pre-expiry behavior.** The protocol does not define a grace period. When `current_time > valid_until`, the grant is expired — immediately and without exception. Agents that need continued authorization MUST obtain a CAPABILITY_RENEW (§5.8.3) before expiry.
@@ -2857,7 +2857,103 @@ timestamp: "2026-02-28T15:00:00.000Z"
 
 > Commitment message types formalized from [issue #64](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/64). The core insight: every unresolved commitment is a promise that a future instance must keep or explicitly refuse. Without protocol-visible commitments, counterpart agents have no structured signal when obligations are silently abandoned after agent restart.
 
-### 6.13 Open Questions
+### 6.13 Explicit Revocation Channel
+
+<!-- Implements #135: explicit revocation channel semantics for §6 delegation lifecycle -->
+
+§5.5 defines TTL as a delegation termination mechanism — after expiry, the delegatee MUST cease operations under the delegation token. TTL expiry is passive: delegation terminates when time runs out, no issuer action required. This section defines the complementary active termination mechanism: explicit revocation, where the issuer terminates delegation immediately regardless of remaining TTL.
+
+Both mechanisms are needed for a complete delegation lifecycle. TTL bounds the maximum delegation window; explicit revocation enables the issuer to close that window early when circumstances change — security compromise, trust loss, task cancellation, or policy violation.
+
+**Design choice — signed revocation token:** Three revocation mechanisms were evaluated:
+
+| Mechanism | Tradeoff | Why rejected/chosen |
+|-----------|----------|---------------------|
+| Issuer liveness check | Receiver queries issuer at verification time | Creates runtime liveness dependency, breaks under partition, incompatible with offline verification |
+| Revocation list | Issuer publishes versioned list of revoked grants | Good for batched revocations but introduces staleness window and polling overhead |
+| **Signed revocation token** (chosen) | Issuer publishes a signed token out-of-band; receivers verify signature, no liveness required | Caching-friendly, partition-tolerant if token pre-distributed, offline-verifiable |
+
+Signed token wins on every relevant dimension for agent coordination: no runtime liveness dependency, offline-verifiable, distributes naturally alongside the grant.
+
+#### 6.13.1 Revocation Token Schema
+
+A revocation token is a signed record that explicitly terminates a grant regardless of remaining TTL.
+
+**Revocation token fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| grant_id | UUID v4 | Yes | The `grant_id` (§5.8.2) of the CAPABILITY_GRANT being revoked. |
+| issuer_id | string | Yes | Identity of the revoking agent (§2 identity handle). MUST match the `grantor_id` of the original grant. |
+| revocation_reason | enum | Yes | Why the grant is being revoked. One of: `SECURITY_COMPROMISE` (the grant's security context has been compromised), `TRUST_LOSS` (the issuer no longer trusts the grantee for this delegation), `TASK_CANCELLED` (the associated task has been cancelled), `POLICY_VIOLATION` (the grantee violated a constraint of the grant), `ISSUER_REVOKED` (the issuer's own authority has been revoked, cascading to its grants). |
+| revoked_at | ISO 8601 | Yes | Timestamp when the revocation was issued. Millisecond precision REQUIRED. |
+| issuer_signature | bytes | Yes | Cryptographic signature over `grant_id || issuer_id || revocation_reason || revoked_at`, produced by the issuer's private key (§2.2.1). The `||` operator denotes concatenation of the canonical byte representations. |
+
+**Revocation token validity:**
+
+- A revocation token MUST be treated as valid if the `issuer_signature` verifies against the issuer's known public key (§2.2.1).
+- A revocation token without a valid signature MUST be rejected. An agent receiving a token with an invalid signature MUST NOT treat the referenced grant as revoked based on that token and MUST log the invalid token (see §6.13.4 audit events).
+- A valid revocation token is irrevocable — once issued, the grant cannot be "un-revoked." To re-authorize the grantee, the issuer MUST issue a new CAPABILITY_GRANT (§5.8.2) with a new `grant_id`.
+
+**Example revocation token:**
+
+```yaml
+grant_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+issuer_id: "agent-alpha"
+revocation_reason: SECURITY_COMPROMISE
+revoked_at: "2026-03-01T10:15:00.000Z"
+issuer_signature: "c2lnbmVkLXJldm9jYXRpb24tdG9rZW4..."
+```
+
+#### 6.13.2 Distribution Requirement
+
+Issuers MUST distribute revocation tokens to known grant recipients via the same channel through which the original grant was delivered. This ensures that the revocation reaches the same agents that hold the grant, using transport that is already established and operational.
+
+Agents MAY cache revocation tokens for any grant they hold or may receive. Caching enables offline verification — an agent that has pre-cached a revocation token can reject a revoked grant without contacting the issuer or any registry.
+
+**Distribution in delegation chains:** When a grant is revoked and the grantee has re-delegated (§6.9), the grantee MUST propagate the revocation token to its own delegatees. Revocation propagation follows the same chain topology as cancellation propagation (§6.9): each agent in the chain forwards the revocation token to agents it delegated to. This is consistent with the `ISSUER_REVOKED` reason — when an intermediate agent's authority is revoked, its downstream grants are invalidated by cascade.
+
+#### 6.13.3 Receiver Validation Behavior
+
+On receiving or verifying a grant, agents MUST evaluate both TTL expiry and explicit revocation. The validation logic is:
+
+| Condition | Token state | TTL state | Result |
+|-----------|-------------|-----------|--------|
+| Valid revocation token exists | Revoked | Any (within or expired) | **REJECT** — revocation in effect |
+| No revocation token | Not revoked | Within TTL | **ACCEPT** — grant is valid |
+| No revocation token | Not revoked | Expired | **REJECT** — TTL expired |
+| No revocation token, issuer unreachable | Unknown | Within TTL | **ACCEPT** — use cached state (last known valid) |
+
+**Partition behavior:** A grant that has never been revoked (no revocation token received) remains valid under network partition, provided it is within TTL. Issuers bear responsibility for pre-distributing revocation tokens to known recipients before going offline. An issuer that goes offline without distributing a revocation token accepts that the grant remains valid until TTL expiry.
+
+**Orthogonality of TTL and revocation:** TTL expiry and explicit revocation are orthogonal termination conditions. An explicitly revoked grant is invalid regardless of remaining TTL. A grant past TTL expiry is invalid regardless of revocation status. Agents MUST check both conditions — neither subsumes the other.
+
+#### 6.13.4 Audit Events
+
+Explicit revocation introduces two new audit event classes for the evidence layer (§8.10):
+
+| Audit event | Trigger | Logged data |
+|-------------|---------|-------------|
+| `EXPLICIT_REVOCATION` | A grant is rejected due to a valid revocation token | `grant_id`, `issuer_id`, `revocation_reason` (from the token), `revoked_at`, timestamp of rejection, identity of the rejecting agent |
+| `REVOCATION_TOKEN_INVALID` | A revocation token is received with an invalid `issuer_signature` | `grant_id`, claimed `issuer_id`, timestamp of receipt, identity of the receiving agent, reason for signature failure |
+
+**`EXPLICIT_REVOCATION` is a distinct class from TTL expiry.** When a grant is rejected because `current_time > valid_until` (§5.8.2), the rejection reason is temporal expiry — the grant aged out. When a grant is rejected because a valid revocation token exists, the rejection reason is active revocation by the issuer. These are different failure modes with different causes, different attribution, and different recovery paths. The audit trail MUST distinguish them.
+
+**EVIDENCE_RECORD integration:** Both `EXPLICIT_REVOCATION` and `REVOCATION_TOKEN_INVALID` events SHOULD be recorded as EVIDENCE_RECORDs (§8.10.1) with `evidence_type: error_event`. The `payload_hash` SHOULD be computed over the revocation token contents (valid or invalid) to enable independent verification of the audit entry.
+
+#### 6.13.5 Relationship to Existing Revocation Mechanisms
+
+**Relationship to §5.8.2 `valid_until`:** The `valid_until` field on CAPABILITY_GRANT is time-based self-enforcement at the receiving agent. Explicit revocation (this section) is issuer-initiated active termination. They are complementary: `valid_until` is the passive backstop; explicit revocation is the active fast-path. The more restrictive of the two applies — a grant is invalid if either condition is met.
+
+**Relationship to §8.17 Revocation Propagation:** §8.17 addresses revocation of agent identity (AGENT_MANIFEST tombstones) for adversarial sessions. This section addresses revocation of individual capability grants. Agent-level revocation (§8.17) implies grant-level revocation — if an agent's identity is revoked, all grants issued by that agent are implicitly invalidated. Grant-level revocation (this section) does not imply agent-level revocation — an issuer may revoke a specific grant while remaining a valid protocol participant.
+
+**Relationship to §9.8.5 `revocation_mode`:** The `sync` and `gossip` revocation modes (§9.8.5) govern how revocation signals propagate through delegation chains. Revocation tokens (this section) are the artifact that propagates — the revocation mode determines the propagation strategy. In `sync` mode, the issuer distributes the token and waits for registry confirmation before proceeding. In `gossip` mode, the token propagates asynchronously through the network. The token schema defined here is mode-agnostic — the same token format is used regardless of propagation strategy.
+
+**Relationship to §5.5 delegation token TTL:** The delegation token's `ttl` field (§5.5) bounds the delegation's total duration. A revocation token terminates the grant before TTL expiry. These are the two delegation termination mechanisms: TTL is the scheduled expiry; revocation is the unscheduled early termination.
+
+> Implements [issue #135](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/135): explicit revocation channel semantics for §6. Defines signed revocation token schema, distribution requirements, receiver validation behavior, audit event classes (EXPLICIT_REVOCATION, REVOCATION_TOKEN_INVALID), and relationship to TTL expiry. TTL and explicit revocation are orthogonal termination conditions — both MUST be checked. Closes #135.
+
+### 6.14 Open Questions
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
