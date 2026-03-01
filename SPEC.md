@@ -4236,6 +4236,7 @@ The `external_ref` field (§8.10.1) mitigates this limitation by anchoring evide
 - Translation boundary (§9.3) identifies the attack surface. Translation bottleneck (§9.4) identifies the information-theoretic reason attacks at that surface evade structural defenses — lossy compression preserves adversarial semantics while satisfying validation. Translation boundary metadata and verification (§7.9) provides the cooperative-model counterpart: `translation_metadata` makes translation losses visible and the two-target verification framework (behavioral correctness vs. translation fidelity) separates execution failures from translation failures.
 - Revocation trust (§9.8) documents the advisory nature of REVOKE signals and the Byzantine propagation problem in delegation chains. Identity revocation (§2.3.4) and delegation token revocation (§5.10) define MUST-level requirements that are binding on compliant agents but not technically enforceable on non-compliant or offline nodes.
 - Evidence layer (§8.10) provides append-only ground truth for external verification. The epistemic boundary (§9.5.1) documents the structural limitation: evidence records guarantee integrity and ordering of what was submitted, not correctness of the original observation. `external_ref` partially mitigates by enabling cross-validation against external systems.
+- Trust annotation types (§9.10) define the closed enum of protocol-level trust claims. Schema attestation (§9.1) addresses who vouched for a schema's honesty; trust annotations address under what trust basis an agent acted. Trust annotations are included in `trace_hash` computation (§6.2), making the trust basis auditable through the existing hash verification mechanism. The genesis publication hash (§9.10.4) applies the same independence criteria as §8 audit media — the audited party must not control the publication medium.
 
 ### 9.7 Open Questions
 
@@ -4500,6 +4501,134 @@ The `reason_code` values in the justification schema (§9.9.1) are intentionally
 The `x-` extension mechanism is shared: a deployment-specific `reason_code` added for `divergence_log` (e.g., `x-model-context-overflow`) is valid in `justification` and vice versa.
 
 > Implements [issue #84](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/84): structured justification schema for the observation channel in §9. Converts free-text justification into a falsifiable prediction with `reason_code`, `target_metric`, and `expected_delta` sub-fields, enabling algorithmic verification of agent action rationale against post-hoc outcomes. Closes #84.
+
+### 9.10 Trust Annotation Types
+
+Trust annotations are protocol-level claims that an agent attaches to actions, delegations, or evidence records to declare the trust basis under which it operated. Without a fixed vocabulary for these claims, each agent implicitly becomes a schema authority — choosing which annotation types to honor, which to ignore, and which to invent. This produces distributed governance with no coordination mechanism: audit trails become inconsistent across agents, and verification-time disputes about which annotations are canonical have no resolution procedure.
+
+§9.10 addresses this by defining a closed enum of trust annotation types at spec genesis, accompanied by a governance ceremony and tamper-evident publication mechanism.
+
+#### 9.10.1 Trust Annotation Model
+
+Trust annotation types MUST be a fixed, closed enum defined at spec genesis. The enum is not extensible at runtime, not extensible by operators, and not extensible by individual agent implementations. Unrecognized annotation types are not protocol errors — they are agent-local metadata that carries no protocol-level authority.
+
+**Rationale for fixed enum over open schema:**
+
+The authority question — who decides which trust annotation types are canonical — has three possible locations:
+
+| Authority location | Mechanism | Failure mode |
+|-------------------|-----------|--------------|
+| Runtime (agent-level) | Each agent chooses which types to honor | Distributed governance with no coordination — inconsistent audit trails, unresolvable disputes at verification time |
+| Operator configuration | Operators define the annotation vocabulary per deployment | Operator becomes implicit schema authority — trust annotations mean different things in different deployments, breaking cross-deployment audit |
+| Spec genesis (one-time ceremony) | Enum is fixed at spec publication time | Bounded expressiveness — some annotation types that agents might want are not representable as protocol-level claims |
+
+The protocol chooses spec genesis because it relocates the authority question from ongoing runtime decisions (low-visibility, repeated, subject to incremental capture) to a single ceremony (bounded, auditable, one-time). The tradeoff — bounded expressiveness — is intentional. Annotation types that do not fit the fixed enum are valid as agent-local metadata but do not carry protocol-level authority and MUST NOT appear in protocol-level verification or audit.
+
+**Rationale against fork-ability:** Allowing agents to fork the trust annotation vocabulary and run parallel governance creates a coordination problem: parallel schemas produce mutually unverifiable audit trails. Resolving which fork is canonical requires a new authority — the problem migrates, it does not dissolve.
+
+#### 9.10.2 Initial Trust Annotation Enum
+
+The following trust annotation types are the complete, closed V1 enum. Each type is a protocol-level claim with defined semantics.
+
+| Type | Description | Use context |
+|------|-------------|-------------|
+| `DELEGATION` | Agent acted under explicit authority granted by another agent. The delegation chain is traceable via §5.5 delegation tokens. | Attached to actions taken on behalf of a delegating agent. Enables audit of authority provenance — who authorized this action and through what chain. |
+| `ASSUMES_AUTHENTICATED_SOURCE` | Agent trusted message origin identity without protocol-level verification. The agent accepted the counterparty's claimed identity (§2.2) without cryptographic verification via the keypair extension (§2.2.1). | Attached to actions taken based on messages from agents identified by `(name, platform)` pair only, without `pubkey` verification. Marks the trust assumption explicitly — the action's validity depends on the platform's identity guarantees, not on protocol-level cryptographic verification. |
+| `ASSUMES_SCHEMA_VERSION` | Agent executed against a specific schema version that was not validated at runtime. The agent assumed the schema version declared by the counterparty or operator was accurate without independently verifying the schema content against the declared version identifier. | Attached to actions where schema version was taken on trust rather than verified. Relevant when schema attestation (§9.1) is not in use — the agent operated on the assumption that the schema labeled "v1.2" actually contains v1.2 semantics. |
+| `OPERATOR_ASSERTED` | Claim originates from operator configuration rather than protocol-level verification. The trust basis is the operator's out-of-band assertion — a configuration file, environment variable, or deployment parameter — rather than any protocol mechanism. | Attached to actions whose trust basis is operator authority. Distinguishes protocol-verified claims from operator-injected claims in audit trails. An `OPERATOR_ASSERTED` annotation on a delegation means the delegation authority was configured by the operator, not established through the §5.5 delegation protocol. |
+
+**Trust annotation field schema:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| annotation_type | enum | Yes | One of: `DELEGATION`, `ASSUMES_AUTHENTICATED_SOURCE`, `ASSUMES_SCHEMA_VERSION`, `OPERATOR_ASSERTED` |
+| annotation_context | string | No | Additional context for the annotation. Free-text, scoped to the specific instance. For `DELEGATION`: the delegation token identifier. For `ASSUMES_SCHEMA_VERSION`: the assumed schema version string. For `OPERATOR_ASSERTED`: the configuration source identifier. |
+| annotated_at | timestamp | Yes | ISO 8601 timestamp of when the annotation was attached. |
+
+**Example (trust annotation on a TASK_COMPLETE message):**
+
+```yaml
+message_type: TASK_COMPLETE
+task_id: "task-abc-123"
+trust_annotations:
+  - annotation_type: DELEGATION
+    annotation_context: "delegation-token-7f3a9b"
+    annotated_at: "2026-01-15T14:30:00Z"
+  - annotation_type: ASSUMES_AUTHENTICATED_SOURCE
+    annotated_at: "2026-01-15T14:30:00Z"
+```
+
+**Interaction with existing protocol surfaces:**
+
+- Trust annotations MAY be attached to TASK_PROGRESS (§6.6), TASK_COMPLETE (§6.6), EVIDENCE_RECORD (§8.10), and DIVERGENCE_REPORT (§8.11) messages via an optional `trust_annotations` array field.
+- Trust annotations are orthogonal to the `justification` field (§9.9.1): `justification` explains _why_ an action was taken; trust annotations declare _under what trust basis_ the action was taken. Both MAY be present on the same message.
+- Trust annotations are included in `trace_hash` computation (§6.2) when present — an action taken under `DELEGATION` and the same action taken under `OPERATOR_ASSERTED` produce different trace hashes, making the trust basis auditable through the existing hash verification mechanism.
+
+#### 9.10.3 Genesis Ceremony
+
+The trust annotation enum (§9.10.2) is defined through a **genesis ceremony** — a single, bounded governance event at spec publication time. The genesis ceremony is not a runtime decision, not an operator decision, and not renewable at will.
+
+**Genesis ceremony properties:**
+
+| Property | Characteristic |
+|----------|----------------|
+| Bounded | One-time event, not ongoing governance. The ceremony occurs once at spec genesis and does not repeat. |
+| High-scrutiny | Deliberate, explicit participants. The ceremony is a design-time decision with named contributors, not an incremental runtime accretion. |
+| Auditable | The event and participants are nameable. The ceremony produces a verifiable artifact (the enum definition and its publication hash per §9.10.4) that any agent can independently verify. |
+
+These properties contrast with runtime authority, which is low-visibility (each agent's annotation type decisions are local and uncoordinated), repeated (every message exchange is an implicit governance decision), and subject to incremental capture (an agent that introduces a new annotation type and gains adoption has silently become a schema authority).
+
+**Modification policy:**
+
+Modifications to the trust annotation enum — adding, removing, or changing the semantics of any annotation type — require a new **major version** of the protocol specification. This means:
+
+- A new annotation type cannot be added in a minor version or patch version (§10).
+- An existing annotation type's semantics cannot be changed without a major version increment.
+- Removal of an annotation type is a breaking change requiring a major version increment.
+
+The modification policy is a security property, not a limitation. If the enum were modifiable without a major version change, the genesis ceremony's governance guarantees would be undermined — an authority that can modify the enum at will has the same power as an authority that defined it, but without the ceremony's bounded, auditable, high-scrutiny properties.
+
+#### 9.10.4 Genesis Publication Hash
+
+The genesis ceremony (§9.10.3) produces the trust annotation enum (§9.10.2). Without tamper-evidence, the "one-time ceremony" guarantee is procedural aspiration — it depends on trust in the spec maintainers not to silently modify the enum post-genesis. The genesis publication hash converts this procedural guarantee into a cryptographic one: any agent can independently verify that the enum it executes against matches the artifact produced at genesis.
+
+**Publication hash requirement:**
+
+The genesis ceremony MUST produce a publication hash computed as:
+
+```
+genesis_hash = hash(canonical_enum_text + spec_version_string)
+```
+
+Where:
+- `canonical_enum_text` is the exact text of §9.10.2 from "The following trust annotation types" through the end of the enum table (the four-row table defining `DELEGATION`, `ASSUMES_AUTHENTICATED_SOURCE`, `ASSUMES_SCHEMA_VERSION`, `OPERATOR_ASSERTED`), canonicalized by stripping leading/trailing whitespace from each line and normalizing line endings to LF.
+- `spec_version_string` is the protocol version identifier (e.g., `"0.1.0"`).
+- `hash` is SHA-256.
+
+**Publication constraints:**
+
+The genesis hash MUST be committed to an external, independently-verifiable medium that satisfies the following constraints:
+
+| Constraint | Requirement |
+|------------|-------------|
+| Independence | The publication medium MUST NOT be maintained or controlled by the spec authors. If the spec authors control the medium, they can modify the hash to match a silently modified enum — the tamper-evidence property is defeated. |
+| Verifiability | Any agent MUST be able to retrieve the published hash and verify it independently without relying on the spec authors' infrastructure. |
+| Immutability | The publication medium MUST provide append-only or immutable storage. A hash published to a mutable medium can be silently replaced. |
+| Consistency with §8 audit media | The publication medium MUST satisfy the same independence criteria as §8 audit media — specifically, the audited party (spec authors) MUST NOT be the party that controls the publication medium. This is the same constraint applied to EVIDENCE_RECORD storage (§8.10). |
+
+**Verification procedure:**
+
+An agent verifying the trust annotation enum performs the following steps:
+
+1. Retrieve the canonical enum text from the spec document (§9.10.2).
+2. Retrieve the spec version string from the spec document (§10).
+3. Compute `hash(canonical_enum_text + spec_version_string)` using SHA-256.
+4. Retrieve the genesis hash from the external publication medium.
+5. Compare the computed hash with the published hash. If they match, the enum has not been modified since genesis. If they do not match, the enum has been modified — the agent SHOULD treat the enum as untrusted and SHOULD log a verification failure via EVIDENCE_RECORD (§8.10) with `evidence_type: error_event`.
+
+**Tamper-evidence, not tamper-prevention:** The genesis publication hash makes silent enum modification detectable. It does not prevent modification — an authority that controls the spec can still change the enum and publish a new hash. What the hash prevents is _undetected_ modification: any change to the enum after genesis produces a hash mismatch that any verifying agent can independently discover. Authority over schema updates becomes detectable rather than merely prohibited.
+
+> Implements [issue #133](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/133) and [issue #134](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/134): fixed enum of trust annotation types with genesis ceremony and publication hash. Defines four canonical trust annotation types (`DELEGATION`, `ASSUMES_AUTHENTICATED_SOURCE`, `ASSUMES_SCHEMA_VERSION`, `OPERATOR_ASSERTED`) as a closed enum at spec genesis, governance ceremony with bounded/auditable/high-scrutiny properties, modification policy requiring major version increment, and SHA-256 genesis publication hash for tamper-evident verification. Closes #133, closes #134.
 
 ## 10. Versioning
 
