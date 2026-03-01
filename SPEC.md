@@ -5515,6 +5515,18 @@ Verification failure entries use the same schema as §8.10.3, with the following
 
 Distinct states with distinct timestamps enable accurate reconstruction of which failure mode occurred at each point in the execution timeline.
 
+**Fault tolerance model mapping:**
+
+The three verification failure states map to classical distributed systems fault categories from the Byzantine generals problem. This mapping provides formal tolerance thresholds for multi-verifier deployments.
+
+| State | Fault category | Tolerance threshold | Rationale |
+|-------|---------------|--------------------|-----------|
+| `VERIFIER_UNREACHABLE` | Crash failure | 2f+1 verifiers tolerate f crash failures | Infrastructure failure — the verifier stopped responding. Crash failures are the simplest fault class: the faulty node does nothing wrong, it simply stops. No trust implication for the agent under verification. |
+| `VERIFICATION_TIMEOUT` | Ambiguous message (omission failure) | Between crash and Byzantine — requires contextual assessment | The verification request was sent but the outcome is unknown. The verifier may have crashed, may be overloaded, or may be partially failed. Maps to the omission failure class — the message may or may not have been processed. Persistent timeouts across the retry threshold MUST be treated as crash failure (`VERIFIER_UNREACHABLE`), never as Byzantine failure (`VERIFICATION_REJECT`). |
+| `VERIFICATION_REJECT` | Byzantine failure | 3f+1 verifiers required to tolerate f Byzantine failures | The verifier evaluated evidence and found non-compliance. This is the only state that requires the stronger Byzantine tolerance threshold — a reject from a single verifier in a multi-verifier deployment requires corroboration from 3f+1 total verifiers to distinguish legitimate rejection from a compromised verifier producing false rejections. |
+
+This mapping informs multi-verifier deployment configuration: a deployment with n verifiers tolerates ⌊(n-1)/2⌋ crash failures (`VERIFIER_UNREACHABLE`) but only ⌊(n-1)/3⌋ Byzantine failures (`VERIFICATION_REJECT`). The distinction determines the minimum verifier pool size required for a given fault tolerance target. The `VERIFICATION_TIMEOUT` → `VERIFIER_UNREACHABLE` escalation path (never `VERIFICATION_TIMEOUT` → `VERIFICATION_REJECT`) is the direct consequence of this mapping: ambiguous messages are crash-adjacent, not Byzantine-adjacent.
+
 **Example divergence_log with verification failure entries:**
 
 ```yaml
@@ -7312,6 +7324,8 @@ An agent verifying the trust annotation enum performs the following steps:
 The genesis ceremony (§9.10.3) defines the trust annotation enum at spec publication time. §9.10.3 specifies that modifications require a major version increment, but does not specify _how_ a modification is proposed, deliberated, or ratified. Without an explicit amendment path, modification governance defaults to whoever can update the document — runtime authority without acknowledgment. This is precisely the failure mode the genesis ceremony was designed to prevent: low-visibility, uncoordinated authority over the trust annotation vocabulary. An implicit amendment path is harder to audit than any explicit one, even a weak one.
 
 §9.11 specifies the amendment ceremony: the procedure by which the trust annotation enum may be modified after genesis. Amendment ceremonies are structurally lighter than the genesis ceremony but explicitly specified — proportional governance with full auditability.
+
+**Composable governance design:** Both genesis (§9.10.3) and amendment ceremonies share the same three-element verification structure: (1) explicit trigger conditions defining when a ceremony is valid, (2) named participant threshold defining who must participate, and (3) publication hash chaining providing tamper-evident linkage. This structural uniformity is intentional — one verification pattern applies at genesis and at every subsequent amendment. An automated governance auditor can traverse the hash chain from genesis through every amendment using a single verification procedure, without type dispatch or special-casing for genesis vs. amendment records. The composable design ensures that amendment governance inherits the genesis ceremony's auditability properties by construction, not by convention.
 
 #### 9.11.1 Trigger Conditions
 
