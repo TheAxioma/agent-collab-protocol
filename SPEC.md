@@ -1808,7 +1808,7 @@ timestamp: "2026-03-01T13:00:05Z"
 **Cross-references:**
 
 - §4.9 SESSION_SUSPEND: `commitments_outstanding` and `commitment_manifest` capture obligation-level state; `pending_tasks` captures task-level state. Both are needed for complete handoff.
-- §6.16.6 Compensation Semantics: the `pending_tasks` inventory provides task-level context that an application-layer compensation policy may use. Whether and how to invoke compensation is the receiver's decision — the protocol surfaces the inventory, not the disposition.
+- §6.16.6 Compensation Semantics: the `pending_tasks` inventory provides task-level context that the `compensation_policy` (§6.16.6) declared per capability may use. The `compensation_policy` enum (`best_effort`, `rollback`, `idempotent_retry`, `none`) governs the remediation strategy; whether and how to invoke compensation for enumerated pending tasks is the receiver's decision — the protocol surfaces the inventory, not the disposition.
 - §8.13 Teardown-First Recovery: teardown-first recovery reads canonical state from durable storage. `pending_tasks` provides the task inventory that a recovering agent or replacement session needs to determine what work remains.
 
 > Addresses [issue #182](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/182): `pending_tasks` inventory field on SESSION_CLOSE for teardown from SUSPENDED state. Adds task descriptor schema (`task_hash`, `status`, `description`), population rules, enumeration-only obligation semantics, `SESSION_TEARDOWN_PENDING_TASKS_OMITTED` audit warning, and cross-references to §6.16.6 and §8.13. Closes #182.
@@ -2393,6 +2393,7 @@ Each entry in `capability_types` is a structured object:
 |-------|------|----------|-------------|
 | capability_id | string | Yes | Structured capability identifier using the format `cap:namespace.capability@version` (e.g. `cap:openclaw.file.read@2`, `cap:example.code.execute@1`). See §5.1.1 for format specification. |
 | constraints | object | No | Self-declared limits (e.g. max input size, supported formats, resource ceilings) |
+| compensation_policy | enum | No | Compensation policy for irrevocable work executed under this capability. One of: `best_effort`, `rollback`, `idempotent_retry`, `none`. See §6.16.6 for definitions. When absent, defaults to `none`. Implementations MUST reject unknown `compensation_policy` values with a parse error — silent ignore or silent default is not permitted (§6.16.6). |
 
 #### 5.1.1 Capability ID Format
 
@@ -4017,7 +4018,7 @@ When a session terminates mid-plan — whether due to crash, disconnect, timeout
 
 - If `reversible: false` for a crossed step (the default), the delegating agent MUST treat that step's effects as **committed** even if the overall plan fails. The step's outputs are binding — they cannot be silently discarded or rolled back. This is a deliberate constraint: irreversible steps that have crossed their boundary have produced real-world effects (writes, external API calls, resource allocations) that cannot be undone by protocol action alone.
 - If `reversible: true` for a crossed step, the delegating agent MAY choose to roll back that step's effects as part of recovery. The protocol does not define a rollback mechanism — rollback semantics are implementation-defined. The `reversible` flag signals that rollback is **possible**, not that the protocol handles it.
-- **Compensation transactions** (automated rollback of irreversible steps) are explicitly **deferred to V2**. V1 acknowledges the problem — crossed irreversible steps in a failed plan create committed partial state — but does not provide a protocol-level compensation mechanism. Implementations that need compensation MUST handle it outside the protocol in V1.
+- **Compensation transactions** (automated rollback of irreversible steps) are explicitly **deferred to V2**. V1 acknowledges the problem — crossed irreversible steps in a failed plan create committed partial state — but does not provide an automated compensation transaction mechanism. V1 provides `compensation_policy` (§6.16.6) as a protocol-level enum for declaring the remediation strategy per capability (`best_effort`, `rollback`, `idempotent_retry`, `none`), but automated execution of compensation transactions is deferred to V2.
 
 **Dependency enforcement during execution:**
 
@@ -4255,13 +4256,13 @@ Explicit revocation and mid-session mode escalation introduce three audit event 
 | `REVOCATION_TOKEN_INVALID` | A revocation token is received with an invalid `issuer_signature` | `revocation_id` (if parseable), `grant_id`, claimed `issuer_id`, timestamp of receipt, identity of the receiving agent, reason for signature failure |
 | `REVOCATION_MODE_ESCALATED` | A revocation mode escalation is accepted mid-session (§6.15) | `session_id`, `prior_mode`, `new_mode`, `effective_from`, timestamp of escalation, identity of the escalating agent (A), identity of the acknowledging agent (B) |
 | `IN_FLIGHT_COMPLETED_DURING_GRACE` | An in-flight operation completed during the grace period between revocation receipt and `takes_effect_at` enforcement (§6.16.3) | `revocation_id`, `grant_id`, `task_id`, `operation_started_at`, `operation_completed_at`, `takes_effect_at`, identity of the executing agent |
-| `COMPENSATION_REQUIRED` | Irrevocable work was committed after `effective_from` and requires compensation (§6.16.6) | `revocation_id`, `grant_id`, `task_id`, `operation_id`, `committed_at`, `effective_from`, `compensation_status` (`pending`, `completed`, `failed`), identity of the executing agent |
+| `COMPENSATION_REQUIRED` | Irrevocable work was committed after `effective_from` and requires compensation (§6.16.6) | `revocation_id`, `grant_id`, `task_id`, `operation_id`, `committed_at`, `effective_from`, `compensation_policy` (enum: `best_effort`, `rollback`, `idempotent_retry`, `none` — from the capability manifest, §5.1), `compensation_status` (`pending`, `completed`, `failed`), identity of the executing agent |
 | `GRANT_CHAIN_INTEGRITY_FAILURE` | CAPABILITY_GRANT chain verification failed — a sub-grant's `parent_grant_hash` does not match the computed SHA-256 of the resolved parent grant, or the parent grant could not be resolved (§5.8.2) | `grant_id` (failing sub-grant), `parent_grant_id`, `claimed_parent_grant_hash`, `computed_parent_grant_hash` (if parent was resolvable), `failure_reason` (`hash_mismatch`, `parent_unresolvable`, `signature_invalid`), timestamp of detection, identity of the detecting agent |
 | `SESSION_TEARDOWN_PENDING_TASKS_OMITTED` | SESSION_CLOSE issued from SUSPENDED state without `pending_tasks` when in-flight tasks were plausibly present (§4.9.2) — audit warning indicating a potential information gap for task resumption or compensation | `session_id`, `sender_id`, `prior_session_state` (`SUSPENDED`), `commitments_outstanding` (from SESSION_CLOSE), `suspension_had_active_tasks` (boolean — `true` if the session had active task delegations before suspension), timestamp of teardown, identity of the closing agent |
 
 **`EXPLICIT_REVOCATION` is a distinct class from TTL expiry.** When a grant is rejected because `current_time > valid_until` (§5.8.2), the rejection reason is temporal expiry — the grant aged out. When a grant is rejected because a valid revocation token exists, the rejection reason is active revocation by the issuer. These are different failure modes with different causes, different attribution, and different recovery paths. The audit trail MUST distinguish them.
 
-**EVIDENCE_RECORD integration:** `EXPLICIT_REVOCATION` and `REVOCATION_TOKEN_INVALID` events SHOULD be recorded as EVIDENCE_RECORDs (§8.10.1) with `evidence_type: error_event`. The `payload_hash` SHOULD be computed over the revocation token contents (valid or invalid) to enable independent verification of the audit entry. `IN_FLIGHT_COMPLETED_DURING_GRACE` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: state_snapshot`, capturing the operation's authorization context and completion timestamp relative to the `takes_effect_at` deadline. `COMPENSATION_REQUIRED` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: error_event`, capturing the irrevocable operation's commit timestamp relative to `effective_from` and the compensation status lifecycle (`pending` → `completed` or `failed`). `GRANT_CHAIN_INTEGRITY_FAILURE` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: error_event`, capturing the failing sub-grant's `grant_id`, `parent_grant_id`, both the claimed and computed parent grant hashes, and the specific failure reason (`hash_mismatch`, `parent_unresolvable`, or `signature_invalid`). `SESSION_TEARDOWN_PENDING_TASKS_OMITTED` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: error_event`, capturing the `session_id`, prior session state (`SUSPENDED`), whether commitments were outstanding, and whether the session had active task delegations before suspension — enabling post-hoc identification of teardowns that may have lost task inventory information.
+**EVIDENCE_RECORD integration:** `EXPLICIT_REVOCATION` and `REVOCATION_TOKEN_INVALID` events SHOULD be recorded as EVIDENCE_RECORDs (§8.10.1) with `evidence_type: error_event`. The `payload_hash` SHOULD be computed over the revocation token contents (valid or invalid) to enable independent verification of the audit entry. `IN_FLIGHT_COMPLETED_DURING_GRACE` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: state_snapshot`, capturing the operation's authorization context and completion timestamp relative to the `takes_effect_at` deadline. `COMPENSATION_REQUIRED` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: error_event`, capturing the irrevocable operation's commit timestamp relative to `effective_from`, the `compensation_policy` enum value from the capability manifest, and the compensation status lifecycle (`pending` → `completed` or `failed`). `GRANT_CHAIN_INTEGRITY_FAILURE` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: error_event`, capturing the failing sub-grant's `grant_id`, `parent_grant_id`, both the claimed and computed parent grant hashes, and the specific failure reason (`hash_mismatch`, `parent_unresolvable`, or `signature_invalid`). `SESSION_TEARDOWN_PENDING_TASKS_OMITTED` events SHOULD be recorded as EVIDENCE_RECORDs with `evidence_type: error_event`, capturing the `session_id`, prior session state (`SUSPENDED`), whether commitments were outstanding, and whether the session had active task delegations before suspension — enabling post-hoc identification of teardowns that may have lost task inventory information.
 
 **Receiver-recorded `propagated_at` timestamp:** On receiving a valid revocation token, the receiving agent MUST record a `propagated_at` timestamp — the agent's local clock time at the moment of token receipt. `propagated_at` is NOT a field on the revocation token itself (it cannot be — the issuer does not know when the receiver will receive the token). It is receiver-local state that MUST be persisted alongside the cached revocation token. `propagated_at` enables: (a) measuring actual propagation latency (`propagated_at - revoked_at`) against the declared `propagation_window_ms`; (b) determining whether good faith protection applies (§6.13.6) — operations committed before `propagated_at` are candidates for good faith protection; (c) audit trail correlation — the `EXPLICIT_REVOCATION` audit event (above) includes `propagated_at` to record when the enforcing agent learned of the revocation.
 
@@ -4606,27 +4607,45 @@ In both cases, the irrevocable work was committed under a capability that is now
 
 1. **Detection.** When an agent discovers that it committed irrevocable work (an operation with `retry_semantics: at_most_once`) under a grant that has since been revoked — specifically, when the operation's `committed_at` timestamp is ≥ `effective_from` on the revocation token — the agent MUST emit a `COMPENSATION_REQUIRED` audit event (§6.13.4).
 
-2. **Declaration.** The `COMPENSATION_REQUIRED` audit event MUST include: `revocation_id`, `grant_id`, `task_id`, the operation identifier, `committed_at` (when the irrevocable step was executed), `effective_from` (the logical revocation time), and whether the commit fell within the `propagation_window_ms` (good faith) or outside it (protocol violation).
+2. **Declaration.** The `COMPENSATION_REQUIRED` audit event MUST include: `revocation_id`, `grant_id`, `task_id`, the operation identifier, `committed_at` (when the irrevocable step was executed), `effective_from` (the logical revocation time), `compensation_policy` (the enum value from the capability manifest for the capability under which the irrevocable work was executed — one of `best_effort`, `rollback`, `idempotent_retry`, `none`), and whether the commit fell within the `propagation_window_ms` (good faith) or outside it (protocol violation).
 
 3. **Issuer responsibility.** The revoking agent (issuer) bears responsibility for initiating compensation for irrevocable work committed during the propagation window — the issuer set the `propagation_window_ms` and accepted that downstream agents might exercise the capability within that window. Irrevocable work committed after `revoked_at + propagation_window_ms` is the executing agent's responsibility (protocol violation).
 
-4. **Compensation hooks.** Agents that execute irreversible operations SHOULD declare compensation endpoints in their capability manifest (§5.1). A compensation endpoint accepts a `COMPENSATION_REQUIRED` event and returns a compensation plan — the set of operations needed to remediate the irrevocable work. The protocol does not mandate a specific compensation mechanism (rollback, counter-operation, manual review) — the mechanism is operation-specific and deployment-defined.
+4. **Compensation hooks.** Agents that execute irreversible operations SHOULD declare compensation endpoints in their capability manifest (§5.1) and SHOULD declare a `compensation_policy` (§5.1) for each capability that may produce irrevocable work. A compensation endpoint accepts a `COMPENSATION_REQUIRED` event and returns a compensation plan — the set of operations needed to remediate the irrevocable work. The `compensation_policy` declared in the capability manifest governs the remediation strategy.
 
 5. **Idempotency requirement for compensation.** Compensation operations MUST be idempotent — invoking the same compensation request multiple times (identified by `revocation_id` + operation identifier) MUST produce the same result. This is critical because compensation may be triggered by multiple agents in a delegation chain that independently discover the revocation.
+
+**`compensation_policy` enum:**
+
+The `compensation_policy` field is a protocol-level enum declared per capability type in the agent's CAPABILITY_MANIFEST (§5.1). It governs what remediation strategy the agent commits to for irrevocable work executed under a given capability. The enum has exactly four values:
+
+| Value | Definition |
+|-------|-----------|
+| `best_effort` | The agent will attempt compensation for irrevocable work, but provides no guarantee of success. The compensation endpoint (if declared) will be invoked, and the result (`completed` or `failed`) recorded in the audit trail. Partial remediation is acceptable. |
+| `rollback` | The agent will attempt a full state revert to the pre-task state. All effects of the irrevocable work — writes, resource allocations, external API side effects — will be reversed. If rollback fails, the agent MUST emit a `COMPENSATION_REQUIRED` event with `compensation_status: failed` and escalate to manual resolution. |
+| `idempotent_retry` | The agent will retry the task with idempotency guarantees. The retried execution MUST produce no additional state change beyond what the original execution committed. This policy is appropriate for operations where re-execution is safe and convergent. |
+| `none` | No compensation action will be taken. The irrevocable work is accepted as committed. The agent will emit the `COMPENSATION_REQUIRED` audit event for record-keeping but will not attempt remediation. The issuer or operator bears full responsibility for any required remediation. |
+
+**Validation requirement:** Implementations MUST reject unknown `compensation_policy` values with a parse error. Silent ignore of an unrecognized value is not permitted. Silent default to a fallback value is not permitted. This is a mandatory interoperability requirement — freeform strings break interoperability at parse time because implementations cannot reliably distinguish valid policies, and divergent interpretations are silent failures. The enum is closed: only the four values defined above are valid in V1. Extension of the enum requires a protocol version change (§10).
 
 **Compensation flow:**
 
 ```
 B discovers irrevocable work committed after effective_from:
   1. Emit COMPENSATION_REQUIRED audit event (§6.13.4)
-  2. If compensation endpoint is declared in manifest:
+     - Include the compensation_policy from the capability manifest
+  2. If compensation_policy is "none":
+     - Log COMPENSATION_REQUIRED with compensation_status: pending
+     - No automated remediation — issuer or operator resolves manually
+  3. If compensation_policy is "best_effort", "rollback", or
+     "idempotent_retry" and compensation endpoint is declared:
      - Invoke compensation endpoint with revocation_id, grant_id,
-       operation details, and committed_at
+       operation details, committed_at, and compensation_policy
      - Record compensation result (completed/failed) in audit trail
-  3. If no compensation endpoint is declared:
+  4. If compensation endpoint is not declared (regardless of policy):
      - Log COMPENSATION_REQUIRED with compensation_status: pending
      - The issuer or operator MUST resolve manually
-  4. Notify the revoking agent (issuer) of the COMPENSATION_REQUIRED
+  5. Notify the revoking agent (issuer) of the COMPENSATION_REQUIRED
      event via the session channel, enabling the issuer to track
      outstanding irrevocable work under the revoked grant
 ```
@@ -4636,6 +4655,8 @@ B discovers irrevocable work committed after effective_from:
 **Relationship to pending_tasks inventory (§4.9.2):** When a session is torn down from SUSPENDED state, the `pending_tasks` inventory (§4.9.2) provides task-level context — which tasks were in-flight and their status at suspension time. The `pending_tasks` obligation is enumeration only; whether a receiver initiates the compensation workflow defined here for any enumerated task is an application-layer decision. The inventory surfaces what the sender knows; the receiver determines disposition (compensation, handoff, or abandonment) per its own policy.
 
 > Implements [issue #94](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/94): compensation semantics for irrevocable work committed past `effective_from`. Adds `COMPENSATION_REQUIRED` audit event, compensation endpoint declaration in capability manifest, idempotency requirement for compensation operations, and compensation flow for propagation-gap and race-condition commits. Closes #94.
+>
+> Implements [issue #192](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/192): changes `compensation_policy` from freeform string to a bounded protocol-level enum with exactly four values (`best_effort`, `rollback`, `idempotent_retry`, `none`). Adds mandatory parse-error rejection for unknown values — silent ignore or silent default is not permitted. Adds `compensation_policy` to CAPABILITY_MANIFEST capability type entries (§5.1) and to the `COMPENSATION_REQUIRED` audit event (§6.13.4). Closes #192.
 
 ### 6.17 Time-Bounded Capability Grants
 
