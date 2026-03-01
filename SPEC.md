@@ -3075,12 +3075,13 @@ On receiving or verifying a grant, agents MUST evaluate both TTL expiry and expl
 
 #### 6.13.4 Audit Events
 
-Explicit revocation introduces two new audit event classes for the evidence layer (§8.10):
+Explicit revocation and mid-session mode escalation introduce three audit event classes for the evidence layer (§8.10):
 
 | Audit event | Trigger | Logged data |
 |-------------|---------|-------------|
 | `EXPLICIT_REVOCATION` | A grant is rejected due to a valid revocation token | `grant_id`, `issuer_id`, `revocation_reason` (from the token), `revoked_at`, timestamp of rejection, identity of the rejecting agent |
 | `REVOCATION_TOKEN_INVALID` | A revocation token is received with an invalid `issuer_signature` | `grant_id`, claimed `issuer_id`, timestamp of receipt, identity of the receiving agent, reason for signature failure |
+| `REVOCATION_MODE_ESCALATED` | A revocation mode escalation is accepted mid-session (§6.15) | `session_id`, `prior_mode`, `new_mode`, `effective_from`, timestamp of escalation, identity of the escalating agent (A), identity of the acknowledging agent (B) |
 
 **`EXPLICIT_REVOCATION` is a distinct class from TTL expiry.** When a grant is rejected because `current_time > valid_until` (§5.8.2), the rejection reason is temporal expiry — the grant aged out. When a grant is rejected because a valid revocation token exists, the rejection reason is active revocation by the issuer. These are different failure modes with different causes, different attribution, and different recovery paths. The audit trail MUST distinguish them.
 
@@ -3162,7 +3163,108 @@ The delegating agent SHOULD implement retry logic for TASK_ASSIGN when no respon
 
 > Implements [issue #130](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/130): delegation-initiation idempotency for §6. Defines `request_id` on TASK_ASSIGN, delegatee deduplication semantics, idempotency window bounded by session TTL (§4.3), interaction with delegation chains (§6.9), and delegator retry semantics. Resolves the ambiguity between lost-ack and lost-delegation scenarios. Closes #130.
 
-### 6.15 Open Questions
+### 6.15 Mid-Session Revocation Mode Escalation
+
+<!-- Implements #123: mid-session revocation mode escalation for §6. -->
+
+The `revocation_mode` field on TASK_ASSIGN (§6.6) sets the revocation verification strategy at delegation time. Once set, the mode is static for the lifetime of that delegation. If session conditions change mid-session — detected anomaly, administrative intervention, escalating operation risk — the delegating agent (A) has no mechanism to switch the revocation mode without terminating the session and re-establishing delegation. For long-running sessions with accumulated state, forced termination solely to change the revocation mode is disproportionately expensive.
+
+REVOCATION_MODE_ESCALATE provides a protocol mechanism for A to tighten the revocation mode mid-session without session termination or re-negotiation.
+
+#### 6.15.1 REVOCATION_MODE_ESCALATE Message
+
+REVOCATION_MODE_ESCALATE is sent by the delegating agent (A) to the delegatee (B) to request a mid-session change to a stricter revocation mode.
+
+**REVOCATION_MODE_ESCALATE fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | The active session identifier. MUST reference an ACTIVE session between A and B. |
+| task_id | UUID v4 | Yes | The task whose revocation mode is being escalated. Correlates with the original TASK_ASSIGN. |
+| new_mode | enum | Yes | The revocation mode to activate. One of: `sync`, `gossip`. MUST be strictly stricter than the current mode (see §6.15.3 for the strictness ordering). |
+| effective_from | enum | Yes | When the new mode takes effect. Value: `next_operation` — the mode change applies from B's next operation forward. The escalation is not retroactive: operations already committed under the prior mode are not re-evaluated. |
+| escalation_reason | string | No | Why the escalation is being requested. Standard reasons: `anomaly_detected` (A detected anomalous behavior in the session), `administrative_intervention` (operator-initiated policy change), `risk_escalation` (operation risk level increased mid-session), `trust_decay_triggered` (trust decay interval expired without re-verification, §9.8.6). Free-text when no standard reason applies. |
+| timestamp | ISO 8601 | Yes | When the REVOCATION_MODE_ESCALATE was issued by A. Millisecond precision REQUIRED. |
+
+**Example REVOCATION_MODE_ESCALATE:**
+
+```yaml
+session_id: "session-42"
+task_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+new_mode: sync
+effective_from: next_operation
+escalation_reason: anomaly_detected
+timestamp: "2026-03-01T14:30:00.000Z"
+```
+
+#### 6.15.2 REVOCATION_MODE_ESCALATE_ACK Message
+
+REVOCATION_MODE_ESCALATE_ACK is sent by the delegatee (B) to acknowledge the mode escalation. B MUST send this acknowledgment before performing any further operations under the delegation.
+
+**REVOCATION_MODE_ESCALATE_ACK fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| session_id | string | Yes | Echoed from REVOCATION_MODE_ESCALATE. |
+| task_id | UUID v4 | Yes | Echoed from REVOCATION_MODE_ESCALATE. |
+| prior_mode | enum | Yes | The revocation mode that was in effect before the escalation. One of: `sync`, `gossip`. |
+| new_mode | enum | Yes | Echoed from REVOCATION_MODE_ESCALATE. Confirms the mode B has activated. |
+| effective_from | enum | Yes | Echoed from REVOCATION_MODE_ESCALATE. |
+| acknowledged_at | ISO 8601 | Yes | Timestamp of acknowledgment. Millisecond precision REQUIRED. |
+
+**Example REVOCATION_MODE_ESCALATE_ACK:**
+
+```yaml
+session_id: "session-42"
+task_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+prior_mode: gossip
+new_mode: sync
+effective_from: next_operation
+acknowledged_at: "2026-03-01T14:30:00.150Z"
+```
+
+#### 6.15.3 Protocol Semantics
+
+**Escalation flow:**
+
+1. A sends REVOCATION_MODE_ESCALATE to B with the desired `new_mode`.
+2. B MUST acknowledge with REVOCATION_MODE_ESCALATE_ACK before performing any further operations under the delegation. Operations initiated by B after receiving REVOCATION_MODE_ESCALATE but before sending REVOCATION_MODE_ESCALATE_ACK are protocol violations.
+3. The session remains ACTIVE — no session termination, no re-negotiation, no new TASK_ASSIGN required.
+4. After acknowledgment, B operates under the new revocation mode for all subsequent operations.
+
+**Strictness ordering:** The revocation modes have a total ordering by strictness:
+
+```
+gossip < sync
+```
+
+`sync` is strictly stricter than `gossip` because it requires per-hop registry verification before each delegation step (§9.8.5), whereas `gossip` relies on asynchronous broadcast with a trust decay window.
+
+**Unidirectional constraint:** Mode escalation within a session is unidirectional — A can escalate to a stricter mode but MUST NOT relax to a less strict mode via REVOCATION_MODE_ESCALATE. A REVOCATION_MODE_ESCALATE message where `new_mode` is less strict than or equal to the current mode is a protocol violation and MUST be rejected by B. To de-escalate (relax the revocation mode), A MUST either explicitly re-negotiate via a new TASK_ASSIGN or establish a new session.
+
+**Acknowledgment timeout:** If B does not respond with REVOCATION_MODE_ESCALATE_ACK within the session's heartbeat timeout (§4.5), A MUST treat the escalation as failed. A MAY then choose to: (a) retry the escalation, (b) send TASK_CANCEL to terminate the delegation, or (c) escalate to session termination. A MUST NOT assume the new mode is in effect without explicit acknowledgment.
+
+**Propagation in delegation chains:** When B has sub-delegated to C (§6.9) and B receives REVOCATION_MODE_ESCALATE from A, B MUST propagate the escalation to C by sending its own REVOCATION_MODE_ESCALATE to C. B MUST wait for C's REVOCATION_MODE_ESCALATE_ACK before sending its own acknowledgment to A. This ensures the entire delegation chain transitions atomically — A's acknowledgment confirms that all downstream agents have adopted the new mode.
+
+**Interaction with `revocation_mode` on TASK_ASSIGN (§6.6):** The `revocation_mode` field on TASK_ASSIGN sets the initial mode at delegation time. REVOCATION_MODE_ESCALATE overrides this initial mode mid-session. After a successful escalation, the effective revocation mode is the escalated mode, not the mode from the original TASK_ASSIGN. Subsequent REVOCATION_MODE_ESCALATE messages are evaluated against the current effective mode, not the original TASK_ASSIGN mode.
+
+#### 6.15.4 Audit Event
+
+A successful revocation mode escalation MUST be recorded as a `REVOCATION_MODE_ESCALATED` audit event in the evidence layer (§8.10). See §6.13.4 for the audit event table.
+
+**EVIDENCE_RECORD integration:** `REVOCATION_MODE_ESCALATED` events SHOULD be recorded as EVIDENCE_RECORDs (§8.10.1) with `evidence_type: state_snapshot`. The `payload_hash` SHOULD be computed over the REVOCATION_MODE_ESCALATE_ACK message contents (including `prior_mode`, `new_mode`, `effective_from`, and `acknowledged_at`) to enable independent verification that the mode transition occurred and was acknowledged.
+
+#### 6.15.5 Relationship to Existing Mechanisms
+
+**Relationship to §9.8.5 `revocation_mode`:** §9.8.5 defines `sync` and `gossip` as static per-delegation choices. This section extends that model with a dynamic escalation path — the mode can be tightened mid-session without re-delegation. The strictness ordering (`gossip < sync`) and the unidirectional constraint are consistent with §9.8.5's mode propagation rules: mode can only be tightened, not relaxed.
+
+**Relationship to §6.13 Explicit Revocation Channel:** Mode escalation is orthogonal to explicit revocation. A mode escalation changes how revocation signals propagate; it does not itself revoke any grant. An agent may escalate from `gossip` to `sync` and subsequently issue an explicit revocation (§6.13) — the two mechanisms operate independently.
+
+**Relationship to §4 Session Lifecycle:** REVOCATION_MODE_ESCALATE does not alter session state. The session remains ACTIVE throughout the escalation. If A determines that mode escalation is insufficient (e.g., B fails to acknowledge), A's recourse is session termination through the normal session lifecycle (§4.2), not a new escalation mechanism.
+
+> Implements [issue #123](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/123): mid-session revocation mode escalation for §6. Defines REVOCATION_MODE_ESCALATE and REVOCATION_MODE_ESCALATE_ACK message types, unidirectional strictness constraint (gossip → sync only), delegation chain propagation semantics, and REVOCATION_MODE_ESCALATED audit event (§6.13.4). Session remains ACTIVE — no re-negotiation required. De-escalation requires explicit re-negotiation or a new session. Closes #123.
+
+### 6.16 Open Questions
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
@@ -5075,6 +5177,8 @@ In `gossip` mode, revocation signals are broadcast as signed messages (§8.17.1 
 | Trust decay | After `trust_decay_interval` without confirmation that a delegatee's key remains valid, the delegating agent MUST treat the delegatee as untrusted (see §9.8.6) |
 
 **Mode coexistence:** Both modes are valid V1 strategies. The delegating agent selects the mode in TASK_ASSIGN via the `revocation_mode` field (§6.6). The choice is per-delegation, not per-session — an agent MAY use `sync` for high-value delegations to untrusted intermediaries and `gossip` for routine delegations within a trusted cluster. When `revocation_mode` is absent from TASK_ASSIGN, `gossip` is the default — consistent with V1's cooperative-first design (§8.18.1).
+
+**Mid-session mode escalation:** The initial `revocation_mode` set at TASK_ASSIGN time can be escalated to a stricter mode mid-session via REVOCATION_MODE_ESCALATE (§6.15) without session termination or re-delegation. Escalation is unidirectional (`gossip` → `sync` only) and requires explicit acknowledgment from the delegatee before further operations proceed. See §6.15 for the full escalation protocol.
 
 **Mode propagation in delegation chains:** When agent B re-delegates to agent C (§6.9), B MUST propagate the `revocation_mode` from the upstream TASK_ASSIGN unless B's own policy requires a stricter mode. Mode can only be tightened, not relaxed: if A specified `sync`, B MUST NOT downgrade to `gossip` when delegating to C. If A specified `gossip`, B MAY upgrade to `sync` for its delegation to C.
 
