@@ -3669,7 +3669,8 @@ A revocation token is a signed record that explicitly terminates a grant regardl
 | revocation_reason | enum | Yes | Why the grant is being revoked. One of: `SECURITY_COMPROMISE` (the grant's security context has been compromised), `TRUST_LOSS` (the issuer no longer trusts the grantee for this delegation), `TASK_CANCELLED` (the associated task has been cancelled), `POLICY_VIOLATION` (the grantee violated a constraint of the grant), `ISSUER_REVOKED` (the issuer's own authority has been revoked, cascading to its grants). |
 | revoked_at | ISO 8601 | Yes | Timestamp when the revocation was issued. Millisecond precision REQUIRED. |
 | takes_effect_at | ISO 8601 | No | Timestamp when the revocation MUST be enforced by the receiving agent (§6.16). Millisecond precision REQUIRED when present. If absent, enforcement is immediate upon receipt — equivalent to `takes_effect_at` equal to the receiver's local time at token receipt. When present, MUST be ≥ `revoked_at`. Separates propagation latency from enforcement deadline: the receiver learns about the revocation at receipt time but MUST NOT enforce it before `takes_effect_at`, allowing in-flight atomic operations to complete (§6.16.3). |
-| issuer_signature | bytes | Yes | Cryptographic signature over `grant_id || issuer_id || revocation_reason || revoked_at || takes_effect_at` (if present), produced by the issuer's private key (§2.2.1). The `||` operator denotes concatenation of the canonical byte representations. When `takes_effect_at` is absent, the signature covers `grant_id || issuer_id || revocation_reason || revoked_at` only. |
+| propagation_window_ms | integer | Yes | Maximum expected propagation delay in milliseconds — the window within which the revoking agent expects CAPABILITY_REVOKE to reach all downstream capability holders. Agents receiving CAPABILITY_REVOKE MUST immediately honor the revocation and forward to all downstream capability holders. The revoking agent bears responsibility for operations completed by agents that have not yet received the revocation within this window (§6.18.3). MUST be > 0. MUST NOT exceed 300000 (5 minutes) — propagation windows longer than 5 minutes indicate a topology or transport problem, not a legitimate propagation delay. |
+| issuer_signature | bytes | Yes | Cryptographic signature over `grant_id || issuer_id || revocation_reason || revoked_at || takes_effect_at` (if present) `|| propagation_window_ms`, produced by the issuer's private key (§2.2.1). The `||` operator denotes concatenation of the canonical byte representations. When `takes_effect_at` is absent, the signature covers `grant_id || issuer_id || revocation_reason || revoked_at || propagation_window_ms`. |
 
 **Revocation token validity:**
 
@@ -3685,6 +3686,7 @@ issuer_id: "agent-alpha"
 revocation_reason: SECURITY_COMPROMISE
 revoked_at: "2026-03-01T10:15:00.000Z"
 takes_effect_at: "2026-03-01T10:15:05.000Z"
+propagation_window_ms: 30000
 issuer_signature: "c2lnbmVkLXJldm9jYXRpb24tdG9rZW4..."
 ```
 
@@ -4138,7 +4140,53 @@ The following TTL-related features are explicitly deferred to V2:
 
 > Implements [issue #107](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/107): time-bounded capability grants for §6. Defines `valid_until` as REQUIRED on CAPABILITY_GRANT with 24-hour V1 maximum TTL, cascading TTL decay with floor constraint formula for child grants, renewal-from-original-issuer constraint with cascading renewal rules, 5-second grace period for in-flight operations at expiry, complementary relationship between TTL and CAPABILITY_REVOKE, session vs capability TTL distinction, TTL exhaustion vs session end orthogonality, and CAPABILITY_DENY with `reason=TTL_EXCEEDS_PARENT` for sub-delegation violations. V2 deferrals: CAPABILITY_RENEW_REQUEST, quorum-based renewal, TTL inheritance policies. Production evidence: @larryadlibrary 47-op expired credential run (issue #15). Design sources: @NewMoon (grant expiration as revocation alternative), @Jarvis4 (TTL + ZK composite primitive), @mote-oo (per-operation revalidation analysis). Closes #107.
 
-### 6.18 Open Questions
+### 6.18 Revocation Propagation Cost Model
+
+<!-- Implements #97: revocation propagation cost model — propagation_window_ms, best-effort gossip with declared propagation window, propagation obligations, enforcement during propagation window, and V2 deferrals -->
+
+§6.13 treats revocation as a point event — CAPABILITY_REVOKE fires and the capability is gone. In a distributed system this is incomplete: B can't honor a revocation it hasn't received, and A can't assume receipt just because it sent. This section declares a propagation model that makes the cost of revocation distribution explicit and auditable.
+
+#### 6.18.1 V1 Decision: Best-Effort Gossip with Declared Propagation Window
+
+Synchronous revocation — complete only when all downstream agents confirm receipt — requires acknowledgment loops and blocks indefinitely if any agent is unreachable. This is a V2 concern. V1 uses best-effort gossip with a declared `propagation_window_ms` field (§6.13.1) on the revocation token.
+
+The `propagation_window_ms` field declares the revoking agent's expectation for how long propagation will take. It is not a guarantee — network partitions, agent crashes, and Byzantine intermediaries can all delay or prevent propagation. It is a declared cost: the revoking agent accepts responsibility for operations completed by agents that have not yet received the revocation within this window.
+
+**Relationship to `takes_effect_at` (§6.13.1):** `propagation_window_ms` and `takes_effect_at` serve complementary purposes. `takes_effect_at` governs enforcement timing at each receiving agent — when that agent must stop honoring the capability. `propagation_window_ms` governs propagation expectations across the entire delegation chain — the maximum expected delay before all holders have received the revocation. An agent may receive CAPABILITY_REVOKE well before `propagation_window_ms` elapses but must still enforce according to `takes_effect_at` semantics. Conversely, an agent that receives CAPABILITY_REVOKE after `propagation_window_ms` has elapsed has still operated in good faith during the window (§6.18.3).
+
+#### 6.18.2 Propagation Obligations
+
+1. An agent receiving CAPABILITY_REVOKE MUST immediately cease honoring the capability (subject to `takes_effect_at` enforcement timing per §6.16) and MUST forward CAPABILITY_REVOKE to all agents it has sub-delegated the capability to. Forwarding MUST occur as soon as practicable — an agent MUST NOT batch or delay revocation forwarding for efficiency.
+2. An agent that has learned of a revocation MUST refuse new operations under the revoked capability even if downstream propagation to its own sub-delegatees is not yet confirmed. An agent's local enforcement is independent of its propagation success to downstream holders.
+3. If an agent cannot reach a downstream capability holder to forward CAPABILITY_REVOKE, it MUST treat the unreachable agent as DEGRADED (§8) pending re-establishment. The forwarding agent SHOULD retry delivery using the session's transport retry semantics and SHOULD emit a `REVOCATION_PROPAGATION_FAILED` signal (§9.8.2) if delivery cannot be confirmed within `propagation_window_ms`.
+
+#### 6.18.3 Enforcement During Propagation Window
+
+Agents that have not yet received CAPABILITY_REVOKE operate in good faith during the propagation window. Operations completed before an agent learns of the revocation are not retroactively invalid — they were authorized at the time of execution. The revoking agent bears responsibility for the window declared in `propagation_window_ms`: by setting a propagation window, the issuer accepts that work may be completed under the revoked capability during that period.
+
+**Attribution:** The `propagation_window_ms` value is included in the revocation token's `issuer_signature` (§6.13.1). This makes the declared propagation window tamper-evident and attributable to the issuer. Post-hoc audit can verify whether operations completed during the propagation window fall within the issuer's declared tolerance.
+
+#### 6.18.4 Enforcement Semantics for Pending Revocations
+
+Agents aware of a pending revocation — those that have received CAPABILITY_REVOKE but for which `propagation_window_ms` has not yet elapsed — operate under the following constraints:
+
+1. **New operations:** The agent MUST refuse to start new operations using the revoked capability. The revocation is effective for authorization purposes at receipt time, not at `propagation_window_ms` expiry.
+2. **Already-started operations:** Operations that were authorized and started before the agent received CAPABILITY_REVOKE MUST follow the in-flight protection rules declared in the revocation token — specifically the `takes_effect_at` grace period (§6.16.3). If `takes_effect_at` is present, in-flight operations may complete within the grace window. If `takes_effect_at` is absent, in-flight operations are subject to immediate enforcement (§6.16.3 strict revocation mode).
+3. **Forwarding obligation:** The agent MUST forward CAPABILITY_REVOKE to downstream holders regardless of whether `propagation_window_ms` has elapsed. The propagation window is the issuer's declared tolerance, not a delay on forwarding — forwarding is always immediate.
+
+#### 6.18.5 V2 Deferrals
+
+The following propagation cost model features are explicitly deferred to V2:
+
+1. **Synchronous revocation with acknowledgment requirement.** CAPABILITY_REVOKE that blocks until all downstream agents confirm receipt. Requires acknowledgment loops and partition-tolerant timeout semantics.
+2. **Revocation receipts and end-to-end propagation confirmation.** Signed acknowledgments from each holder in the delegation chain, providing the issuer with cryptographic proof that revocation reached every downstream agent.
+3. **Cryptographic revocation proofs (ZK-based).** Zero-knowledge proofs that an agent has checked and honored a revocation without revealing the revocation token contents to intermediaries. See #109, #126, #129.
+4. **Quorum-based revocation for high-stakes capabilities.** Revocation that requires confirmation from a quorum of agents (e.g., two-of-three holders acknowledge) before taking effect, preventing unilateral revocation of capabilities with shared governance.
+5. **Revocation propagation monitoring and SLA enforcement.** Declarative SLAs on propagation latency with automated escalation when `propagation_window_ms` is exceeded without full propagation confirmation.
+
+> Implements [issue #97](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/97): revocation propagation cost model for §6. Adds `propagation_window_ms` as REQUIRED field on revocation token (§6.13.1), defines best-effort gossip with declared propagation window, propagation obligations (immediate forwarding, independent local enforcement, DEGRADED state for unreachable holders), good-faith enforcement during propagation window, and enforcement semantics separating new-operation refusal from in-flight protection. V2 deferrals: synchronous revocation, revocation receipts, ZK-based proofs, quorum-based revocation, propagation SLA enforcement. Closes #97.
+
+### 6.19 Open Questions
 
 The following are explicitly identified as unresolved gaps in v0.1:
 
