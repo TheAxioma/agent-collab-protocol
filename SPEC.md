@@ -3351,6 +3351,18 @@ Two agents — one in Python using `json.dumps`, one in Rust using `serde_cbor` 
 
 **Implementor guidance:** A delegation chain where every `intent_hash` verifies is audit-clean (no intermediary tampered with intent) but is not necessarily semantically correct (the preserved intent may not cover the downstream execution). V1 implementations MUST NOT treat successful `intent_hash` verification as proof of authorization compliance.
 
+#### V1 Scope: Intent Payload Schema Is Implementation-Defined
+
+> **V1 mandates `intent_hash` as a tamper-evident commitment field. The schema of the preimage — what gets hashed — is implementation-defined in V1.** No specific intent payload schema is normatively required.
+
+The protocol requires that `intent_hash` exist and be computed over the intent context fields (`intent`, `scope`, `constraints`) using the canonicalization rules in §6.4.1. However, V1 does not mandate the internal structure of those fields. The `intent` field may be a free-form string, a structured object with typed sub-fields, or any other JSON-serializable value. The same applies to `scope` and `constraints`. Two spec-compliant V1 implementations may use entirely different internal representations for these fields.
+
+**Recommendation:** Implementations SHOULD use a structured intent representation that includes at minimum: action type (what operation is being delegated), target resource (what the operation acts on), and constraints (bounds on how the operation may be performed). Structured representations improve auditability and lay groundwork for V2 interoperability. However, this is advisory — no specific schema is mandated by V1.
+
+**Interoperability consequence:** Because the intent payload schema is implementation-defined, two V1 agents from different implementations cannot semantically compare or interpret each other's intent fields — they can only verify that the hash commitment is intact. Cross-agent intent semantic interoperability requires a shared intent vocabulary: a common schema and value space that all participants agree on for interpreting intent fields. This is deferred to V2, where a shared intent vocabulary will be defined.
+
+> Addresses [issue #229](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/229): explicit V1 scope statement that the intent payload schema is implementation-defined. References #229.
+
 #### intent_hash Computation
 
 `intent_hash` is the SHA-256 hash of the delegation intent context. The intent context is the concatenation of the following fields from the task schema (§6.1), canonicalized per §4.10:
