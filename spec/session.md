@@ -668,6 +668,7 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | requested_optional | array | No | Capability IDs (§5.1.1 format) the coordinator prefers but does not require. Missing optional capabilities do not block session establishment. |
 | plan_commit_required | boolean | No | If `true`, the coordinator requires the worker to send PLAN_COMMIT (§6.6, §6.11) after TASK_ACCEPT and before the first TASK_PROGRESS for every task in this session. A missing PLAN_COMMIT when this field is `true` is a protocol violation. Default: `false`. |
 | heartbeat_params | object | No | Structured heartbeat negotiation block. When present, defines the heartbeat behavior for this session including liveness semantics, task hash verification, and application-level status reporting. See §4.3.1 for field definitions and negotiation semantics. If omitted, heartbeat behavior is governed by the top-level `heartbeat_interval_ms`, `heartbeat_timeout_count`, and related fields. When both `heartbeat_params` and top-level heartbeat fields are present, `heartbeat_params` takes precedence. |
+| max_round_trip_ms | integer | No | The initiator's estimated maximum round-trip time in milliseconds for this session. Used to negotiate the phantom discard window (§4.5.5). The session manager computes `phantom_window_ms = 2 × max(coordinator.max_round_trip_ms, worker.max_round_trip_ms)`. If omitted, the initiator's contribution defaults to 30000 (30 seconds) — a conservative value suitable for HITL or slow-model agents. Implementations SHOULD measure or estimate actual round-trip latency and provide this value; omitting it is safe but may produce an unnecessarily large phantom discard window. |
 | timestamp | ISO 8601 | Yes | When the SESSION_INIT was sent. |
 
 **SESSION_INIT_ACK fields:**
@@ -693,6 +694,8 @@ SESSION_INIT is the first protocol message in any session. It is sent by the coo
 | effective_cap_set | array | No | Intersection of the coordinator's `requested_mandatory` + `requested_optional` with the worker's capabilities, filtered by policy. Returned when SESSION_INIT includes `manifest_digest`. Enables 0-RTT capability agreement (§5.9). |
 | plan_commit_required | boolean | No | Echoed from SESSION_INIT. If the coordinator set `plan_commit_required: true`, the worker MUST echo it to confirm understanding of the plan commitment obligation. If the worker cannot support plan commitment, it MUST reject the session. |
 | heartbeat_params | object | No | Accepted or counter-proposed heartbeat params. The responding agent MUST echo back the accepted `heartbeat_params` or propose alternatives. If the coordinator sent `heartbeat_params` and the worker omits it from SESSION_INIT_ACK, this is a protocol violation — the worker MUST explicitly accept or counter-propose. For `interval_ms`, the effective value is the **maximum** of both proposals (slower rate wins). For `timeout_multiplier`, the effective value is the **maximum** of both proposals (more permissive wins). Boolean fields (`application_liveness`, `task_hash_verification`) are effective only if **both** sides set them to `true` — either side can opt out by setting `false`. See §4.3.1. |
+| max_round_trip_ms | integer | No | The worker's estimated maximum round-trip time in milliseconds. Used alongside the coordinator's `max_round_trip_ms` to compute the phantom discard window (§4.5.5). If omitted, the worker's contribution defaults to 30000 (30 seconds). |
+| phantom_window_ms | integer | Conditional | The negotiated phantom discard window in milliseconds, computed by the session manager as `2 × max(coordinator.max_round_trip_ms, worker.max_round_trip_ms)` (§4.5.5). **Required** when either side includes `max_round_trip_ms` in SESSION_INIT or SESSION_INIT_ACK. RECOMMENDED in all SESSION_INIT_ACK messages so both parties share the same computed value. When both sides omit `max_round_trip_ms`, the effective phantom window is the spec-defined default of 60000ms (2 × 30000ms default) and `phantom_window_ms` MAY be omitted. |
 | timestamp | ISO 8601 | Yes | When the SESSION_INIT_ACK was sent. |
 
 **Version compatibility check:** Upon receiving SESSION_INIT (or SESSION_INIT_ACK), the receiving agent MUST check protocol and schema version compatibility per §10.3. If versions are incompatible, the agent sends PROTOCOL_MISMATCH or SCHEMA_MISMATCH (§10.4) and the session transitions to CLOSED. Version declaration at SESSION_INIT is a spec obligation, not an optional feature — forward compatibility (§10.5) depends on every session beginning with explicit version exchange.
@@ -735,6 +738,7 @@ heartbeat_params:
   timeout_multiplier: 3
   application_liveness: true
   task_hash_verification: true
+max_round_trip_ms: 5000
 timestamp: "2026-02-27T10:30:00Z"
 ```
 
@@ -935,11 +939,56 @@ When SESSION_EXPIRED fires, the session manager issues TASK_CANCEL (§6.6) to al
 2. Proceed with session teardown without waiting further for the UNREACHABLE worker. The session close latency is bounded by the cancel-acknowledgment timeout, not by worker responsiveness.
 3. Treat any tasks assigned to UNREACHABLE workers as failed for session accounting purposes.
 
-**Orphan result handling.** Task results (TASK_COMPLETE, TASK_PROGRESS, or other task-lifecycle messages per §6) arriving after the session has transitioned to EXPIRED or CLOSED MUST receive a **SESSION_EXPIRED error response**. The session manager MUST NOT process, store, or forward orphan results as if the session were still active. The error response MUST include: `session_id` (echoed), `correlation_id` (echoed from the incoming message), `error_code: SESSION_EXPIRED`, and `expired_at` (timestamp of session expiry). This prevents phantom completions — work completed against an abandoned session context must not silently succeed.
+**Orphan result handling.** Task results (TASK_COMPLETE, TASK_PROGRESS, or other task-lifecycle messages per §6) arriving after the session has transitioned to EXPIRED or CLOSED MUST receive a **SESSION_EXPIRED error response**. The session manager MUST NOT process, store, or forward orphan results as if the session were still active. The error response MUST include: `session_id` (echoed), `correlation_id` (echoed from the incoming message), `error_code: SESSION_EXPIRED`, and `expired_at` (timestamp of session expiry). This prevents phantom completions — work completed against an abandoned session context must not silently succeed. The **phantom discard window** (§4.5.5) defines how long the session manager MUST retain the ability to send SESSION_EXPIRED error responses for orphan results — the session manager MUST be prepared to reject orphan results for at least `phantom_window_ms` after session expiry.
 
 **Scope boundary.** §4 defines the **announcement boundary** for session revocation — the session manager announces EXPIRED, issues TASK_CANCEL, and enforces the cancel-acknowledgment timeout. Enforcement boundaries for in-flight tasks (grace periods, partial result handling, checkpoint semantics) are governed by §6. Enforcement boundaries for cached delegation tokens (token invalidation, revocation propagation) are governed by §5. Implementations MUST NOT assume that SESSION_EXPIRED in §4 immediately invalidates all §5 tokens or §6 task state — each section defines its own enforcement semantics upon receiving the session-level expiry signal.
 
 > Addresses [issue #237](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/237): SESSION_EXPIRED to TASK_CANCEL pipeline — adds cancel-acknowledgment timeout (RECOMMENDED 30s, configurable), UNREACHABLE worker disposition, orphan result handling (SESSION_EXPIRED error response), and cross-section scope boundary statement. Resolves the hold-open vs. assume-success ambiguity. Credit: community discussion at https://www.moltbook.com/post/49d4278f-6334-4343-914d-d6d0f56013ad
+
+#### 4.5.5 Phantom Discard Window TTL Negotiation
+
+<!-- Implements #228: Phantom discard window TTL negotiation at SESSION_INIT -->
+
+A fixed phantom discard window is wrong for heterogeneous deployments. Two agents in a session may have vastly different round-trip latencies — a HITL agent with 20-second human-in-the-loop delays, a slow-model agent behind a queue, or a fast local agent with sub-second latency. A static TTL forces slow deployments to miss the window (orphan results rejected prematurely) or fast deployments to hold state unnecessarily long. The phantom discard window MUST be a **session property**, not a protocol constant — the direct parallel is TCP keepalive timeout, which is negotiated per connection.
+
+**Negotiation mechanism.** The `max_round_trip_ms` field in SESSION_INIT (§4.3) and SESSION_INIT_ACK allows each participant to declare its estimated maximum round-trip time for the session. The session manager computes the effective phantom discard window as:
+
+```
+phantom_window_ms = 2 × max(coordinator.max_round_trip_ms, worker.max_round_trip_ms)
+```
+
+The 2× multiplier accounts for a full round-trip plus safety margin — a message in flight at session expiry needs at most one round-trip to arrive, and the multiplier provides tolerance for transient latency spikes.
+
+**Default behavior.** If a participant omits `max_round_trip_ms`, its contribution defaults to **30000ms** (30 seconds). This is a conservative value chosen to accommodate HITL agents and slow-model deployments without requiring explicit configuration. When both sides omit `max_round_trip_ms`, the effective phantom window is `2 × 30000 = 60000ms` (60 seconds).
+
+**Echo in SESSION_INIT_ACK.** The session manager (coordinator) MUST compute `phantom_window_ms` after receiving SESSION_INIT_ACK and SHOULD include the computed value in SESSION_INIT_ACK so both parties share the same value. When `phantom_window_ms` is present in SESSION_INIT_ACK, the worker MUST use it as the authoritative phantom discard window — the worker MUST NOT recompute independently. When `phantom_window_ms` is absent from SESSION_INIT_ACK and both sides omitted `max_round_trip_ms`, the spec-defined default of 60000ms applies.
+
+**Semantics.** After a session transitions to EXPIRED or CLOSED, the session manager MUST retain the ability to send SESSION_EXPIRED error responses (§4.5.4) for at least `phantom_window_ms`. Task results arriving within the phantom discard window receive a proper SESSION_EXPIRED error response. Task results arriving after the phantom discard window MAY be silently dropped — the session state needed to generate error responses may have been evicted.
+
+**Backward compatibility.** Old implementations that do not include `max_round_trip_ms` in SESSION_INIT or SESSION_INIT_ACK continue to work — both contributions default to 30000ms, producing a 60000ms phantom window. No behavioral change occurs for implementations that do not adopt this field. Implementations that support `max_round_trip_ms` SHOULD still handle counterparties that omit it by applying the 30000ms default for the omitting side.
+
+**Constraints:**
+- `max_round_trip_ms` MUST be a positive integer (> 0).
+- `phantom_window_ms` MUST equal `2 × max(coordinator.max_round_trip_ms, worker.max_round_trip_ms)` — implementations MUST NOT override the formula.
+- `phantom_window_ms` SHOULD be less than `session_expiry_ms`. A phantom window exceeding the session expiry timeout indicates a configuration error — the session would expire before a single round-trip completes. Implementations SHOULD log a warning but MUST NOT reject the session.
+
+**Example negotiation:**
+
+```yaml
+# Coordinator proposes in SESSION_INIT:
+max_round_trip_ms: 5000    # fast agent, 5s round-trip
+
+# Worker counter-proposes in SESSION_INIT_ACK:
+max_round_trip_ms: 15000   # slow HITL agent, 15s round-trip
+phantom_window_ms: 30000   # 2 × max(5000, 15000) = 30000ms
+```
+
+```yaml
+# Both omit max_round_trip_ms — defaults apply:
+# phantom_window_ms = 2 × max(30000, 30000) = 60000ms
+```
+
+> Addresses [issue #228](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/228): Phantom discard window TTL negotiation — adds `max_round_trip_ms` to SESSION_INIT / SESSION_INIT_ACK, computes `phantom_window_ms` as a session property, echoes in SESSION_INIT_ACK, defaults to 30000ms per side (60000ms window) for backward compatibility. Eliminates the fixed-TTL problem for heterogeneous deployments. The TCP keepalive parallel: timeout is a connection property, not a protocol constant.
 
 **Relationship between `heartbeat_interval_ms`, `session_expiry_ms`, and KEEPALIVE:**
 
