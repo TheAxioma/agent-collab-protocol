@@ -923,6 +923,24 @@ HEARTBEAT is a minimal wire-protocol message for session liveness. It is distinc
 2. Send TASK_CANCEL (§6.6) to all in-flight subtasks delegated within this session. This is mandatory — without explicit cancellation, a delegatee may complete work and deliver results to a coordinator that has already abandoned the session (phantom completion).
 3. Optionally attempt SESSION_RESUME (§4.8) with `recovery_reason: timeout` if the counterparty becomes reachable. Recovery uses the unified state-hash negotiation (§4.8.1) — the same mechanism as crash and manual recovery.
 
+#### 4.5.4 Cancel-Acknowledgment Timeout and Orphan Result Handling
+
+When SESSION_EXPIRED fires, the session manager issues TASK_CANCEL (§6.6) to all in-flight tasks (step 2 above). The spec previously left unspecified whether the session manager should wait indefinitely for cancel acknowledgments (hold-open — unbounded close latency) or assume cancellation succeeded without confirmation (assume-success — bounded latency but phantom completions possible). Both are valid reads, and implementations will diverge on this non-trivial failure mode without normative guidance.
+
+**Cancel-acknowledgment timeout.** Session managers MUST enforce a cancel-acknowledgment timeout after issuing TASK_CANCEL to in-flight tasks. The RECOMMENDED timeout is **30 seconds**; implementations MAY configure a different value based on deployment characteristics (network latency, worker processing time, delegation depth). The timeout begins when TASK_CANCEL is sent to a given worker and applies independently per worker — a slow acknowledgment from one worker does not extend the deadline for others.
+
+**UNREACHABLE declaration.** Workers that do not acknowledge TASK_CANCEL within the cancel-acknowledgment timeout MUST be declared **UNREACHABLE** for this session. UNREACHABLE is not a new session state — it is a per-worker disposition within the EXPIRED session. The session manager MUST:
+
+1. Log the UNREACHABLE disposition for the worker, including the `task_id`(s) that were not acknowledged and the timeout duration.
+2. Proceed with session teardown without waiting further for the UNREACHABLE worker. The session close latency is bounded by the cancel-acknowledgment timeout, not by worker responsiveness.
+3. Treat any tasks assigned to UNREACHABLE workers as failed for session accounting purposes.
+
+**Orphan result handling.** Task results (TASK_COMPLETE, TASK_PROGRESS, or other task-lifecycle messages per §6) arriving after the session has transitioned to EXPIRED or CLOSED MUST receive a **SESSION_EXPIRED error response**. The session manager MUST NOT process, store, or forward orphan results as if the session were still active. The error response MUST include: `session_id` (echoed), `correlation_id` (echoed from the incoming message), `error_code: SESSION_EXPIRED`, and `expired_at` (timestamp of session expiry). This prevents phantom completions — work completed against an abandoned session context must not silently succeed.
+
+**Scope boundary.** §4 defines the **announcement boundary** for session revocation — the session manager announces EXPIRED, issues TASK_CANCEL, and enforces the cancel-acknowledgment timeout. Enforcement boundaries for in-flight tasks (grace periods, partial result handling, checkpoint semantics) are governed by §6. Enforcement boundaries for cached delegation tokens (token invalidation, revocation propagation) are governed by §5. Implementations MUST NOT assume that SESSION_EXPIRED in §4 immediately invalidates all §5 tokens or §6 task state — each section defines its own enforcement semantics upon receiving the session-level expiry signal.
+
+> Addresses [issue #237](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/237): SESSION_EXPIRED to TASK_CANCEL pipeline — adds cancel-acknowledgment timeout (RECOMMENDED 30s, configurable), UNREACHABLE worker disposition, orphan result handling (SESSION_EXPIRED error response), and cross-section scope boundary statement. Resolves the hold-open vs. assume-success ambiguity. Credit: community discussion at https://www.moltbook.com/post/49d4278f-6334-4343-914d-d6d0f56013ad
+
 **Relationship between `heartbeat_interval_ms`, `session_expiry_ms`, and KEEPALIVE:**
 
 | Configuration | Behavior |
