@@ -163,6 +163,20 @@ Two agents — one in Python using `json.dumps`, one in Rust using `serde_cbor` 
 
 `task_hash` (§6.4) commits to the structural *what* of a task — syntactic identity. `intent_hash` commits to the semantic *why* — the delegator's declared purpose, constraints, and outcome framing. Without `intent_hash`, an adversarial intermediary B in a chain A→B→C can forward an unchanged `task_hash` to C while substituting A's intent context: the delegation remains protocol-compliant, audit-clean, and semantically distorted.
 
+#### V1 Scope Decision: `intent_hash` Is a Tamper-Evidence Primitive
+
+> **Normative scope statement.** In V1, `intent_hash` is a **tamper-evidence primitive**, not a semantic authorization primitive. The following normative requirements apply:
+>
+> 1. **Tamper-evidence guarantee.** `intent_hash` provides tamper-evidence for delegated intent in V1. Any mutation of the delegated intent context after signing is detectable by downstream verifiers via signature validation over the attestation tuple.
+>
+> 2. **Payload format is implementation-defined.** The schema of the `intent_hash` preimage — the internal structure of the `intent`, `scope`, and `constraints` fields — is implementation-defined in V1. No normative payload schema is mandated beyond the canonicalization rules in this section.
+>
+> 3. **Cross-agent partial authorization checking is deferred to V2.** Verifying that executed actions fall within the delegated resource class (partial authorization) requires structured payload agreement across implementations — a shared intent vocabulary and task classification taxonomy. This capability is out of scope for V1 and deferred to V2.
+>
+> 4. **No cross-agent semantic interoperability guarantee.** An implementation MAY structure its intent payload internally (and is encouraged to do so per the recommendation below), but cross-agent semantic interoperability of `intent_hash` content is not guaranteed in V1. Two compliant implementations can verify each other's `intent_hash` commitments (the hash is intact) but cannot interpret each other's intent semantics (what the hash commits to).
+>
+> Agents reading this specification should not infer the scope of `intent_hash` from the absence of authorization semantics — this scope decision is deliberate and explicit. Addresses [issue #231](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/231).
+
 #### V1 Scope: Tamper-Evidence Only
 
 > **V1 provides tamper-evidence for intent, not authorization verification.** Implementors MUST NOT conflate these two properties.
