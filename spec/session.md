@@ -1495,7 +1495,7 @@ All inputs to document-text and governance-record hash computations MUST be norm
 
 4. **Trailing newline.** The normalized output MUST end with exactly one LF character. If the input ends with zero LF characters, one MUST be appended. If the input ends with multiple consecutive LF characters, all but one MUST be removed.
 
-5. **Unicode normalization.** All string content MUST be NFC-normalized (Unicode Canonical Decomposition followed by Canonical Composition, per [Unicode TR15](https://unicode.org/reports/tr15/)) before encoding to UTF-8. This is consistent with the NFC requirement in §4.10.2 and closes the same cross-runtime Unicode divergence gap for document text.
+5. **Unicode normalization.** All string content MUST be NFC-normalized (Unicode Canonical Decomposition followed by Canonical Composition) before encoding to UTF-8. The normative reference for NFC is [Unicode Standard Annex #15 (UAX #15)](https://unicode.org/reports/tr15/) — implementations MUST conform to the NFC algorithm as specified in UAX #15. This is consistent with the NFC requirement in §4.10.2 and closes the same cross-runtime Unicode divergence gap for document text.
 
 6. **Deterministic field ordering for JSON-serialized records.** When the hash input is a JSON-serialized record (e.g., amendment records, emergency amendment records, affected section text), the JSON serialization MUST use RFC 8785 JCS: keys sorted lexicographically by Unicode code point, no whitespace between tokens, deterministic number encoding. Rules 1–5 apply to the JCS output bytes.
 
@@ -1521,7 +1521,37 @@ Where each step applies the corresponding rule above, in order: strip BOM (rule 
 
 **Why explicit byte-level rules:** Without normative byte-level serialization, two implementations can read the same spec section, apply the same hash function, and produce different hashes — because one read the source on Windows (CRLF), the other on Unix (LF); one editor left trailing spaces, the other stripped them; one tool emitted a BOM, the other did not. These are not hypothetical: every difference listed in rules 1–4 has been observed in production across Markdown rendering toolchains. The hash chain's integrity guarantee is only as strong as the reproducibility of its inputs.
 
+**Unicode version conformance:**
+
+NFC output can differ across Unicode versions for certain edge cases (Korean jamo composition, some mathematical symbols, newly added characters). Two compliant implementations using different Unicode library versions may therefore produce divergent governance hashes silently — exactly the class of cross-runtime divergence §4.10 is designed to prevent.
+
+To mitigate this:
+
+1. **Normative reference.** The canonical reference for NFC normalization in §4.10.4 is [Unicode Standard Annex #15 (UAX #15)](https://unicode.org/reports/tr15/). Implementations MUST conform to the NFC algorithm as defined in UAX #15 for the Unicode version they support.
+
+2. **Version documentation requirement.** Implementations MUST document the Unicode version used by their NFC normalization library (e.g., "Unicode 15.1.0"). This version MUST be discoverable — either in the implementation's documentation, configuration metadata, or capability advertisement (§3). When two implementations produce divergent hashes for the same input, the documented Unicode versions provide the first diagnostic axis.
+
+3. **Conformance validation baseline.** Implementations SHOULD validate their NFC normalization against the [Unicode Normalization Conformance Test Suite](https://www.unicode.org/Public/UCD/latest/ucd/NormalizationTest.txt) for their declared Unicode version. Passing the conformance test suite for the declared version is the normative validation baseline — an implementation that fails test cases for its declared Unicode version is non-conformant regardless of whether hash outputs happen to match in practice.
+
+4. **Cross-version divergence advisory.** Implementations that interact across Unicode version boundaries SHOULD be aware that NFC output may differ for inputs containing characters whose normalization mappings changed between versions. This specification does not mandate a single Unicode version — mandating a version would freeze implementations against library upgrades and create a different class of compliance burden. Instead, the version documentation requirement (rule 2) ensures that divergence is diagnosable and the epoch versioning mechanism (below) ensures that hash chains remain verifiable across rule changes.
+
+**Epoch versioning for normalization rule amendments:**
+
+Governance hash chains (§9.11.5) are append-only — records created under a given set of normalization rules have hashes that are permanently bound to those rules. When normalization rules change (whether due to a Unicode version migration, a spec amendment modifying §4.10.4, or an operational policy change), the hash chain does not restart. Instead, an epoch boundary is established:
+
+1. **Epoch version header.** Each governance record MUST include a `normalization_epoch` field (unsigned integer, starting at `1`). The epoch identifies which normalization ruleset was in effect when the record's hash was computed. The initial ruleset defined in this section (§4.10.4 as of the current spec version) is epoch `1`.
+
+2. **Immutability of prior-epoch hashes.** Records created under a prior epoch retain their original hashes. Implementations MUST NOT rehash prior-epoch records under the new ruleset. A record's hash is permanently bound to the normalization epoch declared in its `normalization_epoch` field.
+
+3. **Amendment point as epoch boundary.** When a normalization rule amendment takes effect, the amendment point becomes the epoch boundary. The prior chain head — the last record hashed under the previous epoch — becomes the **epoch anchor**: the `prev_hash` of the first record in the new epoch. This preserves chain continuity without requiring rehashing.
+
+4. **Cross-epoch verification.** Verifiers MUST select the applicable normalization ruleset based on the `normalization_epoch` field in each record. A verifier that does not support a record's declared epoch MUST reject the record with a verification error rather than silently applying a different ruleset. This prevents silent hash mismatches from ruleset confusion.
+
+5. **Epoch registry.** The mapping from `normalization_epoch` values to normalization rulesets is maintained as part of the protocol specification. Epoch `1` corresponds to the rules defined in this section. Future epochs will be defined by spec amendments that modify §4.10.4 normalization rules and increment the epoch number.
+
 > Addresses [issue #208](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/208): canonical byte-level serialization for document and governance-record hash computations. Defines UTF-8 encoding (no BOM), LF-only line endings, no trailing whitespace, trailing newline fixup, NFC normalization, and deterministic field ordering (JCS) as normative requirements for all hash inputs derived from protocol document text or governance records. Closes #208.
+
+> Unicode version conformance and epoch versioning: Addresses [issue #227](https://github.com/agent-collab-protocol/agent-collab-protocol/issues/227) — §4.10.4 NFC normalization pinned to UAX #15 as canonical reference; implementations MUST document their Unicode version; Unicode Normalization Conformance Test Suite referenced as validation baseline; epoch versioning semantics added for normalization rule amendments so that prior-epoch hashes remain verifiable without rehashing. Credit: @BobRenze and @danielsclaw on [Moltbook](https://www.moltbook.com/post/227-4104).
 
 ### 4.11 SESSION_STATE Object
 
